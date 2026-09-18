@@ -40,8 +40,14 @@ class Candidate:
 
     @property
     def rank_key(self) -> tuple:
-        """Sort key: unreadable last, then least risk, then most headroom."""
-        return (not self.quota_ok, self.pressure, self.headroom)
+        """Sort key: unreadable last, then least risk, then most headroom.
+
+        The provider name is the final tiebreak. Without it a tie resolves by
+        dict insertion order, so the same fleet could pick a different provider
+        depending on how the config happened to be ordered -- which would make
+        `--plan` output unreproducible.
+        """
+        return (not self.quota_ok, self.pressure, self.headroom, self.provider)
 
 
 @dataclass
@@ -236,13 +242,18 @@ def choose(
     candidates: list[Candidate] = []
     for name, spec in providers.items():
         model_id = (spec.get("models") or {}).get(model_alias)
-        candidates.append(score(quotas.get(name, Quota(name)), model_id, weights,
-                                skip_at, deadline_seconds, now,
-                                active_sessions=int(active.get(name, 0)),
-                                concurrency_cap=caps.get(name),
-                                pressure_per_over=pressure_per_over,
-                                max_load_pressure=max_load_pressure,
-                                health=(health or {}).get(name)))
+        candidate = score(quotas.get(name, Quota(name)), model_id, weights,
+                          skip_at, deadline_seconds, now,
+                          active_sessions=int(active.get(name, 0)),
+                          concurrency_cap=caps.get(name),
+                          pressure_per_over=pressure_per_over,
+                          max_load_pressure=max_load_pressure,
+                          health=(health or {}).get(name))
+        # Identity comes from the providers mapping, which is the authority the
+        # caller acts on. A Quota built for one provider but filed under another
+        # would otherwise route to a name that does not exist.
+        candidate.provider = name
+        candidates.append(candidate)
     offered = [c for c in candidates if c.model_id]
     ranked = sorted(offered, key=lambda c: c.rank_key)
     on_peak = peak_providers or set()

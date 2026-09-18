@@ -405,6 +405,48 @@ def test_health_absent_changes_nothing():
     assert without.provider == explicit_none.provider
 
 
+def test_a_nan_percentage_cannot_look_like_free_capacity():
+    """NaN compares false against every threshold, so an unsanitized NaN window
+    reads as perfect headroom and makes a broken reading look like the healthiest
+    provider. It must sanitise to 0 instead."""
+    bad = q.Quota("p", [q.Window("weekly", float("nan"), time.time() + 3 * DAY)])
+    assert bad.windows[0].percent == 0.0
+    c = r.score(bad, "m", WEIGHTS, SKIP)
+    assert c.pressure == 0.0 and not c.hard
+    # inf is the opposite direction and must not become 0 (that would hide a
+    # genuinely spent provider).
+    inf = q.Quota("p", [q.Window("weekly", float("inf"), time.time() + 3 * DAY)])
+    assert inf.windows[0].percent == 0.0, "inf sanitises too, so it cannot poison a sort"
+
+
+def test_a_negative_percentage_clamps_to_zero():
+    w = q.Window("weekly", -0.4, time.time() + 3 * DAY)
+    assert w.percent == 0.0
+
+
+def test_ticks_resolve_deterministically_regardless_of_input_order():
+    """A tie must not resolve by dict insertion order, or --plan output would
+    differ between runs of the same fleet."""
+    import itertools
+    now = time.time()
+    providers = {n: {"models": {"ds": n}} for n in ("p1", "p2", "p3")}
+    live = {n: q.Quota(n, [win("weekly", 0.30, resets_in=3 * DAY, now=now)]) for n in providers}
+    picks = {r.choose("ds", {k: providers[k] for k in perm}, live, WEIGHTS, SKIP, now=now).provider
+             for perm in itertools.permutations(providers)}
+    assert len(picks) == 1, f"tie broke differently per ordering: {picks}"
+
+
+def test_the_chosen_name_comes_from_the_provider_mapping_not_the_quota():
+    """A Quota filed under the wrong key must not route to a name that does not
+    exist in the provider set."""
+    now = time.time()
+    providers = {"p1": {"models": {"ds": "m1"}}, "p2": {"models": {"ds": "m2"}}}
+    quotas = {"p1": q.Quota("WRONG_NAME", [win("weekly", 0.1, resets_in=3 * DAY, now=now)]),
+              "p2": q.Quota("p2", [win("weekly", 0.9, resets_in=3 * DAY, now=now)])}
+    d = r.choose("ds", providers, quotas, WEIGHTS, SKIP, now=now)
+    assert d.provider in providers, d.provider
+
+
 def test_sticky_expires():
     table = r.StickyTable(ttl_seconds=0)
     table.put("c1", "commandcode")

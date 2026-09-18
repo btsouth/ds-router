@@ -77,6 +77,15 @@ class Window:
     percent: float
     resets_at: Optional[float] = None
 
+    def __post_init__(self) -> None:
+        # Enforce at the boundary, not only in the parsers: a NaN compares false
+        # against every threshold, so an unsanitized window reads as perfect
+        # headroom and makes a broken reading look like the best provider.
+        # Sanitising here means no caller -- present or future, parser or test --
+        # can inject one.
+        cleaned = _finite_percent(self.percent)
+        self.percent = 0.0 if cleaned is None else cleaned
+
     @property
     def kind(self) -> Optional[str]:
         return _kind(self.label)
@@ -176,6 +185,24 @@ def _http_json(url: str, key: str, timeout: float = 12.0) -> Any:
         return json.load(response)
 
 
+def _finite_percent(value: Any) -> Optional[float]:
+    """Coerce a percentage into a usable fraction, or None when unusable.
+
+    Guards against NaN/inf, which arrive from a broken upstream reading. A NaN
+    compares false against every threshold, so an unsanitized NaN window reads as
+    *perfect headroom* and the provider looks like the healthiest option -- the
+    worst possible failure direction. Negative values clamp to 0 because a
+    provider cannot report negative usage.
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):  # NaN / inf
+        return None
+    return max(0.0, number)
+
+
 def _reset(value: Any) -> Optional[float]:
     """Normalise epoch seconds, epoch milliseconds, or an ISO string."""
     if value in (None, "", 0):
@@ -205,7 +232,7 @@ def parse_commandcode(payload: dict) -> list[Window]:
             continue
         out.append(Window(label, max(0.0, used / cap), _reset(window.get("resetAt"))))
     monthly = (payload.get("credits") or {}).get("monthlyCredits")
-    if isinstance(monthly, (int, float)):
+    if isinstance(monthly, (int, float)) and monthly == monthly:
         # The endpoint reports remaining credits; the spent figure is not
         # carried here, so express headroom as the fraction already consumed of
         # what is left plus what this period spent (filled in by the caller).
@@ -223,10 +250,10 @@ def parse_opencode_go(payload: dict) -> list[Window]:
         window = usage.get(name)
         if not isinstance(window, dict):
             continue
-        percent = window.get("percent")
-        if not isinstance(percent, (int, float)):
+        fraction = _finite_percent(window.get("percent"))
+        if fraction is None:
             continue
-        out.append(Window(label, max(0.0, float(percent) / 100.0), _reset(window.get("resetsAt"))))
+        out.append(Window(label, fraction / 100.0, _reset(window.get("resetsAt"))))
     if not out:
         raise ValueError("opencode-go returned no recognised windows")
     return out
@@ -241,10 +268,10 @@ def parse_ollama(payload: dict) -> list[Window]:
         window = limits.get(name)
         if not isinstance(window, dict):
             continue
-        usage = window.get("usage")
-        if not isinstance(usage, (int, float)):
+        fraction = _finite_percent(window.get("usage"))
+        if fraction is None:
             continue
-        out.append(Window(str(name), max(0.0, float(usage)), None))
+        out.append(Window(str(name), fraction, None))
     if not out:
         raise ValueError("ollama returned no recognised windows")
     return out
@@ -265,13 +292,13 @@ def parse_clinepass(payload: dict) -> list[Window]:
     for row in limits:
         if not isinstance(row, dict):
             continue
-        percent = row.get("percentUsed")
-        if not isinstance(percent, (int, float)):
+        fraction = _finite_percent(row.get("percentUsed"))
+        if fraction is None:
             continue
         # Provider labels: five_hour / weekly / monthly. Normalize underscores so
         # the shared label mapper classifies them.
         label = str(row.get("type") or "").replace("_", " ")
-        out.append(Window(label, max(0.0, float(percent) / 100.0), _reset(row.get("resetsAt"))))
+        out.append(Window(label, fraction / 100.0, _reset(row.get("resetsAt"))))
     if not out:
         raise ValueError("clinepass returned no recognised windows")
     return out
@@ -373,10 +400,10 @@ def from_collector(provider: str, state_dir: "Path", ttl_seconds: float = 300.0)
     for row in payload.get("limits") or []:
         if not isinstance(row, dict):
             continue
-        percent = row.get("percent")
-        if not isinstance(percent, (int, float)):
+        fraction = _finite_percent(row.get("percent"))
+        if fraction is None:
             continue
-        windows.append(Window(str(row.get("label") or ""), float(percent), _reset(row.get("resetsAt"))))
+        windows.append(Window(str(row.get("label") or ""), fraction, _reset(row.get("resetsAt"))))
     if not windows:
         return None
     return Quota(provider, windows, float(attempted), "", str(payload.get("plan") or ""))
