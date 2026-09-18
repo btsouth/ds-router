@@ -158,8 +158,13 @@ falls back to reading `state.db` read-only when not.
 Four inputs, in order of authority:
 
 **1. Hard exhaustion — leave immediately.** A window that has actually run out,
-a quota that cannot be read, or a health probe that fails. No argument, no
-waiting to see if it recovers.
+or a health probe that fails. No argument, no waiting to see if it recovers.
+
+A quota that *cannot be read* is deliberately not in this list. A failed reading
+says the telemetry endpoint did not answer, not that the provider is down, so a
+session already there stays where it is — moving it would pay a prompt-cache reset
+to avoid an outage that may not exist. What it does block is choosing that provider
+for anything new, until it reads again.
 
 **2. Burn rate, not raw percent.** A window is only dangerous if it will run out
 before it refills, so usage is compared against how much of the window has
@@ -177,7 +182,7 @@ raises a provider's cost without disqualifying it, because queueing still works.
 upstream prompt cache and drops the model's reasoning traces. Your conversation
 is preserved — the router is stateless and Hermes replays the full history — but
 those two costs are real, so a conversation keeps its provider until that
-provider is exhausted, unreadable, or failing.
+provider is exhausted or failing.
 
 Peak pricing is applied as a tie-break only. Both providers charge double during
 their own peak windows, and the windows barely overlap:
