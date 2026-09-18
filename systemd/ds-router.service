@@ -10,6 +10,8 @@ Type=oneshot
 # Hermes venv, which a supervisor-started unit does not inherit, so PATH must be
 # set explicitly. Adjust if Hermes is installed somewhere other than ~/.hermes.
 Environment=PATH=%h/.hermes/hermes-agent/venv/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=%h/Projects/ds-router/ds-switch
+# Quoted: systemd splits an unquoted ExecStart on whitespace, so a clone path
+# containing a space would be read as a command plus arguments.
+ExecStart="%h/Projects/ds-router/ds-switch"
 # A stuck quota poll must not stack up runs.
 TimeoutStartSec=120
