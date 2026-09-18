@@ -26,9 +26,45 @@ sys.path.insert(0, str(HERE))
 CONFIG = HERE / "config.yaml"
 
 
+class ConfigError(RuntimeError):
+    """config.yaml is missing, unreadable, or not the shape it claims to be."""
+
+
+class ConfigReadError(RuntimeError):
+    """The Hermes config could not be READ, which is not the same as a key being unset."""
+
+
 def load_config() -> dict:
+    """This repo's config.yaml, validated enough to fail with a message rather than
+    a traceback. A stranger editing this file is the normal case, so a typo has to
+    read as a diagnosis, not a stack trace."""
     import yaml
-    return yaml.safe_load(CONFIG.read_text())
+
+    try:
+        raw = CONFIG.read_text()
+    except OSError as exc:
+        raise ConfigError(f"cannot read {CONFIG}: {exc}") from exc
+    try:
+        cfg = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"{CONFIG.name} is not valid YAML: {str(exc)[:200]}") from exc
+    if not isinstance(cfg, dict):
+        raise ConfigError(f"{CONFIG.name} must be a mapping, found {type(cfg).__name__}")
+    for block_name in ("providers", "models"):
+        block = cfg.get(block_name)
+        if block is None:
+            continue
+        if not isinstance(block, dict):
+            raise ConfigError(f"{CONFIG.name}: {block_name!r} must be a mapping of names, "
+                              f"found {type(block).__name__}")
+        for key, entry in block.items():
+            if block_name == "providers" and not isinstance(entry, dict):
+                raise ConfigError(f"{CONFIG.name}: providers.{key} must be a mapping "
+                                  f"(base_url, key_env), found {type(entry).__name__}")
+            if block_name == "models" and not isinstance(entry, dict):
+                raise ConfigError(f"{CONFIG.name}: models.{key} must map providers to model "
+                                  f"ids, found {type(entry).__name__}")
+    return cfg
 
 
 def hermes(*args: str) -> str:
@@ -39,12 +75,16 @@ def hermes(*args: str) -> str:
     return proc.stdout.strip()
 
 
-def current_provider() -> str:
-    """The provider Hermes is configured to use, or '' when unset."""
-    try:
-        out = hermes("config", "get", "model.provider")
-    except Exception:
-        return ""
+def _config_get(key: str) -> str:
+    """The stored value of a config key, or '' when it is genuinely unset.
+
+    A failed `hermes config get` raises. The two cases were the same value before,
+    and conflating them made the tool drop the sticky provider (so a healthy
+    conversation could be moved, paying a prompt-cache reset) and, worse, made the
+    rollback issue `config unset` for a key whose real value had never been read,
+    which deletes a setting while reporting it as restored.
+    """
+    out = hermes("config", "get", key)
     # `hermes config get` prints the value, or a "not set" notice.
     for line in reversed(out.splitlines()):
         value = line.strip()
@@ -53,17 +93,20 @@ def current_provider() -> str:
     return ""
 
 
-def current_value(key: str) -> str:
-    """The stored value of a config key, or '' when unset/unreadable."""
+def current_provider() -> str:
+    """The provider Hermes is configured to use, or '' when unset."""
     try:
-        out = hermes("config", "get", key)
-    except Exception:
-        return ""
-    for line in reversed(out.splitlines()):
-        value = line.strip()
-        if value and not value.lower().startswith("config key not set"):
-            return value
-    return ""
+        return _config_get("model.provider")
+    except Exception as exc:
+        raise ConfigReadError(f"could not read model.provider ({exc})") from exc
+
+
+def current_value(key: str) -> str:
+    """The stored value of a config key, or '' when unset. Raises when unreadable."""
+    try:
+        return _config_get(key)
+    except Exception as exc:
+        raise ConfigReadError(f"could not read {key} ({exc})") from exc
 
 
 def router_decision(sticky: str | None, alias: str) -> dict:
@@ -93,6 +136,22 @@ def model_id_for(provider: str, alias: str, models: dict) -> str:
 _ROUTED_KEYS = ("model.provider", "model.default", "model.base_url")
 
 
+def _read_before_write(key: str) -> str:
+    """The value to restore if a later key fails to write.
+
+    Deliberately raises rather than returning '': an unread value would be restored
+    as "unset", which deletes whatever is really there. Better to refuse the write
+    than to make the rollback destructive.
+    """
+    try:
+        return current_value(key)
+    except ConfigReadError as exc:
+        raise ConfigReadError(
+            f"{exc}. Refusing to write: the rollback would have to restore this key, and "
+            "an unread value cannot be told apart from an empty one"
+        ) from exc
+
+
 def set_provider(name: str, spec: dict, alias: str, *, dry: bool,
                  models: dict | None = None) -> tuple[str, str]:
     """Write model.provider/default/base_url for one provider, as a unit.
@@ -115,7 +174,7 @@ def set_provider(name: str, spec: dict, alias: str, *, dry: bool,
     if dry:
         return model_id, base_url
 
-    previous = {key: current_value(key) for key in _ROUTED_KEYS}
+    previous = {key: _read_before_write(key) for key in _ROUTED_KEYS}
     pending = [("model.provider", name), ("model.default", model_id)]
     if base_url:
         pending.append(("model.base_url", base_url))
@@ -156,7 +215,11 @@ def main() -> int:
     ap.add_argument("--alias", default=None, help="model alias to route")
     args = ap.parse_args()
 
-    cfg = load_config()
+    try:
+        cfg = load_config()
+    except ConfigError as exc:
+        print(f"config: {exc}", file=sys.stderr)
+        return 1
     providers = cfg.get("providers") or {}
     models = cfg.get("models") or {}
     alias = args.alias or cfg.get("default_model")
@@ -174,8 +237,15 @@ def main() -> int:
             print("config.yaml needs a 'default_provider' naming one of: "
                   + ", ".join(providers), file=sys.stderr)
             return 2
-        model_id, _ = set_provider(default_provider, providers[default_provider], alias,
-                                   dry=args.show, models=models)
+        try:
+            model_id, _ = set_provider(default_provider, providers[default_provider], alias,
+                                       dry=args.show, models=models)
+        except ConfigReadError as exc:
+            print(str(exc), file=sys.stderr)
+            return 6
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 5
         print(f"Routing off — Hermes is back on {default_provider} ({model_id})."
               + ("  [--show: nothing written]" if args.show else ""))
         return 0
@@ -189,7 +259,13 @@ def main() -> int:
     else:
         # Stay on whatever Hermes already uses unless there is a real reason to
         # move: each move rebuilds the agent and resets the prompt cache.
-        sticky = current_provider()
+        try:
+            sticky = current_provider()
+        except ConfigReadError as exc:
+            print(f"{exc}; leaving the Hermes config untouched. A sticky provider that "
+                  "cannot be read is not the same as one that is unset, and acting as if "
+                  "it were would move a healthy conversation.", file=sys.stderr)
+            return 6
         if sticky not in providers:
             sticky = None
         try:
@@ -207,6 +283,9 @@ def main() -> int:
 
     try:
         model_id, _ = set_provider(chosen, providers[chosen], alias, dry=args.show, models=models)
+    except ConfigReadError as exc:
+        print(str(exc), file=sys.stderr)
+        return 6
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 5
