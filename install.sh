@@ -73,6 +73,14 @@ done
 # ---------------------------------------------------------------------------
 # locations
 # ---------------------------------------------------------------------------
+# Fail with something readable rather than a raw `set -u` message: these are
+# the two environment values every path below is built from.
+: "${HOME:?HOME is not set — run this from a normal login shell}"
+command -v dirname >/dev/null 2>&1 || {
+  printf 'ERROR: the standard shell tools (dirname, sed, cmp, cp, readlink) must be on PATH.\n' >&2
+  exit 1
+}
+
 # Resolve this script's own directory, following symlinks, without readlink -f
 # (which BSD readlink does not have).
 self=$0
@@ -96,7 +104,8 @@ SYMLINK=$BIN_DIR/ds-switch
 TMPDIR_D=${TMPDIR:-/tmp}
 TMP_FILE=$TMPDIR_D/ds-router-install.$$.tmp
 TMP_UNIT=$TMPDIR_D/ds-router-install.$$.unit
-cleanup() { rm -f "$TMP_FILE" "$TMP_UNIT"; }
+TMP_MANIFEST=$TMPDIR_D/ds-router-install.$$.manifest
+cleanup() { rm -f "$TMP_FILE" "$TMP_UNIT" "$TMP_MANIFEST"; }
 trap cleanup EXIT INT TERM HUP
 
 # ---------------------------------------------------------------------------
@@ -537,8 +546,15 @@ else
     printf 'SYSTEMD_USER_DIR=%s\n' "$SYSTEMD_USER_DIR"
     printf 'LAUNCHD_PLIST=%s\n' "$(launchd_plist_dst)"
     printf 'HERMES_BIN=%s\n' "$HERMES_BIN"
-  } >"$MANIFEST"
-  printf '  write %s\n' "$MANIFEST"
+  } >"$TMP_MANIFEST"
+  # Rewriting an identical manifest would be a no-op write; keep re-runs clean.
+  if [ -f "$MANIFEST" ] && cmp -s "$TMP_MANIFEST" "$MANIFEST"; then
+    skip "manifest already current: $MANIFEST"
+    rm -f "$TMP_MANIFEST"
+  else
+    mv "$TMP_MANIFEST" "$MANIFEST"
+    printf '  write %s\n' "$MANIFEST"
+  fi
 fi
 
 # ---------------------------------------------------------------------------

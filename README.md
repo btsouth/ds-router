@@ -114,9 +114,21 @@ is preserved — the router is stateless and Hermes replays the full history —
 those two costs are real, so a conversation keeps its provider until that
 provider is exhausted, unreadable, or failing.
 
-Peak pricing is applied as a tie-break only. CommandCode peaks 01:00-10:00 UTC
-and Ollama 12:00-18:00 UTC, so during either block the other is cheaper. That is
-free: no cache reset, no quality change.
+Peak pricing is applied as a tie-break only. Both providers charge double during
+their own peak windows, and the windows barely overlap:
+
+- **CommandCode**: 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri (note the 04:00-06:00
+  gap — it is off-peak there)
+- **Ollama Cloud**: 12:00-18:00 UTC, Mon-Fri
+
+So between 12:00 and 18:00 UTC Ollama pays double and CommandCode does not, and
+from 01:00 to 10:00 the reverse. Preferring the off-peak provider is free: no
+cache reset, no quality change, no context loss.
+
+These hours are read from each provider's published pricing and hardcoded in
+`config.yaml` under `peak:`. If a provider changes its schedule the router
+silently optimises against the old one — harmless when wrong (it just picks by
+headroom instead) but worth re-checking occasionally.
 
 ## Changing models
 

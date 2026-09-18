@@ -55,6 +55,12 @@ done
 # ---------------------------------------------------------------------------
 # locate the checkout, same symlink-free logic as install.sh
 # ---------------------------------------------------------------------------
+: "${HOME:?HOME is not set — run this from a normal login shell}"
+command -v dirname >/dev/null 2>&1 || {
+  printf 'ERROR: the standard shell tools (dirname, sed, cmp, rm, readlink) must be on PATH.\n' >&2
+  exit 1
+}
+
 self=$0
 while [ -h "$self" ]; do
   link=$(readlink "$self")

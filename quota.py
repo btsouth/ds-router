@@ -342,6 +342,9 @@ COLLECTOR_FILES = {
     "commandcode": "commandcode-quota.json",
     "opencode-go": "go-quota.json",
     "ollama-cloud": "ollama-quota.json",
+    # Written by the omarchy-usage-dashboard collector once ClinePass is wired
+    # in there. Absent is fine: the caller polls ClinePass directly.
+    "clinepass": "clinepass-quota.json",
 }
 
 
