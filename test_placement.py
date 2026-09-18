@@ -15,6 +15,7 @@ Run: python3 test_placement.py
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -176,6 +177,24 @@ def test_load_that_is_not_in_the_plan_still_occupies_a_slot():
 
     assert dest_counts(result).get("ollama-cloud", 0) == 0, dest_counts(result)
     assert len(moved(result)) == 2
+
+
+def test_a_named_custom_provider_is_read_from_the_config_not_the_billing_identity():
+    """Hermes records the runtime identity in billing_provider, which is the
+    generic "custom" for every named custom provider, and the durable config key in
+    model_config. Reading the billing identity made a clinepass session look like
+    an unmanaged provider, so it was never spread and its provider's load was
+    undercounted."""
+    cfg = json.dumps({"provider": "clinepass", "model": "cline-pass/deepseek-v4.1-flash"})
+    assert pl._provider_of("custom", cfg) == "clinepass", pl._provider_of("custom", cfg)
+    # The config key wins even when billing names something else.
+    assert pl._provider_of("somethingelse", cfg) == "clinepass"
+    # Built-in providers carry no model config, so billing is still the source.
+    assert pl._provider_of("ollama-cloud", None) == "ollama-cloud"
+    assert pl._provider_of("ollama-cloud", "") == "ollama-cloud"
+    # Nothing usable anywhere: the generic identity must not leak through.
+    assert pl._provider_of("custom", None) == ""
+    assert pl._provider_of(None, "not json") == ""
 
 
 def test_the_same_input_produces_the_same_plan_twice():

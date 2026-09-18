@@ -303,14 +303,19 @@ def _destination(cands: dict[str, _Candidate], assigned: dict[str, int], *,
 
 def _why_leaving(source: str, cands: dict[str, _Candidate], declared: dict[str, Any],
                  alias: str, over_cap: bool) -> str:
-    """A one-line justification for moving a session, for the printed table."""
+    """A one-line justification for moving a session, for the printed table.
+
+    Each return value names the source provider, so a caller should present it as
+    a clause after the move rather than concatenating it onto a verb phrase:
+    "over its concurrency cap" reads from here, and the caller joins with a colon.
+    """
     if not source:
-        return "no provider yet"
+        return "it had no provider yet"
     cand = cands.get(source)
     if cand is None:
         if source in declared:
             return f"{source} does not serve {alias!r}"
-        return f"{source} is not a declared provider"
+        return f"{source} is not a provider ds-router manages"
     if cand.exhausted:
         return f"{source} is exhausted"
     if cand.unreadable:
@@ -410,7 +415,8 @@ def plan(sessions: Iterable[Any], quotas_or_load: Any = None, caps: Any = None,
             continue
         assigned[dest.name] += 1
         out.append(Assignment(session.id, dest.name, dest.model_id, source,
-                              reason="moved off " + _why_leaving(source, cands, declared, alias, over_cap)))
+                              reason=f"moved to {dest.name}: "
+                                     + _why_leaving(source, cands, declared, alias, over_cap)))
 
     return sorted(out, key=lambda a: (a.session_id, a.provider))
 
@@ -834,17 +840,39 @@ def _session_columns(con: sqlite3.Connection) -> set[str]:
         return set()
 
 
+# Hermes writes this into billing_provider for EVERY named custom provider: it is
+# the runtime identity, not the name the user configured. Treating it as a
+# provider name makes those sessions look unmanaged, so their real provider's load
+# is undercounted and they are never spread.
+_GENERIC_PROVIDER = "custom"
+
+
+def _config_provider(model_config: Any) -> str:
+    """The provider named inside a session's stored model config, or ''."""
+    if not model_config:
+        return ""
+    try:
+        parsed = json.loads(model_config) if isinstance(model_config, str) else model_config
+    except (TypeError, ValueError):
+        return ""
+    if isinstance(parsed, dict) and parsed.get("provider"):
+        return str(parsed["provider"])
+    return ""
+
+
 def _provider_of(billing_provider: Any, model_config: Any) -> str:
-    """Hermes records the provider in two places; either is authoritative."""
-    if billing_provider:
-        return str(billing_provider)
-    if model_config:
-        try:
-            parsed = json.loads(model_config) if isinstance(model_config, str) else model_config
-        except (TypeError, ValueError):
-            return ""
-        if isinstance(parsed, dict) and parsed.get("provider"):
-            return str(parsed["provider"])
+    """The provider a session is configured to use, or '' when unknowable.
+
+    ``model_config.provider`` is preferred because it holds the durable config key
+    (``clinepass``), while ``billing_provider`` holds the runtime identity, which
+    is the generic ``custom`` for any named custom provider. Falling back to
+    ``billing_provider`` keeps the pre-existing behaviour for the built-in
+    providers, whose model config is empty.
+    """
+    for candidate in (_config_provider(model_config), billing_provider):
+        name = str(candidate or "").strip()
+        if name and name != _GENERIC_PROVIDER:
+            return name
     return ""
 
 

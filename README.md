@@ -118,7 +118,7 @@ state, not a global config write. Real output from a 21-session fleet:
   ---------------------------------------------------------------------------
   02340f5c       nous           nous           -                              nous is not managed by ds-router; left alone
   036e75ea       ollama-cloud   ollama-cloud   deepseek-v4.1-flash            stays on ollama-cloud (1/3 of its cap)
-  418ca809       ollama-cloud   opencode-go    deepseek-v4.1-flash            moved off ollama-cloud is over its concurrency cap
+  418ca809       ollama-cloud   opencode-go    deepseek-v4.1-flash            moved to opencode-go: ollama-cloud is over its concurrency cap
 ```
 
 Design rules, all asserted by tests:
