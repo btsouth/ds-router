@@ -54,6 +54,16 @@ From then on the timer re-checks every 15 minutes. To stop it:
 ./ds-switch --off         # hand Hermes back to a plain provider
 ```
 
+### Do you need all four providers?
+
+No. Start with the one you have. On a single-provider setup ds-router correctly
+concludes there is nowhere better to move anything and leaves every session exactly
+where it is — so it is inert until you add a second provider, and adding one is
+just another entry in `config.yaml`.
+
+It becomes useful at two: that is when "which one still has quota" stops having an
+obvious answer.
+
 ## Before you start: add your keys
 
 ds-router reads provider API keys from `~/.hermes/.env`, the same file Hermes
@@ -210,9 +220,20 @@ Use `./router.py --list-models` to get real IDs before adding one.
 2. Add its model IDs under `models:`
 3. Add a quota reader in `quota.py` if it exposes a usage API
 
-If a provider has no usage API, ds-router cannot score it, and it will be treated
-as unreadable. That is deliberate: Token Harbor was evaluated and rejected for
-exactly this (dashboard-only allowance) plus a 53s median response time.
+### A provider with no usage API
+
+It can be added, but it cannot be scored, so ds-router will not route *to* it. The
+router's whole subject is remaining quota, and a provider that will not report its
+remaining quota has nothing to contribute to that decision — inventing a number for
+it would be worse than leaving it out, because the answer would look authoritative.
+
+That does not make it useless. It works fine as a plain Hermes provider, and as a
+**fallback entry** in Hermes' own chain, which is a separate mechanism: put it last
+so it only handles traffic when every measurable provider has failed. Add it under
+`providers:` with a `base_url` and `key_env`, and set `quota:` to nothing.
+
+Token Harbor was evaluated this way and left out of the router for exactly this
+reason, plus a 53s median response time. See `docs/token-harbor.md`.
 
 ## Design notes
 
