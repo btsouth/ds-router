@@ -116,6 +116,120 @@ def test_no_declared_cap_means_no_provider_is_ever_over_one():
     assert dest_counts(result) == {"ollama-cloud": 9}
 
 
+def test_a_cap_that_cannot_be_read_is_refused_not_treated_as_unlimited():
+    """A mistyped cap used to read as "no cap", so a provider whose real limit was
+    3 was filled to 6. The planner cannot honour its main guarantee without knowing
+    the limit, so a cap it cannot read stops the plan instead."""
+    fleet = sessions(*[(f"oc{i}", "ollama-cloud") for i in range(6)])
+    quotas = healthy_quotas()
+    for bad in ("three", {"limit": 3}, [3], True):
+        try:
+            pl.plan(fleet, quotas, {"ollama-cloud": bad}, PROVIDERS, ALIAS)
+        except pl.CapError as exc:
+            assert "ollama-cloud" in str(exc), exc
+        else:
+            raise AssertionError(f"cap {bad!r} was accepted as unlimited")
+    # Absent and 0 keep meaning "no declared cap", which is a real configuration.
+    assert pl._cap_problems({"ollama-cloud": 0, "clinepass": None}) == []
+    for caps in ({}, {"ollama-cloud": 3}, {"ollama-cloud": "3"}):
+        assert pl._cap_problems(caps) == [], caps
+        pl.plan(fleet, quotas, caps, PROVIDERS, ALIAS)
+
+
+def test_a_malformed_cap_stops_the_cli_with_a_message():
+    """The timer runs this unattended, so the message has to be in the output even
+    when the plan is refused."""
+    import io
+    import tempfile
+    from contextlib import redirect_stderr
+
+    store = Path(tempfile.mkdtemp(prefix="ds-cap-")) / "state.db"
+    con = sqlite3.connect(store)
+    con.execute("create table sessions (id text primary key, session_key text, "
+                "billing_provider text, model_config text, title text, model text, "
+                "last_activity_at real, ended_at real)")
+    con.execute("create table session_turn_leases (conversation_id text, holder text, "
+                "acquired_at real, expires_at real)")
+    con.commit()
+    con.close()
+    cfg = Path(tempfile.mkdtemp(prefix="ds-cap-cfg-")) / "config.yaml"
+    cfg.write_text(
+        "default_model: ds\n"
+        "routing:\n"
+        "  concurrency:\n"
+        "    caps:\n"
+        "      ollama-cloud: three\n"
+        "providers:\n"
+        + "".join(f"  {name}:\n    base_url: https://x/v1\n    key_env: K\n"
+                 for name in PROVIDERS)
+        + "models:\n  ds:\n" + "".join(f"    {name}: {name}-ds\n" for name in PROVIDERS))
+    real_config = pl.CONFIG
+    pl.CONFIG = cfg
+    stderr = io.StringIO()
+    try:
+        with redirect_stderr(stderr):
+            code = pl.main(["--db", "--db-path", str(store), "--plan"])
+    finally:
+        pl.CONFIG = real_config
+    assert code == 7, (code, stderr.getvalue())
+    assert "unreadable concurrency cap" in stderr.getvalue(), stderr.getvalue()
+    assert "ollama-cloud" in stderr.getvalue(), stderr.getvalue()
+
+
+def test_the_cli_hands_the_concurrency_reading_to_the_planner():
+    """The README promises that sessions already running outside this plan still
+    occupy a slot. That held for library callers only: main() passed quotas alone,
+    so every provider started on zero load and a cap that was already full could be
+    filled again."""
+    import tempfile
+
+    store = Path(tempfile.mkdtemp(prefix="ds-cli-load-")) / "state.db"
+    now = time.time()
+    con = sqlite3.connect(store)
+    con.execute("create table sessions (id text primary key, session_key text, "
+                "billing_provider text, model_config text, title text, model text, "
+                "last_activity_at real, ended_at real)")
+    con.execute("create table session_turn_leases (conversation_id text, holder text, "
+                "acquired_at real, expires_at real)")
+    # A session already running on ollama-cloud: not in the plan (it is archived),
+    # but it holds one of the three concurrent slots.
+    con.execute("insert into sessions values (?,?,?,?,?,?,?,?)",
+                ("busy", "busy-key", "ollama-cloud", "", "busy", "ds", now, None))
+    con.execute("insert into session_turn_leases values (?,?,?,?)",
+                ("busy-key", "h", now, now + 600))
+    con.commit()
+    con.close()
+
+    cfg = Path(tempfile.mkdtemp(prefix="ds-cli-cfg-")) / "config.yaml"
+    cfg.write_text(
+        "default_model: ds\n"
+        "routing:\n  concurrency:\n    caps:\n      ollama-cloud: 3\n"
+        "providers:\n"
+        + "".join(f"  {name}:\n    base_url: https://x/v1\n    key_env: K\n"
+                 for name in PROVIDERS)
+        + "models:\n  ds:\n" + "".join(f"    {name}: {name}-ds\n" for name in PROVIDERS))
+
+    seen: dict = {}
+    real_plan, real_collect, real_config = pl.plan, pl.collect_quotas, pl.CONFIG
+    pl.CONFIG = cfg
+    pl.collect_quotas = lambda providers, config: healthy_quotas()
+
+    def spy(fleet, readings, caps, providers, alias, **kwargs):
+        seen["readings"] = readings
+        seen["caps"] = caps
+        return real_plan(fleet, readings, caps, providers, alias, **kwargs)
+
+    pl.plan = spy
+    try:
+        code = pl.main(["--db", "--db-path", str(store), "--plan"])
+    finally:
+        pl.plan, pl.collect_quotas, pl.CONFIG = real_plan, real_collect, real_config
+    assert code == 0, code
+    assert seen["readings"]["ollama-cloud"]["load"] == 1, seen["readings"].get("ollama-cloud")
+    assert seen["readings"]["ollama-cloud"].get("quota") is not None, "quotas were dropped"
+    assert seen["caps"] == {"ollama-cloud": 3}, seen["caps"]
+
+
 def test_a_draining_provider_is_passed_over_while_a_healthier_one_has_room():
     """Population first, but not onto a provider that is about to throttle.
 
@@ -347,9 +461,14 @@ def test_apply_reports_a_reply_that_means_nothing_happened():
     assert len(t.calls) == 2, "must retry once with confirmation"
     assert t.calls[1][1].get("confirm_expensive_model") is True, t.calls[1][1]
 
-    # A plain success is still a success, and a useless reply is not a failure.
-    for reply in ({"key": "model", "scope": "session"}, None, "ok"):
+    # A plain success is still a success. A reply with no result is neither: the
+    # backend never said the move happened, so it must not be reported as one.
+    for reply in ({"key": "model", "scope": "session"}, "ok"):
         assert pl.apply(move, T(reply), dry_run=False)[0].ok
+    for empty in (None, {}, {"result": None}):
+        result = pl.apply(move, T(empty), dry_run=False)[0]
+        assert not result.ok, f"{empty!r} must not be reported as a completed move"
+        assert "confirm" in (result.error or ""), (empty, result.error)
 
 
 def test_a_failed_quota_read_does_not_eject_sessions_from_a_working_provider():
@@ -498,7 +617,7 @@ def test_apply_refuses_to_write_with_state_db_ids():
             self.calls = []
         def call(self, method, params):
             self.calls.append(method)
-            return {}
+            return {"key": "model", "scope": "session"}
         def close(self):
             pass
 

@@ -20,10 +20,11 @@ Both are read-only. Nothing here writes to the session store.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -32,6 +33,7 @@ class Load:
 
     counts: dict[str, int] = field(default_factory=dict)
     source: str = "none"
+    error: str = ""
 
     def count(self, provider: str) -> int:
         return int(self.counts.get(provider, 0))
@@ -39,6 +41,72 @@ class Load:
     @property
     def total(self) -> int:
         return sum(self.counts.values())
+
+    @property
+    def readable(self) -> bool:
+        """True when an empty count means "idle" rather than "unknown".
+
+        These used to be the same value: a store whose tables could not be read
+        returned counts {} and source "none", exactly like a healthy store with
+        nothing running, so a saturated provider looked idle and its cap stopped
+        constraining anything. Callers cannot fix that without being able to tell
+        the two apart, which is what this field is for.
+
+        "disabled" counts as readable: the caller switched the reading off in
+        config, which is a choice rather than a failure.
+        """
+        if self.source in ("leases", "activity", "disabled"):
+            return True
+        return self.source == "none" and not self.error
+
+
+# Hermes writes the generic identity "custom" into billing_provider for every
+# named custom provider, so it names no provider at all.
+_GENERIC_PROVIDER = "custom"
+
+
+def _config_provider(model_config: Any) -> str:
+    """The provider named inside a session's stored model config, or ''."""
+    if not model_config:
+        return ""
+    try:
+        parsed = json.loads(model_config) if isinstance(model_config, str) else model_config
+    except (TypeError, ValueError):
+        return ""
+    if isinstance(parsed, dict) and parsed.get("provider"):
+        return str(parsed["provider"])
+    return ""
+
+
+def provider_of(billing_provider: Any, model_config: Any) -> str:
+    """The provider a session runs on, or '' when unknowable.
+
+    ``model_config.provider`` wins because it holds the durable config key
+    (``clinepass``), while ``billing_provider`` holds the runtime identity, which
+    is the generic ``custom`` for any named custom provider. Grouping on
+    ``billing_provider`` alone filed those sessions under a provider named
+    "custom" that no cap is ever declared for, so a cap on the real provider could
+    never see them. ``placement.py`` reads the same rule, from here, so the two
+    modules cannot disagree about the same session.
+    """
+    for candidate in (_config_provider(model_config), billing_provider):
+        name = str(candidate or "").strip()
+        if name and name != _GENERIC_PROVIDER:
+            return name
+    return ""
+
+
+def _tally(rows: Any) -> tuple[dict[str, int], str]:
+    """Count rows per provider. Returns (counts, note about unreadable rows)."""
+    counts: dict[str, int] = {}
+    unknown = 0
+    for _id, _key, billing, model_config in rows:
+        name = provider_of(billing, model_config)
+        if not name:
+            unknown += 1
+            continue
+        counts[name] = counts.get(name, 0) + 1
+    return counts, (f"{unknown} session(s) with no readable provider" if unknown else "")
 
 
 def _store_path(session_db: Optional[Path] = None) -> Path:
@@ -67,13 +135,15 @@ def active_by_provider(
     now = time.time() if now is None else now
     path = _store_path(session_db)
     if not path.exists():
-        return Load({}, "no-store")
+        return Load({}, "no-store", f"no session store at {path}")
 
     try:
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
-    except sqlite3.Error:
-        return Load({}, "unreadable")
+    except sqlite3.Error as exc:
+        return Load({}, "unreadable", f"cannot open {path}: {exc}")
 
+    failures: list[str] = []
+    lease_rows: list[Any] = []
     try:
         # Leases held by a session, still valid or acquired recently. A lease
         # that expired long ago is history, not load.
@@ -83,8 +153,8 @@ def active_by_provider(
             from session_turn_leases l
             """
         ))
-    except sqlite3.Error:
-        lease_rows = []
+    except sqlite3.Error as exc:
+        failures.append(f"session_turn_leases: {exc}")
 
     counts: dict[str, int] = {}
     source = "none"
@@ -103,31 +173,42 @@ def active_by_provider(
             # fewer matches rather than a hard error.
             try:
                 rows = con.execute(
-                    f"select billing_provider, count(*) from sessions "
-                    f"where id in ({placeholders}) or session_key in ({placeholders}) "
-                    f"group by billing_provider",
+                    f"select id, session_key, billing_provider, model_config from sessions "
+                    f"where id in ({placeholders}) or session_key in ({placeholders})",
                     tuple(ids) + tuple(ids),
                 )
-                counts = {(p or "(unknown)"): int(n) for p, n in rows}
-            except sqlite3.Error:
+                counts, note = _tally(rows)
+                if note:
+                    failures.append(note)
+            except sqlite3.Error as exc:
+                failures.append(f"sessions by lease: {exc}")
                 counts = {}
 
-    if not counts:
-        # No lease data (or no leases held). Fall back to recent activity.
+    if not counts and source != "leases":
+        # No lease data (or the leases matched no session). Fall back to recent
+        # activity, which is a weaker signal: a session that finished a turn
+        # recently still occupies its provider's connection briefly.
         try:
             rows = con.execute(
-                "select billing_provider, count(*) from sessions "
-                "where last_activity_at > ? group by billing_provider",
+                "select id, session_key, billing_provider, model_config from sessions "
+                "where last_activity_at > ?",
                 (now - activity_window_seconds,),
             )
-            counts = {(p or "(unknown)"): int(n) for p, n in rows}
+            counts, note = _tally(rows)
             if counts:
                 source = "activity"
-        except sqlite3.Error:
-            pass
+            if note:
+                failures.append(note)
+        except sqlite3.Error as exc:
+            failures.append(f"sessions by activity: {exc}")
 
     con.close()
-    return Load(counts, source)
+    detail = "; ".join(failures)[:200]
+    if failures and not counts:
+        # Nothing could be read. An empty count here is ignorance, not idleness,
+        # and the caller has to be able to tell which.
+        return Load({}, "unreadable", detail)
+    return Load(counts, source, detail)
 
 
 def over_capacity(load: Load, caps: dict[str, int]) -> dict[str, int]:

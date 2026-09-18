@@ -57,6 +57,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+import load as load_mod  # noqa: E402
 import quota as quota_mod  # noqa: E402
 import routing as routing_mod  # noqa: E402
 
@@ -228,9 +229,30 @@ def _model_id_for(spec: Any, alias: str) -> str:
 
 
 def _positive_cap(value: Any) -> Optional[int]:
-    """A cap only counts when it is a positive integer. Absent/0 = unbounded."""
+    """A cap only counts when it is a positive integer. Absent/0 = unbounded.
+
+    ``None`` covers both "no cap was declared" and "a cap that cannot be read",
+    which are not the same thing, so ``_cap_problems`` reports the second one
+    before planning starts: a mistyped cap read as unlimited fills a provider
+    past a limit it really has.
+    """
     as_int = _as_int(value)
     return as_int if as_int is not None and as_int > 0 else None
+
+
+class CapError(ValueError):
+    """A declared concurrency cap that is not a positive integer."""
+
+
+def _cap_problems(caps: Any) -> list[str]:
+    """Declared caps that cannot be read. Absent and 0 stay meaning "unbounded"."""
+    problems: list[str] = []
+    for name, value in (caps or {}).items():
+        if value is None or value == 0:
+            continue
+        if _positive_cap(value) is None:
+            problems.append(f"{name}: {value!r}")
+    return problems
 
 
 # --------------------------------------------------------------------------- #
@@ -418,6 +440,8 @@ def plan(sessions: Iterable[Any], quotas_or_load: Any = None, caps: Any = None,
     * a provider that does not serve the alias is never a destination;
     * a destination that is draining is used only when no destination that is not
       draining can take the session (see ``_destination``);
+    * a declared cap that cannot be read as a positive integer raises, rather than
+      being treated as "no cap";
     * the same input always produces the same output (every ordering in here is
       a sort on names and session ids, never on dict iteration order).
 
@@ -427,6 +451,12 @@ def plan(sessions: Iterable[Any], quotas_or_load: Any = None, caps: Any = None,
 
     Returns one `Assignment` per session, in a deterministic order.
     """
+    problems = _cap_problems(caps)
+    if problems:
+        raise CapError("unreadable concurrency cap(s) in config.yaml: "
+                       + "; ".join(problems)
+                       + " (a cap is a positive integer; remove it or fix the value, "
+                         "because a cap that cannot be read is not 'unlimited')")
     weights = dict(weights or WEIGHTS)
     now = time.time() if now is None else now
     declared = dict(providers or {})
@@ -550,6 +580,15 @@ def counts(assignments: Iterable[Assignment]) -> dict[str, int]:
 
 class TransportError(RuntimeError):
     """A transport could not carry a call: no backend, no socket, or a refusal."""
+
+
+class NotSentError(TransportError):
+    """The request never reached the backend, so repeating it cannot duplicate work.
+
+    Only this fault is retried. A timeout, a closed socket or a malformed frame
+    after the request went out may already have been applied by the backend, and
+    config.set is a state mutation.
+    """
 
 
 class Transport:
@@ -883,30 +922,39 @@ class LiveTransport(Transport):
         client = _WSClient(url, timeout=self.timeout)
         try:
             client.connect()
-        except TransportError:
+        except NotSentError:
             raise
+        except TransportError as exc:
+            # A connection is never a mutation: safe to repeat.
+            raise NotSentError(str(exc)) from exc
         except OSError as exc:
-            raise TransportError(f"could not reach {self.backend.describe()}: {exc}") from exc
+            raise NotSentError(f"could not reach {self.backend.describe()}: {exc}") from exc
         self._ws = client
         return client
 
     def call(self, method: str, params: dict) -> dict:
         """One JSON-RPC round trip. Reconnects once on a broken connection.
 
-        Only a CONNECTION fault is retried. A well-formed error reply is a final
-        answer: retrying it would re-send a state mutation like config.set that the
-        backend already processed, and would hide the real error behind an
-        eventual socket error.
+        Only a fault that happened BEFORE the request went out is retried. A
+        well-formed error reply is a final answer: retrying it would re-send a
+        state mutation like config.set that the backend already processed, and
+        would hide the real error behind an eventual socket error. A timeout or a
+        closed socket after the send is in the same class: the backend may have
+        applied the change before the reply was lost, so repeating it can apply it
+        twice while reporting a failure.
         """
         for attempt in (0, 1):
             try:
                 return self._call_once(method, params)
             except BackendError:
                 raise  # the server answered; do not repeat the request
-            except TransportError:
+            except NotSentError:
                 self.close()
                 if attempt:
                     raise
+            except TransportError:
+                self.close()
+                raise
         raise TransportError("unreachable")  # pragma: no cover
 
     def _call_once(self, method: str, params: dict) -> dict:
@@ -915,6 +963,9 @@ class LiveTransport(Transport):
         request = {"jsonrpc": "2.0", "id": self._id, "method": method, "params": params or {}}
         try:
             client.send_text(json.dumps(request))
+        except (OSError, socket.timeout) as exc:
+            raise NotSentError(f"{method}: could not send: {exc}") from exc
+        try:
             deadline = time.time() + self.timeout
             while time.time() < deadline:
                 frame = json.loads(client.recv_text(timeout=deadline - time.time()))
@@ -977,12 +1028,11 @@ def _provider_of(billing_provider: Any, model_config: Any) -> str:
     is the generic ``custom`` for any named custom provider. Falling back to
     ``billing_provider`` keeps the pre-existing behaviour for the built-in
     providers, whose model config is empty.
+
+    The rule itself lives in ``load.provider_of``, so the planner and the load
+    reading cannot disagree about which provider the same session is on.
     """
-    for candidate in (_config_provider(model_config), billing_provider):
-        name = str(candidate or "").strip()
-        if name and name != _GENERIC_PROVIDER:
-            return name
-    return ""
+    return load_mod.provider_of(billing_provider, model_config)
 
 
 class BackendError(RuntimeError):
@@ -1167,24 +1217,34 @@ def _read_reply(reply: Any) -> tuple[str, str]:
     * ``deferred`` — the pick was stashed for the next turn, not applied now.
     * an ``error`` member — a failure delivered inside a well-formed reply.
 
-    Anything else (including None, a plain string, or a dict without these keys)
-    is reported as ok, so a transport that returns nothing useful is not
-    mistaken for a failure.
+    Anything else (including a plain string) is reported as ok, so a transport that
+    returns a bare success token is not mistaken for a failure. A reply that carries
+    NO result is different: it is reported as ``unconfirmed``, because the backend
+    never said the move happened and this whole function exists to keep a returned
+    call from being read as a completed action.
     """
-    if not isinstance(reply, dict):
+    if isinstance(reply, dict):
+        if reply.get("confirm_required"):
+            return "blocked", str(reply.get("confirm_message")
+                                  or "the backend asked for confirmation and applied nothing")
+        if reply.get("deferred"):
+            return "deferred", "the backend stashed this change for the next turn instead of applying it"
+        error = reply.get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+            message = error.get("message") or error.get("data") or "unspecified error"
+            return "error", f"backend error {code}: {message}" if code else str(message)
+        if error:
+            return "error", str(error)
+        # The transport wraps a non-dict result as {"result": <value>}, so a null
+        # result arrives as exactly this shape.
+        if set(reply) <= {"result"} and reply.get("result") in (None, "", {}, []):
+            return "unconfirmed", ("the backend returned no result for this call, so the "
+                                  "move cannot be confirmed")
         return "ok", ""
-    if reply.get("confirm_required"):
-        return "blocked", str(reply.get("confirm_message")
-                              or "the backend asked for confirmation and applied nothing")
-    if reply.get("deferred"):
-        return "deferred", "the backend stashed this change for the next turn instead of applying it"
-    error = reply.get("error")
-    if isinstance(error, dict):
-        code = error.get("code")
-        message = error.get("message") or error.get("data") or "unspecified error"
-        return "error", f"backend error {code}: {message}" if code else str(message)
-    if error:
-        return "error", str(error)
+    if reply in (None, "", {}, []):
+        return "unconfirmed", ("the backend returned no result for this call, so the move "
+                              "cannot be confirmed")
     return "ok", ""
 
 
@@ -1367,15 +1427,38 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("  Check that state.db is readable, or pass --db-path.", file=sys.stderr)
         return 5
     quotas = collect_quotas(providers, config)
-    assignments = plan(sessions, quotas, caps, providers, alias,
-                       skip_at=float(routing_cfg.get("skip_at", SKIP_AT)),
-                       weights=routing_cfg.get("window_weights") or WEIGHTS)
+    # The concurrency reading has to be handed to the planner, or the rule that a
+    # provider already busy from work outside this plan takes no new session holds
+    # only for callers of the library and not for the shipped CLI.
+    session_db = Path(args.db_path) if args.db_path else None
+    try:
+        live_load = load_mod.active_by_provider(session_db=session_db)
+    except Exception as exc:  # a load reading is an optimisation and must not stop a plan
+        live_load = load_mod.Load({}, "unreadable", f"{type(exc).__name__}: {exc}")
+    readings: dict[str, dict[str, Any]] = {name: {"quota": q} for name, q in quotas.items()}
+    for name, count in live_load.counts.items():
+        readings.setdefault(name, {})["load"] = count
+
+    try:
+        assignments = plan(sessions, readings, caps, providers, alias,
+                           skip_at=float(routing_cfg.get("skip_at", SKIP_AT)),
+                           weights=routing_cfg.get("window_weights") or WEIGHTS)
+    except CapError as exc:
+        print(f"refusing to plan: {exc}", file=sys.stderr)
+        return 7
 
     if not quotas and providers:
         print("  note: no quota readings were collected, so this plan spreads by load "
               "only and knows nothing about headroom.", file=sys.stderr)
         print("  note: check the provider keys and the quota endpoints "
               "(router.py --dry-run shows what each provider reports).", file=sys.stderr)
+    if not live_load.readable:
+        print(f"  note: the concurrency reading is unusable ({live_load.error or live_load.source}), "
+              "so no provider is charged for work already running on it.", file=sys.stderr)
+        print("  note: caps still hold for the sessions in this plan.", file=sys.stderr)
+    elif live_load.counts:
+        print(f"  note: {live_load.total} session(s) active elsewhere count against their "
+              f"provider's cap ({live_load.source}).", file=sys.stderr)
 
     # --limit shortens the PRINTED rows only. Truncating the assignment list
     # itself would make `--apply --limit N` write an arbitrary prefix of the plan,
@@ -1388,6 +1471,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             "source": source,
             "caps": caps,
             "counts": counts(assignments),
+            "load": {"source": live_load.source, "readable": live_load.readable,
+                     "error": live_load.error,
+                     "counts": dict(sorted(live_load.counts.items()))},
             "printed": len(shown),
             "assignments": [{"session_id": a.session_id, "from": a.from_provider,
                              "to": a.provider, "model_id": a.model_id, "keep": a.keep,

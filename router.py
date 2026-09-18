@@ -181,6 +181,8 @@ def main() -> int:
             "reason": decision.reason,
             "active_sessions": live_load.counts,
             "concurrency_caps": caps,
+            "load": {"source": live_load.source, "readable": live_load.readable,
+                     "error": live_load.error},
             "health": health,
             "candidates": [
                 {"provider": c.provider, "risk": round(c.pressure, 4), "headroom": round(c.headroom, 4),
@@ -198,6 +200,11 @@ def main() -> int:
     over = load_mod.over_capacity(live_load, caps)
     load_desc = ", ".join(f"{n}={live_load.count(n)}/{caps.get(n, '-')}" for n in providers)
     print(f"  active      : {load_desc}  (via {live_load.source})")
+    if not live_load.readable:
+        # An unreadable store and an idle one both count zero, so say which this
+        # is: the concurrency pressure term is silently absent otherwise.
+        print(f"  load unknown: {live_load.error or live_load.source}"
+              "  (no provider is charged for work already running on it)")
     if over:
         print(f"  OVER CAP    : " + ", ".join(f"{n} by {o}" for n, o in over.items()))
     print()
