@@ -1,0 +1,114 @@
+listen:
+  host: 127.0.0.1
+  port: 8788
+
+# The model table is the whole point of this file.
+#
+# Logical alias -> the id each provider calls it. Hermes asks for the alias
+# ("deepseek-v4.1-flash"); the router translates per provider. A new model is a
+# new entry here and nothing else changes. A model only some providers serve is
+# fine: the router picks among the providers that list it.
+default_model: deepseek-v4.1-flash
+
+models:
+  deepseek-v4.1-flash:
+    commandcode: deepseek/deepseek-v4.1-flash
+    opencode-go: deepseek-v4.1-flash
+    ollama-cloud: deepseek-v4.1-flash
+    clinepass: cline-pass/deepseek-v4.1-flash
+  # Uncomment when it ships. IDs below are guesses; check each catalog first
+  # with: router.py --list-models
+  # deepseek-v4.2-flash:
+  #   commandcode: deepseek/deepseek-v4.2-flash
+  #   opencode-go: deepseek-v4.2-flash
+  #   ollama-cloud: deepseek-v4.2-flash
+  kimi-k3:
+    commandcode: moonshotai/Kimi-K3
+    opencode-go: kimi-k3
+    ollama-cloud: kimi-k3
+
+providers:
+  commandcode:
+    base_url: https://api.commandcode.ai/provider/v1
+    key_env: COMMANDCODE_API_KEY
+    quota: commandcode
+  opencode-go:
+    base_url: https://opencode.ai/zen/go/v1
+    key_env: OPENCODE_GO_API_KEY
+    quota: opencode_go
+    # OpenCode refuses a request without this and cannot pin prompt caching.
+    session_header: x-opencode-session
+  ollama-cloud:
+    base_url: https://ollama.com/v1
+    key_env: OLLAMA_API_KEY
+    quota: ollama
+  clinepass:
+    # Note the base_url carries the /api/v1 prefix, unlike the others' /v1.
+    base_url: https://api.cline.bot/api/v1
+    key_env: HERMES_CUSTOM_CLINEPASS_API_KEY
+    quota: clinepass
+
+routing:
+  # A provider is "spent" once its tightest weighted window reaches this.
+  skip_at: 0.85
+  # Concurrency, read live from Hermes' session store. A cap applies to
+  # requests IN FLIGHT, not to sessions that merely exist, so this is measured
+  # from active turn leases. Ollama Cloud Pro is the only provider that
+  # documents a cap: 3 concurrent requests, queueing beyond that and rejecting
+  # when the queue is full. Queuing is a latency risk rather than a hard
+  # failure, so being over capacity raises a provider's pressure without
+  # disqualifying it outright.
+  concurrency:
+    enabled: true
+    caps:
+      ollama-cloud: 3
+    # Pressure added per session over the cap, on the same 0..1 scale as
+    # window risk (where 0.26 means "exhausts in about 13 hours").
+    #
+    # Calibrated DOWN from 0.15 deliberately: at 0.15, two queued sessions
+    # (0.30) outweighed a provider whose weekly window would run out within
+    # 13 hours (0.26). That is backwards. A queued request still completes,
+    # just slower; a window that runs out does not complete at all. So a
+    # queue overage is priced well below a real exhaustion risk.
+    pressure_per_over: 0.08
+    # Cap the contribution so a badly overloaded provider stays reachable
+    # rather than being excluded entirely.
+    max_pressure: 0.4
+  # How long a conversation stays on the provider it started on. Sticky on
+  # purpose: every switch resets the upstream prompt cache, so switching to
+  # chase a slightly cheaper window costs more than it saves. Hard exhaustion
+  # bypasses this entirely.
+  stick_seconds: 1800
+  # Window weights. The short windows are what actually interrupt a session,
+  # so they dominate; a monthly window only matters once it is nearly gone.
+  window_weights:
+    session: 1.0
+    weekly: 1.0
+    monthly: 0.6
+  # Quota snapshots older than this are treated as unknown and ignored.
+  quota_ttl_seconds: 300
+  # Reuse the omarchy-usage-dashboard collector's snapshots when they are
+  # fresh, instead of polling the same endpoints a second time.
+  reuse_collector_state: true
+  collector_state_dir: ~/.local/state/omarchy/ai-usage
+
+# Peak pricing. Both CommandCode and Ollama bill more during their own peak
+# windows, and the windows barely overlap, which makes time-of-day a real
+# routing dimension rather than a curiosity.
+#
+#   commandcode: peak 01-04 and 06-10 UTC, Mon-Fri  (6h/day at 2x)
+#   ollama:      peak 12-18 UTC, Mon-Fri             (6h/day at 2x)
+#
+# Between 12:00 and 18:00 UTC, Ollama pays double and CommandCode does not.
+# Between 01:00 and 10:00 UTC the reverse. Preferring the off-peak provider
+# during those blocks is free efficiency: no cache reset, no quality change.
+peak:
+  preferred_tiebreak: true
+  windows:
+    commandcode:
+      # Each window is [start_hour_utc, end_hour_utc); weekdays only.
+      - [1, 4]
+      - [6, 10]
+    ollama-cloud:
+      - [12, 18]
+    opencode-go: []
