@@ -278,6 +278,29 @@ def test_a_failed_quota_read_does_not_eject_sessions_from_a_working_provider():
     assert moved(result) == [], [a.reason for a in moved(result)]
 
 
+def test_a_session_running_another_model_is_never_repointed():
+    """The wire format is '<model-id> --provider <p> --session', so a move sets the
+    MODEL as well as the provider. Relocating a session that is deliberately
+    running another model would overwrite that choice, so it must be left alone."""
+    fleet = [pl.Session("a", "ollama-cloud", "ka", model="kimi-k3"),
+             pl.Session("b", "ollama-cloud", "kb", model="kimi-k3")]
+    quotas = {"ollama-cloud": q.Quota("ollama-cloud", [win("weekly", 0.1, resets_in=3 * 86400)])}
+    providers = {"commandcode": {"models": {ALIAS: "cd/ds"}},
+                 "ollama-cloud": {"models": {ALIAS: "ds", "kimi-k3": "kimi-k3"}}}
+
+    result = pl.plan(fleet, quotas, {"ollama-cloud": 1}, providers, ALIAS)
+
+    assert moved(result) == [], [a.reason for a in moved(result)]
+    for a in result:
+        assert a.model_id == "kimi-k3", a.model_id
+        assert "not " + ALIAS in a.reason, a.reason
+
+    # An unknown model is NOT treated as a different one, or nothing would move.
+    unknown = [pl.Session("c", "ollama-cloud", "kc", model=""),
+               pl.Session("d", "ollama-cloud", "kd", model="")]
+    assert moved(pl.plan(unknown, quotas, {"ollama-cloud": 1}, providers, ALIAS))
+
+
 def test_the_same_input_produces_the_same_plan_twice():
     fleet = sessions(*[(f"oc{i}", "ollama-cloud") for i in range(7)],
                      *[(f"cc{i}", "commandcode") for i in range(2)],

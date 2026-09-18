@@ -123,10 +123,16 @@ state, not a global config write. Real output from a 21-session fleet:
 
 Design rules, all asserted by tests:
 
-- **Never exceed a declared cap.** `routing.concurrency.caps` in `config.yaml`.
+- **Never assign more sessions to a provider than its cap allows**, counting the
+  sessions already there that are not part of the plan. Note that a provider can
+  still be *running* over its cap if something outside ds-router started work;
+  the planner will not add to it.
 - **Leave sessions alone unless there is a reason.** Moving a session resets its
-  prompt cache, so a session only moves when its provider is over cap or
-  exhausted. 16 of 21 stayed put above.
+  prompt cache, so a session only moves when its provider is over cap, hard
+  exhausted, or cannot serve your chosen model. 16 of 21 stayed put above.
+  A provider whose *usage endpoint* fails is not a reason to move: that is a
+  telemetry outage, not a broken endpoint, so a session already there stays. It
+  does stop the provider being chosen as a *destination* until it reads again.
 - **Never send a session to a provider that does not serve your model.**
 - **A provider ds-router does not manage is never touched.**
 - **Deterministic** — the same fleet always produces the same plan.
@@ -239,6 +245,10 @@ Claims in this README that have been measured, rather than reasoned about:
   provider.
 - ClinePass tool calling, streaming, and its usage API on a personal plan.
 - `placement.py --plan` against a live 21-session desktop backend.
+- Three critical failures found by an independent audit and fixed: an unreadable
+  session store rewriting the whole fleet, `apply` reporting success for replies
+  that mean nothing happened, and a crafted clone path executing as shell through
+  the uninstall manifest.
 - `install.sh` / `uninstall.sh` in an isolated sandbox, including that
   `--dry-run` writes nothing and a re-run is a no-op.
 
@@ -263,14 +273,23 @@ Claims that are reasoned but **not** verified end to end are flagged inline.
   | case | what happens |
   |---|---|
   | `session.create` with `{model, provider}` | **Works.** The session is created on that provider; `info.provider` reports it and the stored `model_config.provider` agrees. This is the reliable path. |
-  | `config.set` on a new session | Persists `model_config.provider` correctly, and the RPC confirms `scope: "session"`. |
-  | `config.set` on a session that has *already run a turn* | The override persists for the next rebuild, but that session's in-flight agent kept its original provider for one turn. |
+  | `config.set` on a **idle** session | Applies immediately; the RPC confirms `scope: "session"`. |
+  | `config.set` on a session **mid-turn** | Deliberately deferred: the backend stashes the pick and applies it at the next turn start. The change is not lost, it is late. |
 
-  So the dependable behaviour today is **choosing a provider when a session
-  starts**, which is exactly the concurrency fix needed. Moving a session that is
-  mid-conversation costs a cache reset and may take a turn to take effect — which
-  is also why the planner only moves sessions whose provider is over cap or
-  exhausted, and leaves the rest alone.
+  That deferral matters here, because over-cap providers are disproportionately
+  the *busy* ones — a provider is over its concurrency cap precisely because
+  sessions are running on it — so some of the moves the planner wants are exactly
+  the ones that land a turn later. Nothing is lost; the spread completes as those
+  turns finish. The dependable behaviour is **choosing a provider when a session
+  starts**, which is the concurrency fix itself.
+
+  A move can also be **refused**: Hermes asks for confirmation before abandoning a
+  large cached context (>= `model.switch_context_confirm_tokens`, 100k by default)
+  when the destination uses a different model id. That fires for cross-provider
+  moves, since `cline-pass/...` and `deepseek/...` are not the same string as
+  `deepseek-v4.1-flash`. `placement.py` is non-interactive and its intent is
+  unambiguous, so it retries once with the backend's confirmation flag rather than
+  reporting a move that did not happen.
 - **A hang is not bounded by ds-router.** Health probing catches a *dead*
   provider before you are routed to it, but nothing here can interrupt one that
   dies mid-turn — only Hermes' own timeout can. There is a Hermes bug in that

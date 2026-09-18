@@ -314,6 +314,19 @@ def _destination(cands: dict[str, _Candidate], assigned: dict[str, int], *,
     return best[1] if best else None
 
 
+def _running_other_model(session: Session, alias: str) -> bool:
+    """True when the session is on a known model that is not the one being placed.
+
+    The config.set wire format is ``<model-id> --provider <p> --session``, so a
+    move sets the model too. Relocating a session that is deliberately running
+    another model would overwrite that choice, so such a session is left alone and
+    only counted as load. An unknown model ('' from a DB row that lacks it) is not
+    treated as different, or nothing would ever be movable.
+    """
+    model = (session.model or "").strip()
+    return bool(model) and model != alias
+
+
 def _why_leaving(source: str, cands: dict[str, _Candidate], declared: dict[str, Any],
                  alias: str, over_cap: bool) -> str:
     """A one-line justification for moving a session, for the printed table.
@@ -389,6 +402,15 @@ def plan(sessions: Iterable[Any], quotas_or_load: Any = None, caps: Any = None,
         for session in sorted((s for s in rows if (s.provider or "") == name),
                               key=lambda s: s.id):
             seen.add(session.id)
+            if _running_other_model(session, alias):
+                # Not ours to move: the wire format sets the model as well as the
+                # provider, so relocating this session would silently replace the
+                # model the user chose. It still occupies a slot.
+                kept += 1
+                assigned[name] += 1
+                out.append(Assignment(session.id, name, session.model, name, keep=True,
+                                      reason=f"stays on {name} (running {session.model}, not {alias})"))
+                continue
             if cand.may_keep and (room is None or kept < room):
                 kept += 1
                 assigned[name] += 1
@@ -403,6 +425,11 @@ def plan(sessions: Iterable[Any], quotas_or_load: Any = None, caps: Any = None,
     for session in sorted(rows, key=lambda s: s.id):
         if session.id not in seen:
             seen.add(session.id)
+            if _running_other_model(session, alias):
+                out.append(Assignment(session.id, session.provider or "", session.model,
+                                      session.provider or "", keep=True,
+                                      reason=f"not moved: running {session.model}, not {alias}"))
+                continue
             movers.append((session, False))
 
     # Phase 2 — the movers, in id order, each to the least loaded usable
