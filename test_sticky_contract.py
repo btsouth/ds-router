@@ -60,3 +60,20 @@ def test_peak_alone_never_causes_a_mid_conversation_move():
     d = r.choose("ds", PROVIDERS, live, WEIGHTS, SKIP, sticky_provider="commandcode",
                  now=now, peak_providers={"commandcode"})
     assert d.provider == "commandcode", d.reason
+
+
+if __name__ == "__main__":
+    failures = 0
+    passed = 0
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"  pass  {name}")
+                passed += 1
+            except AssertionError as exc:
+                failures += 1
+                print(f"  FAIL  {name}: {exc}")
+    print(f"\n{'FAILED' if failures else 'all tests passed'} "
+          f"({passed} passed, {failures} failed)")
+    raise SystemExit(1 if failures else 0)
