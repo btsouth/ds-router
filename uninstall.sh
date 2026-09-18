@@ -23,7 +23,6 @@
 # ============================================================================
 set -eu
 
-PROG=uninstall.sh
 
 DRY_RUN=0
 KEEP_SYMLINK=0
@@ -73,6 +72,7 @@ while [ -h "$self" ]; do
     *)  self=$(dirname "$self")/$link ;;
   esac
 done
+# shellcheck disable=SC1007  # deliberate env override for cd, not a typo.
 ROUTER_DIR=$(CDPATH= cd "$(dirname "$self")" && pwd -P)
 
 CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
@@ -307,8 +307,13 @@ if [ -f "$MANIFEST" ]; then
   else
     rm -f "$MANIFEST"
     printf '  rm    %s\n' "$MANIFEST"
-    rmdir "$STATE_DIR" 2>/dev/null && printf '  rmdir %s\n' "$STATE_DIR" \
-      || note "$STATE_DIR kept (not empty — logs or other state remain)"
+    # if/else rather than `A && B || C`: the latter also runs the else branch
+    # when B fails, not only when A does.
+    if rmdir "$STATE_DIR" 2>/dev/null; then
+      printf '  rmdir %s\n' "$STATE_DIR"
+    else
+      note "$STATE_DIR kept (not empty — logs or other state remain)"
+    fi
   fi
 else
   skip "no manifest at $MANIFEST"

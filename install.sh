@@ -94,6 +94,8 @@ while [ -h "$self" ]; do
     *)  self=$(dirname "$self")/$link ;;
   esac
 done
+# shellcheck disable=SC1007  # CDPATH= is a deliberate env override for cd,
+# not an assignment typo: it stops a user's CDPATH from changing the result.
 ROUTER_DIR=$(CDPATH= cd "$(dirname "$self")" && pwd -P)
 
 CONFIG_HOME=${XDG_CONFIG_HOME:-$HOME/.config}
