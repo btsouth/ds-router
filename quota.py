@@ -355,25 +355,53 @@ _PARSERS: dict[str, Callable[[dict], list[Window]]] = {
 }
 
 
-# The windows each provider is expected to report. A response that omits one is not
-# a smaller plan, it is a reading with a hole in it: the missing window cannot be
-# reasoned about, and scoring the rest as if the provider had fewer limits is how a
-# partially-read provider wins a destination on data nobody checked.
+# The windows each provider kind is expected to report. Keyed by the `quota:` KIND
+# from config.yaml, not by the provider's name: the name is the user's to choose
+# (`providers: {go: {quota: opencode_go}}` is legal), and keying on it would silently
+# switch this rule off for that install.
+#
+# A response that omits one is not a smaller plan, it is a reading with a hole in it:
+# the missing window cannot be reasoned about, and scoring the rest as if the
+# provider had fewer limits is how a partially-read provider wins a destination on
+# data nobody checked.
 _EXPECTED_WINDOWS = {
     "commandcode": ("session", "weekly", "monthly"),
-    "opencode-go": ("session", "weekly", "monthly"),
-    "ollama-cloud": ("monthly",),
+    "opencode_go": ("session", "weekly", "monthly"),
+    "ollama": ("monthly",),
     "clinepass": ("session", "weekly", "monthly"),
 }
 
+# The names those kinds arrive under: a `quota:` value, or the snapshot file's
+# provider name. Both resolve to a key in _EXPECTED_WINDOWS.
+_KIND_ALIASES = {
+    "commandcode": "commandcode",
+    "opencode_go": "opencode_go",
+    "opencode-go": "opencode_go",
+    "ollama": "ollama",
+    "ollama-cloud": "ollama",
+    "clinepass": "clinepass",
+}
 
-def missing_windows(windows: list, provider: str) -> list[str]:
-    """Window kinds *provider* is expected to report but did not."""
-    expected = _EXPECTED_WINDOWS.get(str(provider))
+
+def resolve_kind(value: str) -> str:
+    """The quota kind behind a provider name or a `quota:` value.
+
+    Both spellings reach the window tables: `fetch_quota` knows the kind from config,
+    while `from_collector` is keyed by the snapshot's provider name. Neither should
+    have to know the other's vocabulary, and a provider the user renamed must not
+    lose the completeness rule.
+    """
+    text = str(value or "").strip()
+    return _KIND_ALIASES.get(text, text)
+
+
+def missing_windows(windows: list, kind: str) -> list[str]:
+    """Window kinds *kind* is expected to report but did not survive parsing."""
+    expected = _EXPECTED_WINDOWS.get(resolve_kind(kind))
     if not expected:
         return []
     have = {w.kind for w in windows if w.kind}
-    return [kind for kind in expected if kind not in have]
+    return [k for k in expected if k not in have]
 
 
 def describe_windows(windows: list) -> str:
@@ -381,16 +409,22 @@ def describe_windows(windows: list) -> str:
     return ", ".join(f"{w.label or w.kind} {w.percent:.0%}" for w in windows) or "nothing"
 
 
-def partial_note(provider: str, windows: list, *, skip: tuple = ()) -> str:
-    """The "a window went missing" note, or '' when the reading looks complete.
+def partial_note(windows: list, kind: str, *, skip: tuple = ()) -> str:
+    """The "a window did not survive" note, or '' when the reading looks complete.
+
+    The wording says "missing or unreadable" because a window the provider DID report
+    with an unusable value (a cap of 0, an unparseable reset) is dropped by the parser
+    and is indistinguishable from one the payload never carried. Both mean the same
+    thing for a decision: this window cannot be reasoned about.
 
     *skip* is for windows that legitimately come from another endpoint (CommandCode's
-    monthly window is fetched separately, and has its own note).
+    monthly window is fetched separately and carries its own note).
     """
-    missing = [kind for kind in missing_windows(windows, provider) if kind not in skip]
+    missing = [k for k in missing_windows(windows, kind) if k not in skip]
     if not missing:
         return ""
-    return f"partial reading: no {', '.join(missing)} window (read: {describe_windows(windows)})"
+    return (f"partial reading: no usable {', '.join(missing)} window "
+            f"(read: {describe_windows(windows)})")
 
 
 def fetch_quota(provider: str, spec: dict, key: str, timeout: float = 12.0) -> Quota:
@@ -423,8 +457,12 @@ def fetch_quota(provider: str, spec: dict, key: str, timeout: float = 12.0) -> Q
                             "credit figures")
             # Every window the credits payload was supposed to carry, on top of the
             # monthly one handled above.
-            if note == "":
-                note = partial_note(provider, windows, skip=("monthly",))
+            # The monthly note and a missing session/weekly window COMPOSE: reporting
+            # only the first would name one endpoint while the reading was missing two
+            # windows.
+            partial = partial_note(windows, kind, skip=("monthly",))
+            if partial:
+                note = f"{note}; {partial}" if note else partial
             if note:
                 # " (read: " and not "read:", which the note's own "unread:" would match.
                 note = note if " (read: " in note else f"{note} (read: {describe_windows(windows)})"
@@ -443,13 +481,13 @@ def fetch_quota(provider: str, spec: dict, key: str, timeout: float = 12.0) -> Q
         if kind == "opencode_go":
             payload = _http_json("https://opencode.ai/zen/go/v1/usage", key, timeout)
             windows = _PARSERS["opencode_go"](payload)
-            return Quota(provider, windows, time.time(), partial_note(provider, windows))
+            return Quota(provider, windows, time.time(), partial_note(windows, kind))
 
         if kind == "ollama":
             payload = _http_json("https://ollama.com/api/usage", key, timeout)
             plan = payload.get("plan") if isinstance(payload.get("plan"), str) else ""
             windows = _PARSERS["ollama"](payload)
-            return Quota(provider, windows, time.time(), partial_note(provider, windows), plan)
+            return Quota(provider, windows, time.time(), partial_note(windows, kind), plan)
 
         if kind == "clinepass":
             payload = _http_json("https://api.cline.bot/api/v1/users/me/plan/usage-limits", key, timeout)
@@ -462,7 +500,7 @@ def fetch_quota(provider: str, spec: dict, key: str, timeout: float = 12.0) -> Q
             except Exception:
                 # Cosmetic label only; never fail the quota read over it.
                 pass
-            return Quota(provider, windows, time.time(), partial_note(provider, windows), plan)
+            return Quota(provider, windows, time.time(), partial_note(windows, kind), plan)
 
         return Quota(provider, [], time.time(), f"no quota reader for {kind!r}")
     except Exception as exc:

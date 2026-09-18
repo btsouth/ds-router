@@ -221,6 +221,82 @@ def test_a_partial_provider_join_does_not_move_what_it_could_not_read():
     assert not placed.keep and placed.provider, placed.reason
 
 
+def test_the_sticky_hold_is_bounded_by_a_real_probe():
+    """A provider whose reading failed is held rather than abandoned, which is only
+    safe if something can still evict one that is genuinely gone. Hard exhaustion
+    needs a reading, and a reading is what is missing, so apply.py asks the router to
+    probe the sticky provider in exactly that case: one request, only while its
+    reading is bad."""
+    import io
+    import json
+    from contextlib import redirect_stdout
+    import apply as A
+    import load as q_load
+    import router as R
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return type("P", (), {"returncode": 0, "stdout": json.dumps({"chosen": "x"}), "stderr": ""})()
+
+    real_run = A.subprocess.run
+    A.subprocess.run = fake_run
+    try:
+        A.router_decision("clinepass", "ds")
+    finally:
+        A.subprocess.run = real_run
+    assert calls, calls
+    assert "--sticky" in calls[0] and "clinepass" in calls[0], calls[0]
+    assert "--verify-sticky" in calls[0], calls[0]
+    # With no sticky provider there is nothing to hold, so no probe is asked for.
+    calls.clear()
+    A.subprocess.run = fake_run
+    try:
+        A.router_decision(None, "ds")
+    finally:
+        A.subprocess.run = real_run
+    assert "--verify-sticky" not in calls[0], calls[0]
+
+    # And the router only probes when the reading really is unusable.
+    probed: list[str] = []
+    real_ping, real_collect, real_load_by, real_config = (
+        R.ping, R.collect, q_load.active_by_provider, R.load_config)
+    # main() reads providers from config.yaml; give it the two names this test uses.
+    R.load_config = lambda: {
+        "default_model": "ds",
+        "providers": {"healthy": {"base_url": "https://x/v1", "key_env": "K"},
+                      "broken": {"base_url": "https://x/v1", "key_env": "K"}},
+        "models": {"ds": {"healthy": "m", "broken": "m"}},
+        "routing": {}}
+    R.ping = lambda spec, key, model_id, timeout=40.0, max_tokens=64: (
+        probed.append("ping"), (False, 0.1, "connection refused"))[1]
+    R.collect = lambda providers, env, routing_cfg=None: {
+        "healthy": q.Quota("healthy", [win("monthly", 0.1)]),
+        "broken": q.Quota("broken", [], 0.0, "HTTPError: 401"),
+    }
+    q_load.active_by_provider = lambda: q_load.Load({}, "none")
+    real_argv = sys.argv
+    for sticky, expected in (("broken", 1), ("healthy", 0)):
+        probed.clear()
+        sys.argv = ["router.py", "--dry-run", "--verify-sticky", "--sticky", sticky, "--json"]
+        stdout = io.StringIO()
+        try:
+            with redirect_stdout(stdout):
+                R.main()
+        finally:
+            sys.argv = real_argv
+        assert len(probed) == expected, (sticky, probed)
+        payload = json.loads(stdout.getvalue())
+        if sticky == "broken":
+            # The probe failed, so the provider is hard: it can no longer be held.
+            broken = [c for c in payload["candidates"] if c["provider"] == "broken"][0]
+            assert broken["hard"] is True, broken
+            assert payload["chosen"] != "broken", payload["chosen"]
+    R.ping, R.collect, q_load.active_by_provider, R.load_config = (
+        real_ping, real_collect, real_load_by, real_config)
+
+
 def test_a_partial_apply_reports_the_counts_and_exits_nonzero():
     """Three of five moves succeeding must not read as a clean run, and every
     session must still be attempted."""
@@ -242,8 +318,12 @@ def test_a_partial_apply_reports_the_counts_and_exits_nonzero():
     transport = pl.FakeTransport(fail={"s3"})
     # main() prints which backend it read the fleet from, so the stand-in needs one.
     import types
+    import load as q_load
     transport.backend = types.SimpleNamespace(describe=lambda: "test backend")
-    real = (pl.LiveTransport, pl.enumerate_sessions, pl.collect_quotas, pl.CONFIG)
+    real = (pl.LiveTransport, pl.enumerate_sessions, pl.collect_quotas, pl.CONFIG,
+            q_load.active_by_provider)
+    # A hermetic load reading: the real one would make this depend on the machine.
+    q_load.active_by_provider = lambda **kwargs: q_load.Load({}, "none")
     pl.CONFIG = cfg
     pl.LiveTransport = lambda **kwargs: transport          # type: ignore[assignment]
     pl.enumerate_sessions = lambda transport=None, **kwargs: fleet  # type: ignore[assignment]
@@ -253,7 +333,8 @@ def test_a_partial_apply_reports_the_counts_and_exits_nonzero():
         with redirect_stdout(stdout):
             code = pl.main(["--apply"])
     finally:
-        pl.LiveTransport, pl.enumerate_sessions, pl.collect_quotas, pl.CONFIG = real
+        (pl.LiveTransport, pl.enumerate_sessions, pl.collect_quotas, pl.CONFIG,
+         q_load.active_by_provider) = real
     out = stdout.getvalue()
     assert code == 1, (code, out)
     assert "FAILED s3" in out, out
@@ -834,7 +915,7 @@ def test_an_unreadable_session_store_refuses_instead_of_reporting_no_sessions():
     try:
         pl.sessions_from_db(broken)
     except pl.StoreUnreadable as exc:
-        assert "cannot open" in str(exc) or "cannot read" in str(exc), exc
+        assert "no sessions table" in str(exc) or "cannot open" in str(exc), exc
     else:
         raise AssertionError("an unreadable store must not enumerate as empty")
     # A missing store is a different thing: nothing to enumerate, not a failure.

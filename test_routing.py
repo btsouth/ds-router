@@ -199,14 +199,14 @@ def test_a_partial_reading_is_not_a_complete_one():
                       "weekly": {"status": "ok", "percent": 88, "resetsAt": "2026-09-21T00:00:00Z"},
                       "monthly": {"status": "ok", "percent": 80, "resetsAt": "2026-09-27T00:00:00Z"}}}
     windows = q.parse_opencode_go(full)
-    assert q.missing_windows(windows, "opencode-go") == [], q.missing_windows(windows, "opencode-go")
-    assert q.partial_note("opencode-go", windows) == ""
+    assert q.missing_windows(windows, "opencode_go") == [], q.missing_windows(windows, "opencode_go")
+    assert q.partial_note(windows, "opencode_go") == ""
 
     partial = {"usage": {"weekly": {"status": "ok", "percent": 10,
                                     "resetsAt": "2026-09-21T00:00:00Z"}}}
     windows = q.parse_opencode_go(partial)
-    assert q.missing_windows(windows, "opencode-go") == ["session", "monthly"]
-    note = q.partial_note("opencode-go", windows)
+    assert q.missing_windows(windows, "opencode_go") == ["session", "monthly"]
+    note = q.partial_note(windows, "opencode_go")
     assert "partial reading" in note and "session" in note and "monthly" in note, note
     assert "read: " in note, note
 
@@ -224,10 +224,21 @@ def test_a_partial_reading_is_not_a_complete_one():
     assert pl.plan(fleet, {"opencode-go": quota, "other": healthy_other}, {},
                    providers, "ds")[0].keep
 
+    # The rule is keyed on the quota KIND, not on the provider's name, so renaming a
+    # provider in config.yaml cannot switch it off, and the snapshot path (which is
+    # keyed by name) resolves to the same set.
+    assert q.resolve_kind("opencode-go") == "opencode_go"
+    assert q.resolve_kind("ollama-cloud") == "ollama"
+    assert q.missing_windows(windows, "opencode_go") == ["session", "monthly"]
+    assert q.missing_windows(windows, "opencode-go") == ["session", "monthly"]
+    # A kind this project has no window list for is not judged, which is the limit of
+    # the rule rather than a silent pass.
+    assert q.missing_windows(windows, "some-other-api") == []
+
     # A provider that only ever has one window is not partial.
     ollama = q.parse_ollama({"limits": {"monthly": {"usage": 0.5, "models": []}}})
-    assert q.missing_windows(ollama, "ollama-cloud") == []
-    assert q.partial_note("ollama-cloud", ollama) == ""
+    assert q.missing_windows(ollama, "ollama") == []
+    assert q.partial_note(ollama, "ollama") == ""
 
 
 def test_a_partial_snapshot_is_not_used_as_the_reading():

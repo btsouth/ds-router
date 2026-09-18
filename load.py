@@ -53,7 +53,9 @@ class Load:
         the two apart, which is what this field is for.
 
         "disabled" counts as readable: the caller switched the reading off in
-        config, which is a choice rather than a failure.
+        config, which is a choice rather than a failure. "leases-unknown" does NOT:
+        live leases existed and none could be attributed to a session, so zero here
+        means "something is running and we cannot say what".
         """
         if self.source in ("leases", "activity", "disabled"):
             return True
@@ -184,10 +186,15 @@ def active_by_provider(
                 failures.append(f"sessions by lease: {exc}")
                 counts = {}
 
-    if not counts:
-        # No leases matched a session row, or the lease table is absent. Fall back
-        # to recent activity, which is a weaker signal but a real one: without this
-        # a store whose leases resolve to nothing reported zero load and looked idle.
+    if not counts and source != "leases":
+        # No live leases at all (older Hermes, or a surface that does not lease).
+        # Fall back to recent activity, which is a weaker signal: a session that
+        # finished a turn recently still occupies its provider's connection briefly.
+        #
+        # Deliberately NOT used when live leases existed but matched no session row:
+        # that is a knowledge gap about WORK IN FLIGHT, and answering it with
+        # recently-active sessions would charge idle conversations against a cap
+        # that measures requests in flight. That case is reported as unknown below.
         try:
             rows = con.execute(
                 "select id, session_key, billing_provider, model_config from sessions "
@@ -202,12 +209,18 @@ def active_by_provider(
         except sqlite3.Error as exc:
             failures.append(f"sessions by activity: {exc}")
 
+    if lease_rows and not counts and source == "leases":
+        # Live leases that resolve to no session: something is running and this
+        # reading cannot say what. Unknown, not zero, and not a substitute count.
+        failures.append(f"{len(lease_rows)} live lease(s) matched no session row")
+
     con.close()
     detail = "; ".join(failures)[:200]
     if failures and not counts:
-        # Nothing could be read. An empty count here is ignorance, not idleness,
-        # and the caller has to be able to tell which.
-        return Load({}, "unreadable", detail)
+        # Nothing could be read, OR something is running that this reading cannot
+        # attribute. An empty count here is ignorance, not idleness, and the caller
+        # has to be able to tell which.
+        return Load({}, "unreadable" if not lease_rows else "leases-unknown", detail)
     if not counts:
         # The store was read and nothing is running: a real zero, not a failure.
         source = "none"
@@ -247,10 +260,19 @@ def normalize_caps(caps: Any) -> tuple[dict[str, int], list[str]]:
     out: dict[str, int] = {}
     problems: list[str] = []
     for name, value in caps.items():
-        if value is None or value == 0:
+        if isinstance(value, bool):
+            # True/False read as 1/0 to Python; a boolean cap is a mistake either way.
+            problems.append(f"{name}: {value!r}")
+            continue
+        if value is None:
             continue  # no declared cap
         number = _as_cap(value)
-        if number is None or number < 1:
+        if number is None:
+            problems.append(f"{name}: {value!r}")
+            continue
+        if number == 0:
+            continue  # "0 = no declared cap", in either spelling: 0 and '0'
+        if number < 0:
             problems.append(f"{name}: {value!r}")
             continue
         out[str(name)] = number

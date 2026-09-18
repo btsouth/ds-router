@@ -120,6 +120,9 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="print the decision, proxy nothing")
     parser.add_argument("--model", default=None, help="model alias to route (default: config default)")
     parser.add_argument("--health", action="store_true", help="also time a real request per provider")
+    parser.add_argument("--verify-sticky", action="store_true",
+                        help="probe the sticky provider, but only when its reading failed, so a "
+                             "provider that is really gone can still be left")
     parser.add_argument("--sticky", default=None,
                         help="provider to stay on unless it is exhausted (the current one)")
     parser.add_argument("--list-models", action="store_true", help="fetch each provider's model list")
@@ -169,6 +172,13 @@ def main() -> int:
         print("  a cap is a positive integer, and a cap that cannot be read is not "
               "'unlimited'. Fix it or remove the entry.", file=sys.stderr)
         return 2
+    unknown_caps = [name for name in caps if name not in providers]
+    if unknown_caps:
+        # A typo'd provider name means the limit is never enforced anywhere, which is
+        # the same silent hole as a cap that cannot be read.
+        print(f"  note: cap(s) declared for provider(s) not in config.yaml: "
+              f"{', '.join(sorted(unknown_caps))} - they can never apply.",
+              file=sys.stderr)
     live_load = load_mod.active_by_provider() if caps else load_mod.Load({}, "disabled")
 
     # Health is measured BEFORE the decision so it can inform it: a provider that
@@ -181,6 +191,20 @@ def main() -> int:
                 continue
             ok, seconds, err = ping(spec, q.load_key(spec, env), model_id)
             health[name] = {"ok": ok, "seconds": round(seconds, 2), "error": err}
+    elif args.verify_sticky and args.sticky:
+        # The one case where a probe changes a decision rather than describing it: a
+        # sticky provider whose reading failed. The rule is "a failed reading is not
+        # a reason to move", which is only safe while something can still evict a
+        # provider that is genuinely gone. Hard exhaustion needs a reading, and a
+        # reading is exactly what is missing, so without this the provider is held
+        # indefinitely on a broken key. One request, only while its reading is bad.
+        spec = providers.get(args.sticky)
+        stale = quotas.get(args.sticky)
+        if spec is not None and (stale is None or stale.stale):
+            model_id = (spec.get("models") or {}).get(alias)
+            if model_id:
+                ok, seconds, err = ping(spec, q.load_key(spec, env), model_id)
+                health[args.sticky] = {"ok": ok, "seconds": round(seconds, 2), "error": err}
 
     decision = r.choose(alias, providers, quotas, weights, skip_at,
                         sticky_provider=args.sticky, peak_providers=on_peak,
@@ -206,8 +230,10 @@ def main() -> int:
             "candidates": [
                 # `usage` is the fullest window's usage fraction: 1.0 is spent and
                 # 0.0 is empty. It was called "headroom", which reads the other way
-                # round and made sorting on it pick the worst provider.
-                {"provider": c.provider, "risk": round(c.pressure, 4), "usage": round(c.headroom, 4),
+                # round and made sorting on it pick the worst provider. null when
+                # there is no reading, so the 9.9 sentinel cannot be charted as 990%.
+                {"provider": c.provider, "risk": round(c.pressure, 4),
+                 "usage": round(c.headroom, 4) if c.quota_ok else None,
                  "quota_ok": c.quota_ok, "hard": c.hard, "detail": c.detail}
                 for c in decision.ranked
             ],

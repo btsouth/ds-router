@@ -131,7 +131,10 @@ def router_decision(sticky: str | None, alias: str) -> dict:
     """Ask router.py for a decision. Raises on failure."""
     args = ["./router.py", "--dry-run", "--json", "--model", alias]
     if sticky:
-        args += ["--sticky", sticky]
+        # A provider whose reading failed is held rather than abandoned, so this is
+        # what keeps that rule safe: when the reading is bad, one real request decides
+        # whether the provider is answering at all. See --verify-sticky.
+        args += ["--sticky", sticky, "--verify-sticky"]
     proc = subprocess.run(args, capture_output=True, text=True, cwd=str(HERE))
     if proc.returncode != 0:
         raise RuntimeError(f"router exited {proc.returncode}: {proc.stderr.strip()[:200]}")

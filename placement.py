@@ -453,18 +453,24 @@ def plan(sessions: Iterable[Any], quotas_or_load: Any = None, caps: Any = None,
 
     Returns one `Assignment` per session, in a deterministic order.
     """
-    problems = _cap_problems(caps)
-    if problems:
-        raise CapError("unreadable concurrency cap(s) in config.yaml: "
-                       + "; ".join(problems)
-                       + " (a cap is a positive integer; remove it or fix the value, "
-                         "because a cap that cannot be read is not 'unlimited')")
+    declared = dict(providers or {})
     # Normalised once here, so every consumer inside the plan (capacity, the
     # destination ranking, the load tie-break) reads the same number.
-    caps = load_mod.normalize_caps(caps)[0]
+    readable_caps, cap_problems = load_mod.normalize_caps(caps)
+    if cap_problems:
+        raise CapError("unreadable concurrency cap(s) in config.yaml: "
+                       + "; ".join(cap_problems)
+                       + " (a cap is a positive integer; remove it or fix the value, "
+                         "because a cap that cannot be read is not 'unlimited')")
+    unknown_caps = [name for name in readable_caps if name not in declared]
+    if unknown_caps:
+        # A typo'd provider name means the limit is never enforced anywhere, which is
+        # the same silent hole as a cap that cannot be read.
+        print(f"  note: cap(s) declared for provider(s) that are not in config.yaml: "
+              f"{', '.join(sorted(unknown_caps))} - they can never apply.", file=sys.stderr)
+    caps = readable_caps
     weights = dict(weights or WEIGHTS)
     now = time.time() if now is None else now
-    declared = dict(providers or {})
     readings = normalize(quotas_or_load)
     rows = [_as_session(s) for s in (sessions or [])]
 
@@ -1112,6 +1118,12 @@ def sessions_from_db(db_path: Optional[Path] = None, *,
         wanted = [c for c in ("id", "session_key", "billing_provider", "model_config",
                               "model", "title", "source", "ended_at", "archived", "hidden",
                               "last_activity_at") if c in cols]
+        if not wanted:
+            # A sqlite file with no sessions columns is not a Hermes store. Building
+            # "select  from sessions" out of an empty column list produced a SQL syntax
+            # error, which reads as a bug here rather than as "wrong file".
+            raise StoreUnreadable(f"{path} has no sessions table with the columns a Hermes "
+                                  "session store has; is this the right file?")
         where = ["ended_at is null"] if "ended_at" in cols else []
         if "archived" in cols:
             where.append("coalesce(archived, 0) = 0")
