@@ -314,17 +314,27 @@ def _destination(cands: dict[str, _Candidate], assigned: dict[str, int], *,
     return best[1] if best else None
 
 
-def _running_other_model(session: Session, alias: str) -> bool:
-    """True when the session is on a known model that is not the one being placed.
+def _running_other_model(session: Session, alias: str, alias_ids: "set[str]") -> bool:
+    """True when the session runs a known model other than the one being placed.
 
     The config.set wire format is ``<model-id> --provider <p> --session``, so a
-    move sets the model too. Relocating a session that is deliberately running
-    another model would overwrite that choice, so such a session is left alone and
-    only counted as load. An unknown model ('' from a DB row that lacks it) is not
-    treated as different, or nothing would ever be movable.
+    move sets the model too. Relocating a session that is deliberately running a
+    different model would overwrite that choice, so it is left alone and only
+    counted as load.
+
+    The comparison must use every id the alias maps to, not the alias string: a
+    session stores the PROVIDER-SPECIFIC id ('deepseek/deepseek-v4.1-flash' on
+    CommandCode, 'cline-pass/deepseek-v4.1-flash' on ClinePass), so comparing to
+    the bare alias 'deepseek-v4.1-flash' marks every session as different and
+    freezes all movement.
+
+    An unknown model ('' from a row that lacks it) is not treated as different, or
+    nothing would ever be movable.
     """
     model = (session.model or "").strip()
-    return bool(model) and model != alias
+    if not model:
+        return False
+    return model not in {str(v).strip() for v in (alias_ids or set())}
 
 
 def _why_leaving(source: str, cands: dict[str, _Candidate], declared: dict[str, Any],
@@ -388,6 +398,11 @@ def plan(sessions: Iterable[Any], quotas_or_load: Any = None, caps: Any = None,
         cands[name] = _Candidate(name, model_id, _positive_cap(caps.get(name)),
                                  readings.load.get(name, 0), readings.quotas.get(name))
 
+    # Every id the alias maps to anywhere. A session stores its provider's own id,
+    # so this set -- not the alias string -- is what tells "this session is already
+    # on the model we are placing" from "this session is on something else".
+    alias_ids = {cand.model_id for cand in cands.values()}
+
     assigned: dict[str, int] = {name: 0 for name in cands}
     out: list[Assignment] = []
     movers: list[tuple[Session, bool]] = []
@@ -402,7 +417,7 @@ def plan(sessions: Iterable[Any], quotas_or_load: Any = None, caps: Any = None,
         for session in sorted((s for s in rows if (s.provider or "") == name),
                               key=lambda s: s.id):
             seen.add(session.id)
-            if _running_other_model(session, alias):
+            if _running_other_model(session, alias, alias_ids):
                 # Not ours to move: the wire format sets the model as well as the
                 # provider, so relocating this session would silently replace the
                 # model the user chose. It still occupies a slot.
@@ -425,7 +440,7 @@ def plan(sessions: Iterable[Any], quotas_or_load: Any = None, caps: Any = None,
     for session in sorted(rows, key=lambda s: s.id):
         if session.id not in seen:
             seen.add(session.id)
-            if _running_other_model(session, alias):
+            if _running_other_model(session, alias, alias_ids):
                 out.append(Assignment(session.id, session.provider or "", session.model,
                                       session.provider or "", keep=True,
                                       reason=f"not moved: running {session.model}, not {alias}"))
@@ -1129,18 +1144,33 @@ def _read_reply(reply: Any) -> tuple[str, str]:
     return "ok", ""
 
 
+class StoredIdError(RuntimeError):
+    """A write was attempted with state.db ids, which the backend will reject."""
+
+
 def apply(assignments: Iterable[Any], transport: Optional[Transport], *,
-          dry_run: bool = True, method: str = DEFAULT_METHOD) -> list[Result]:
+          dry_run: bool = True, method: str = DEFAULT_METHOD,
+          session_ids_are_stored: bool = False) -> list[Result]:
     """Send the per-session provider change for each moved session.
 
     Skipped, in this order: a session already on its target provider (nothing to
     send), and a session no provider could take. *dry_run* computes the exact
     params without sending them. One failed call does not abort the rest — a
     live fleet should not lose nine good moves because one session was busy.
+
+    *session_ids_are_stored* must be set when the assignments came from the
+    state.db fallback, whose ids the backend cannot resolve (verified live: it
+    answers 4001 "config.set model requires a live session"). Refusing up front
+    beats emitting one identical failure per session.
     """
     rows = [a if isinstance(a, Assignment) else Assignment(**a) for a in (assignments or [])]
     if not dry_run and transport is None:
         raise TransportError("apply needs a transport; pass dry_run=True to only report")
+    if not dry_run and session_ids_are_stored:
+        raise StoredIdError(
+            "cannot write with state.db session ids: the backend resolves live session "
+            "ids and answers 4001 for stored ones. Drop --db so sessions come from the "
+            "running backend, or use --plan to inspect the DB view without writing.")
 
     out: list[Result] = []
     for a in rows:
@@ -1282,6 +1312,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         except TransportError as exc:
             print(f"  note: {exc}\n  note: falling back to the state DB.", file=sys.stderr)
 
+    from_db = bool(args.db) or transport is None
     try:
         sessions = enumerate_sessions(transport, db_path=Path(args.db_path) if args.db_path else None,
                                       include_children=args.children)
@@ -1337,7 +1368,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 3
 
     dry_run = bool(args.dry_run) or not args.apply
-    results = apply(assignments, transport, dry_run=dry_run)
+    try:
+        results = apply(assignments, transport, dry_run=dry_run,
+                        session_ids_are_stored=from_db)
+    except StoredIdError as exc:
+        print(f"refusing to apply: {exc}", file=sys.stderr)
+        return 6
     failed = [r for r in results if not r.ok]
     if not args.json:
         for r in results:

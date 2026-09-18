@@ -297,6 +297,23 @@ def test_a_failed_quota_read_does_not_eject_sessions_from_a_working_provider():
     assert moved(result) == [], [a.reason for a in moved(result)]
 
 
+def test_the_alias_is_recognised_by_every_provider_specific_id():
+    """A session stores its PROVIDER's id for a model, not the alias. Comparing a
+    session's model to the bare alias string therefore marks every session as
+    "running something else" and freezes all movement. Caught live: the plan went
+    from 5 moves to 0. Every id the alias maps to must be accepted."""
+    fleet = [pl.Session("b", "ollama-cloud", "kb", model="deepseek-v4.1-flash"),
+             pl.Session("c", "ollama-cloud", "kc", model="deepseek/deepseek-v4.1-flash"),
+             pl.Session("d", "ollama-cloud", "kd", model="cline-pass/deepseek-v4.1-flash")]
+    quotas = {"ollama-cloud": q.Quota("ollama-cloud", [win("weekly", 0.2, resets_in=3 * 86400)])}
+
+    result = pl.plan(fleet, quotas, {"ollama-cloud": 1}, PROVIDERS, ALIAS)
+
+    assert len(moved(result)) == 2, [a.reason for a in result]
+    for a in moved(result):
+        assert a.model_id == PROVIDERS[a.provider]["models"][ALIAS], a.model_id
+
+
 def test_a_session_running_another_model_is_never_repointed():
     """The wire format is '<model-id> --provider <p> --session', so a move sets the
     MODEL as well as the provider. Relocating a session that is deliberately
@@ -404,6 +421,34 @@ def test_one_failed_session_does_not_abort_the_rest_of_the_fleet():
     by_id = {r.session_id: r for r in results}
     assert not by_id["bad"].ok and "fake failure" in by_id["bad"].error
     assert by_id["good"].ok
+
+
+def test_apply_refuses_to_write_with_state_db_ids():
+    """Verified against the live backend: config.set with a STORED id (the DB
+    fallback's identifier) answers 4001 "requires a live session", so a DB-only
+    --apply would fail identically on every session. Refuse up front instead of
+    emitting N confusing failures."""
+    class T:
+        def __init__(self):
+            self.calls = []
+        def call(self, method, params):
+            self.calls.append(method)
+            return {}
+        def close(self):
+            pass
+
+    move = [pl.Assignment("20260918_065334_28c015", "opencode-go", "m", "ollama-cloud", reason="t")]
+    t = T()
+    try:
+        pl.apply(move, t, dry_run=False, session_ids_are_stored=True)
+        raise AssertionError("must refuse to write with stored ids")
+    except pl.StoredIdError as exc:
+        assert "--db" in str(exc), exc
+    assert t.calls == [], "must not send anything"
+
+    # The DB view is still fine to inspect, and dry runs are unaffected.
+    assert pl.apply(move, t, dry_run=True, session_ids_are_stored=True)[0].dry_run
+    assert pl.apply(move, t, dry_run=False, session_ids_are_stored=False)[0].ok
 
 
 def test_apply_refuses_a_live_run_with_no_transport():
