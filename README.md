@@ -271,10 +271,13 @@ Claims that are reasoned but **not** verified end to end are flagged inline.
   mid-conversation costs a cache reset and may take a turn to take effect — which
   is also why the planner only moves sessions whose provider is over cap or
   exhausted, and leaves the rest alone.
-- **A hang is not bounded by ds-router.** A provider that accepts a connection
-  and never replies stalls that request until the SDK's own timeout. Health
-  probing catches a *dead* provider before you are routed to it, but cannot
-  interrupt one that dies mid-turn.
+- **A hang is not bounded by ds-router.** Health probing catches a *dead*
+  provider before you are routed to it, but nothing here can interrupt one that
+  dies mid-turn — only Hermes' own timeout can. There is a Hermes bug in that
+  area worth knowing about: per-provider timeout config is silently ignored for
+  named custom providers, so the effective bound is 600 s rather than your
+  setting. See `docs/hangs-and-timeouts.md` for the measurement, the cause, and
+  a workaround.
 - **Stickiness does not survive a restart.** ds-router re-picks after a reboot,
   which is correct but means the first turn of the first session may move.
 
