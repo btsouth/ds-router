@@ -34,7 +34,10 @@ fi
 
 case ${1:-} in
   -h|--help)
-    sed -n '2,17p' "$self" | sed 's/^# \{0,1\}//'
+    # Print the leading comment block, stopping at the first line that is not a
+    # comment. A hardcoded line range drifts when the header changes and can leak
+    # implementation lines to the user.
+    sed -n '2,/^[^#]/p' "$self" | sed '$d' | sed 's/^# \{0,1\}//'
     exit 0
     ;;
 esac

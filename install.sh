@@ -52,7 +52,10 @@ warn() { printf '  WARN  %s\n' "$*" >&2; }
 die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  sed -n '3,31p' "$0" | sed 's/^# \{0,1\}//'
+  # Print the leading comment block, stopping at the first non-comment line,
+  # so editing the header cannot leak implementation lines into --help.
+  sed -n '3,/^[^#]/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//' \
+    | sed '/^=\+$/d'
 }
 
 # ---------------------------------------------------------------------------

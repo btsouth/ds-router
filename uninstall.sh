@@ -36,7 +36,11 @@ note() { printf '  note  %s\n' "$*"; }
 warn() { printf '  WARN  %s\n' "$*" >&2; }
 die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
-usage() { sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() {
+  # Print the leading comment block, stopping at the first non-comment line.
+  sed -n '3,/^[^#]/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//' \
+    | sed '/^=\+$/d'
+}
 
 while [ $# -gt 0 ]; do
   case $1 in
