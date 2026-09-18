@@ -1080,12 +1080,14 @@ def _render_table(sessions: list[Session], assignments: list[Assignment], caps: 
         flag = "  OVER CAP" if isinstance(cap, int) and used > cap else ""
         lines.append(f"    {name:<14} {used}/{cap}{flag}")
     lines.append("")
-    lines.append(f"  {'session':<22}{'from':<15}{'-> to':<15}{'model':<32}why")
+    # Fixed-width columns with an explicit separator: provider names here are
+    # 12 characters ("ollama-cloud"), so a width of 12 leaves no gap and the
+    # model id runs into it.
+    lines.append(f"  {'session':<14} {'from':<14} {'to':<14} {'model':<30} why")
     lines.append("  " + "-" * 108)
     for a in assignments:
-        arrow = "->" if a.changed else "  "
-        lines.append(f"  {a.session_id[:22]:<22}{a.from_provider or '-':<15}"
-                     f"{arrow} {a.provider or '-':<12}{a.model_id:<32}{a.reason}")
+        lines.append(f"  {a.session_id[:14]:<14} {(a.from_provider or '-'):<14} "
+                     f"{(a.provider or '-'):<14} {(a.model_id or '-'):<30} {a.reason}")
     return "\n".join(lines)
 
 
