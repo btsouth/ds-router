@@ -147,35 +147,6 @@ class Quota:
     def stale(self) -> bool:
         return bool(self.error) or not self.windows
 
-    def pressure(self, weights: dict[str, float], reset_soon_seconds: float = 1800.0,
-                 now: Optional[float] = None) -> float:
-        """How close this provider is to interrupting a session.
-
-        The tightest weighted window decides, not the average: a plan at 98%
-        weekly is spent even if its monthly window sits at 10%.
-
-        A window that resets within *reset_soon_seconds* contributes nothing,
-        because a near-full window that refreshes in twenty minutes cannot
-        interrupt anything. Without this the router would flee a provider that
-        is about to hand back a full allowance.
-        """
-        if not self.windows:
-            return 0.0
-        now = time.time() if now is None else now
-        session_weight = weights.get("session", 1.0)
-        scored = []
-        for window in self.windows:
-            # An unrecognised window name is treated as session-class risk
-            # rather than ignored, so a provider renaming a window fails safe
-            # (skipped early) instead of looking permanently healthy.
-            kind = window.kind
-            weight = weights.get(kind, session_weight) if kind else session_weight
-            due = window.resets_at
-            if due is not None and 0 < (due - now) <= reset_soon_seconds:
-                continue
-            scored.append(window.percent * weight)
-        return max(scored) if scored else 0.0
-
 
 def _http_json(url: str, key: str, timeout: float = 12.0) -> Any:
     request = urllib.request.Request(

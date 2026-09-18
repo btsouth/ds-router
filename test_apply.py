@@ -34,7 +34,9 @@ def check(label: str, ok: bool, detail: str = "") -> None:
 
 def fake_hermes(tmp: pathlib.Path, *, fail_on: str = "", calls: pathlib.Path | None = None) -> str:
     """A stand-in `hermes` that can be made to fail on a chosen key."""
-    log = f'echo "$*" >> {calls}\n' if calls else ""
+    # Quote the redirect target: TMPDIR is allowed to contain spaces, and an
+    # unquoted path silently sends the log somewhere else.
+    log = f'echo "$*" >> "{calls}"\n' if calls else ""
     # Only emit the failing branch when a failure is actually wanted: an empty
     # pattern would match every "config set" call.
     fail_branch = f'  *"config set {fail_on}"*)      echo "boom" >&2; exit 1 ;;\n' if fail_on else ""
@@ -76,7 +78,8 @@ def test_a_failed_write_rolls_back_the_ones_before_it(tmp: pathlib.Path) -> None
         check("the error names the rollback", "restored" in raised, raised)
     written = calls.read_text() if calls.exists() else ""
     check("the first key was rolled back to its original value",
-          "config set model.provider ORIGINAL_PROV" in written, written)
+          "config set model.provider ORIGINAL_PROV" in written,
+          f"log={written!r} path={calls}")
     check("no attempt was made to write model.base_url",
           "config set model.base_url" not in written, written)
 

@@ -419,6 +419,17 @@ def test_a_nan_percentage_cannot_look_like_free_capacity():
     assert inf.windows[0].percent == 0.0, "inf sanitises too, so it cannot poison a sort"
 
 
+def test_a_window_past_its_reset_is_not_treated_as_spent():
+    """A window whose reset already passed has refilled upstream, so its old
+    percentage must not make the provider look exhausted. This is what the live
+    scoring path does; a removed dead helper used to disagree with it."""
+    now = time.time()
+    quota = q.Quota("p", [win("weekly", 0.99, resets_in=-HOUR, now=now)])
+    c = r.score(quota, "m", WEIGHTS, SKIP, now=now)
+    assert c.pressure == 0.0, c.pressure
+    assert not c.hard and not r.hard_exhausted(quota, SKIP, now=now)
+
+
 def test_a_negative_percentage_clamps_to_zero():
     w = q.Window("weekly", -0.4, time.time() + 3 * DAY)
     assert w.percent == 0.0
