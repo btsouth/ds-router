@@ -104,7 +104,9 @@ def score(quota: Quota, model_id: Optional[str], weights: dict[str, float],
           skip_at: float, deadline_seconds: float = 1800.0,
           now: Optional[float] = None, refill_soon_seconds: float = 3600.0,
           active_sessions: int = 0, concurrency_cap: Optional[int] = None,
-          pressure_per_over: float = 0.08, max_load_pressure: float = 0.4) -> Candidate:
+          pressure_per_over: float = 0.08, max_load_pressure: float = 0.4,
+          health: Optional[dict] = None, slow_seconds: float = 10.0,
+          slow_pressure: float = 0.25) -> Candidate:
     """Score one provider for one model.
 
     Two numbers, in order of importance:
@@ -175,7 +177,25 @@ def score(quota: Quota, model_id: Optional[str], weights: dict[str, float],
         risk = max(risk, load_risk)
         shown.append(f"{active_sessions} active / cap {concurrency_cap} (+{over} queued)")
 
-    hard = hard_exhausted(quota, skip_at, now)
+    # A provider that failed its health probe is treated as unusable rather than
+    # merely unattractive: quota says what a plan allows, health says whether the
+    # endpoint is answering at all, and an endpoint that is down cannot be spent
+    # down. A provider that answered but slowly gains pressure, which only breaks
+    # ties between otherwise-equal providers.
+    unhealthy = False
+    if health is not None:
+        ok = health.get("ok") if isinstance(health, dict) else None
+        if ok is False:
+            unhealthy = True
+            err = str(health.get("error") or "probe failed")[:60]
+            shown.append(f"health probe FAILED ({err})")
+        elif ok is True and isinstance(health.get("seconds"), (int, float)):
+            elapsed = float(health["seconds"])
+            if elapsed >= slow_seconds:
+                risk = max(risk, min(slow_pressure, elapsed / max(slow_seconds, 1e-6) * slow_pressure))
+                shown.append(f"slow ({elapsed:.1f}s)")
+
+    hard = hard_exhausted(quota, skip_at, now) or unhealthy
     if predicted_to_run_out(quota, deadline_seconds, now):
         shown.append(f"expected to exhaust within {int(deadline_seconds // 60)}m")
     if about_to_refill and not shown:
@@ -200,6 +220,7 @@ def choose(
     concurrency_caps: Optional[dict[str, int]] = None,
     pressure_per_over: float = 0.08,
     max_load_pressure: float = 0.4,
+    health: Optional[dict[str, dict]] = None,
 ) -> Decision:
     """Pick a provider for *model_alias*.
 
@@ -220,7 +241,8 @@ def choose(
                                 active_sessions=int(active.get(name, 0)),
                                 concurrency_cap=caps.get(name),
                                 pressure_per_over=pressure_per_over,
-                                max_load_pressure=max_load_pressure))
+                                max_load_pressure=max_load_pressure,
+                                health=(health or {}).get(name)))
     offered = [c for c in candidates if c.model_id]
     ranked = sorted(offered, key=lambda c: c.rank_key)
     on_peak = peak_providers or set()

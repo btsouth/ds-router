@@ -66,11 +66,19 @@ def collect(providers: dict, env: dict[str, str], timeout: float = 12.0,
     return out
 
 
-def ping(spec: dict, key: str, model_id: str, timeout: float = 25.0) -> tuple[bool, float, str]:
-    """One minimal request, to confirm a provider is actually answering."""
+def ping(spec: dict, key: str, model_id: str, timeout: float = 40.0,
+         max_tokens: int = 64) -> tuple[bool, float, str]:
+    """One minimal request, to confirm a provider is actually answering.
+
+    ``max_tokens`` must be generous enough for a reasoning model to emit
+    something after thinking. At very small budgets (1-5) at least one provider
+    here answers with HTTP 500 "empty response content" where others silently
+    return a truncated success, so a tiny probe reports a healthy provider as
+    dead. 64 is comfortably above the measured threshold of 20.
+    """
     base = str(spec.get("base_url") or "").rstrip("/")
     body = json.dumps({"model": model_id, "messages": [{"role": "user", "content": "ping"}],
-                       "max_tokens": 1}).encode()
+                       "max_tokens": max_tokens}).encode()
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json",
                "User-Agent": "ds-router/0.1"}
     header_name = spec.get("session_header")
@@ -81,7 +89,16 @@ def ping(spec: dict, key: str, model_id: str, timeout: float = 25.0) -> tuple[bo
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             response.read(64)
-        return True, time.time() - started, ""
+            return True, time.time() - started, ""
+    except urllib.error.HTTPError as exc:
+        elapsed = time.time() - started
+        # A provider that answered at all is reachable -- the point of the probe.
+        # A 4xx/5xx carries a status, so Hermes' own error classification and
+        # fallback handle it; treating it as "dead" here would wrongly exclude a
+        # provider that is merely rejecting this one request shape.
+        if exc.code in (400, 404, 422):
+            return True, elapsed, f"reachable (HTTP {exc.code} on probe)"
+        return False, elapsed, f"HTTP {exc.code}"
     except Exception as exc:
         return False, time.time() - started, f"{type(exc).__name__}: {exc}"[:120]
 
@@ -125,20 +142,24 @@ def main() -> int:
     conc_cfg = routing_cfg.get("concurrency") or {}
     caps = (conc_cfg.get("caps") or {}) if conc_cfg.get("enabled", True) else {}
     live_load = load_mod.active_by_provider() if caps else load_mod.Load({}, "disabled")
-    decision = r.choose(alias, providers, quotas, weights, skip_at,
-                        sticky_provider=args.sticky, peak_providers=on_peak,
-                        load=live_load.counts, concurrency_caps=caps,
-                        pressure_per_over=float(conc_cfg.get("pressure_per_over", 0.15)),
-                        max_load_pressure=float(conc_cfg.get("max_pressure", 0.6)))
 
-    health = {}
-    if args.health and decision.ok:
+    # Health is measured BEFORE the decision so it can inform it: a provider that
+    # is not answering cannot be spent down, so it is excluded rather than ranked.
+    health: dict[str, dict] = {}
+    if args.health:
         for name, spec in providers.items():
             model_id = (spec.get("models") or {}).get(alias)
             if not model_id:
                 continue
             ok, seconds, err = ping(spec, q.load_key(spec, env), model_id)
             health[name] = {"ok": ok, "seconds": round(seconds, 2), "error": err}
+
+    decision = r.choose(alias, providers, quotas, weights, skip_at,
+                        sticky_provider=args.sticky, peak_providers=on_peak,
+                        load=live_load.counts, concurrency_caps=caps,
+                        pressure_per_over=float(conc_cfg.get("pressure_per_over", 0.08)),
+                        max_load_pressure=float(conc_cfg.get("max_pressure", 0.4)),
+                        health=health or None)
 
     if args.json:
         print(json.dumps({

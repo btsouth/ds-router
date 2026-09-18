@@ -358,6 +358,53 @@ def test_collector_labels_and_api_labels_agree():
     assert q.Window("Monthly", 0.5).kind == "monthly"
 
 
+def test_unreachable_provider_is_excluded_not_merely_ranked():
+    """Quota says what a plan allows; health says whether the endpoint answers.
+    A provider that fails its probe must not be chosen, even with perfect quota."""
+    now = time.time()
+    live = {
+        "commandcode": q.Quota("commandcode", [win("monthly", 0.90)]),   # nearly spent
+        "opencode-go": q.Quota("opencode-go", [win("monthly", 0.10)]),   # healthy quota
+        "ollama-cloud": q.Quota("ollama-cloud", [win("monthly", 0.10)]),
+    }
+    # opencode is the emptiest on quota but is not answering.
+    health = {"opencode-go": {"ok": False, "seconds": 0.0, "error": "ConnectionError"}}
+    d = r.choose("ds", PROVIDERS, live, WEIGHTS, SKIP, now=now, health=health)
+    assert d.provider != "opencode-go", d.reason
+    assert "FAILED" in str([c.detail for c in d.ranked if c.provider == "opencode-go"])
+
+
+def test_unhealthy_provider_cannot_win_even_when_sticky():
+    """A pinned-but-dead provider must be left, like a hard-exhausted one."""
+    now = time.time()
+    live = {n: q.Quota(n, [win("monthly", 0.10)]) for n in PROVIDERS}
+    health = {"ollama-cloud": {"ok": False, "seconds": 0.0, "error": "timeout"}}
+    d = r.choose("ds", PROVIDERS, live, WEIGHTS, SKIP, sticky_provider="ollama-cloud",
+                 now=now, health=health)
+    assert d.provider != "ollama-cloud", d.reason
+
+
+def test_a_slow_but_working_provider_is_deprioritised_not_excluded():
+    """Slowness is soft: it should break ties, not remove a working provider."""
+    now = time.time()
+    live = {n: q.Quota(n, [win("monthly", 0.10)]) for n in PROVIDERS}
+    health = {"ollama-cloud": {"ok": True, "seconds": 45.0, "error": ""}}
+    d = r.choose("ds", PROVIDERS, live, WEIGHTS, SKIP, now=now, health=health)
+    ranked = {c.provider: c for c in d.ranked}
+    assert ranked["ollama-cloud"].pressure > 0, "slow provider should gain pressure"
+    assert not ranked["ollama-cloud"].hard, "slow is not the same as dead"
+    assert d.provider != "ollama-cloud", "a healthy peer should win"
+
+
+def test_health_absent_changes_nothing():
+    """No health data must behave exactly as before it existed."""
+    now = time.time()
+    live = {n: q.Quota(n, [win("monthly", 0.10)]) for n in PROVIDERS}
+    without = r.choose("ds", PROVIDERS, live, WEIGHTS, SKIP, now=now)
+    explicit_none = r.choose("ds", PROVIDERS, live, WEIGHTS, SKIP, now=now, health=None)
+    assert without.provider == explicit_none.provider
+
+
 def test_sticky_expires():
     table = r.StickyTable(ttl_seconds=0)
     table.put("c1", "commandcode")
