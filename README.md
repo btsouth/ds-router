@@ -144,7 +144,9 @@ Design rules, all asserted by tests:
 - **A cap that cannot be read is not "no cap".** `caps: {ollama-cloud: three}`, or
   a nested `{limit: 3}` where a number belongs, stops the plan with exit 7 and
   names the entry. Reading it as unlimited would fill a provider past a limit it
-  really has, which is the queueing this exists to prevent.
+  really has, which is the queueing this exists to prevent. A quoted `'3'` is read
+  as 3 everywhere; before, it crashed the scorer while the planner enforced it and
+  the over-cap line ignored it. `caps: 3` instead of a mapping is diagnosed too.
 - **Leave sessions alone unless there is a reason.** Moving a session resets its
   prompt cache, so a session only moves when its provider is over cap, hard
   exhausted, or cannot serve your chosen model. 22 of 27 stayed put above.
@@ -177,16 +179,23 @@ A quota that *cannot be read* is deliberately not in this list. A failed reading
 says the telemetry endpoint did not answer, not that the provider is down, so a
 session already there stays where it is — moving it would pay a prompt-cache reset
 to avoid an outage that may not exist. What it does block is choosing that provider
-for anything new, until it reads again.
+for anything new, until it reads again. The same rule applies to the global choice:
+a provider whose reading failed is not abandoned, because that would reset the
+prompt cache for every conversation on it to avoid an outage that may not exist.
+Hard exhaustion and a failed health probe are evidence about the provider, so both
+still move traffic away.
 
 A reading that is *incomplete* is treated the same way, and it used to be treated
 as healthy. CommandCode's monthly window needs a second endpoint for the period's
 spend; when that figure cannot be read, the window is absent rather than zero, and
-the provider is not a destination until it reads. Three rules follow from the same
+the provider is not a destination until it reads. The same applies to any provider
+that stops reporting one of the windows it normally carries, which is a hole in
+the reading rather than a plan with fewer limits. Three rules follow from the same
 idea, and each of them was once the opposite:
 
-- a percentage that cannot be trusted (NaN, infinity, negative) is dropped, never
-  rewritten to `0%`, because `0%` is both the lowest risk and the best headroom;
+- a percentage that cannot be trusted (NaN, infinity, negative, a boolean) is
+  dropped, never rewritten to `0%`, because `0%` is both the lowest risk and the
+  best headroom;
 - a window whose reset time is present but unreadable is dropped, rather than
   silently losing its burn-rate rule;
 - a reading with nothing recognisable in it is unreadable, not empty.
@@ -310,6 +319,14 @@ Claims in this README that have been measured, rather than reasoned about:
 - The transport contract: a reply with no result is unconfirmed rather than a
   completed move, a JSON-RPC error is never retried, and a fault from before the
   request went out is retried exactly once.
+- First use against the real CLI: with an unset `model.provider/default/base_url`
+  in a throwaway `HERMES_HOME`, all three of `apply.py <provider>`, `apply.py` and
+  `apply.py --off` write and exit 0. The real CLI answers an unset key with the
+  notice on stderr and exit 1, which is why the exit status alone cannot mean the
+  read failed.
+- A partial reading: for each provider, the windows it is expected to report are
+  asserted, and a payload missing one is marked incomplete (with the missing and
+  the read windows both named) instead of scoring as a plan with fewer limits.
 - Four critical failures found by an independent audit of this codebase and
   fixed, each with the test that would have caught it: an unreadable session
   store rewriting the whole fleet, `apply` reporting success for replies that mean
