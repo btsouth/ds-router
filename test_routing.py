@@ -92,7 +92,12 @@ def test_clinepass_nanosecond_reset_times_are_parsed():
     window = q.parse_clinepass(payload)[0]
     assert window.resets_at is not None
     import datetime
-    assert datetime.datetime.fromtimestamp(window.resets_at, datetime.timezone.utc).year == 2026
+    # The exact instant, not just "it is a date": before Python 3.11 the parser
+    # raised on more than six fractional digits and the caller silently turned a
+    # readable reset into None, which quietly disabled pace and exhaustion.
+    expected = datetime.datetime(
+        2026, 9, 18, 9, 6, 35, 170792, tzinfo=datetime.timezone.utc).timestamp()
+    assert abs(window.resets_at - expected) < 1e-6, (window.resets_at, expected)
 
 
 def test_ollama_reports_only_the_windows_the_plan_has():

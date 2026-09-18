@@ -8,6 +8,7 @@ that opened before this process started.
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.request
 from dataclasses import dataclass, field
@@ -174,6 +175,11 @@ def _finite_percent(value: Any) -> Optional[float]:
     return max(0.0, number)
 
 
+# Fractional seconds beyond microsecond precision, which `datetime.fromisoformat`
+# refused before Python 3.11.
+_EXTRA_FRACTION = re.compile(r"(\.\d{6})\d+")
+
+
 def _reset(value: Any) -> Optional[float]:
     """Normalise epoch seconds, epoch milliseconds, or an ISO string."""
     if value in (None, "", 0):
@@ -185,7 +191,15 @@ def _reset(value: Any) -> Optional[float]:
     try:
         from datetime import datetime
 
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        text = str(value).strip().replace("Z", "+00:00")
+        # ClinePass publishes nanosecond precision ("2026-09-18T09:06:35.170792893Z")
+        # and datetime.fromisoformat rejected anything finer than microseconds
+        # before Python 3.11. Passing that straight through raised, and the except
+        # below turned a perfectly readable reset time into None -- so on 3.10 the
+        # window lost its reset silently and pace/hard-exhaustion rules quietly
+        # degraded. Trim the extra digits instead: three digits of a reset time are
+        # worth nothing, the reset time itself is load-bearing.
+        return datetime.fromisoformat(_EXTRA_FRACTION.sub(r"\1", text)).timestamp()
     except Exception:
         return None
 

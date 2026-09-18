@@ -320,7 +320,11 @@ class StickyTable:
         if not row:
             return None
         provider, chosen_at = row
-        if time.time() - chosen_at > self.ttl:
+        # `>=`, not `>`: a row is good for at most ttl seconds, and a ttl of 0
+        # must mean nothing is ever remembered. Reading the boundary strictly also
+        # made the result depend on the host clock's resolution -- macOS can return
+        # the same time.time() twice in a row, so a just-put row looked live.
+        if time.time() - chosen_at >= self.ttl:
             self._rows.pop(conversation, None)
             return None
         return provider
@@ -333,5 +337,5 @@ class StickyTable:
 
     def evict_expired(self) -> None:
         now = time.time()
-        for key in [k for k, (_, at) in self._rows.items() if now - at > self.ttl]:
+        for key in [k for k, (_, at) in self._rows.items() if now - at >= self.ttl]:
             self._rows.pop(key, None)
