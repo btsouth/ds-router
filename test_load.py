@@ -22,18 +22,13 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import load as L
-
-PASSED = FAILED = 0
+import testkit
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
-    global PASSED, FAILED
-    if ok:
-        PASSED += 1
-        print(f"  pass  {label}")
-    else:
-        FAILED += 1
-        print(f"  FAIL {label}" + (f"\n       {detail}" if detail else ""))
+    """A named assertion: raise, so the runner reports the test, the label and the line."""
+    if not ok:
+        raise AssertionError(label + (f": {detail}" if detail else ""))
 
 
 def make_store(path: Path, *, leases=(), sessions=(), with_leases_table=True,
@@ -181,20 +176,5 @@ def test_total_and_count_defaults() -> None:
     check("total adds up", load.total == 3, str(load.total))
 
 
-def main() -> int:
-    test_a_named_custom_provider_is_counted_under_its_real_name()
-    test_a_builtin_provider_still_counts_from_billing_provider()
-    test_a_session_with_no_readable_provider_is_not_invented()
-    test_an_unreadable_store_is_not_a_store_with_nothing_running()
-    test_a_store_without_a_leases_table_falls_back_to_activity()
-    test_an_expired_lease_is_history_not_load()
-    test_no_store_at_all_is_reported_as_such()
-    test_the_store_is_only_ever_read()
-    test_over_capacity_counts_the_overflow()
-    test_total_and_count_defaults()
-    print(f"\n{PASSED} passed, {FAILED} failed")
-    return 1 if FAILED else 0
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(testkit.run(globals(), scratch_prefix="ds-load-"))

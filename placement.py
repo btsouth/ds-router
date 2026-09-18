@@ -250,13 +250,7 @@ class CapError(ValueError):
 
 def _cap_problems(caps: Any) -> list[str]:
     """Declared caps that cannot be read. Absent and 0 stay meaning "unbounded"."""
-    problems: list[str] = []
-    for name, value in (caps or {}).items():
-        if value is None or value == 0:
-            continue
-        if _positive_cap(value) is None:
-            problems.append(f"{name}: {value!r}")
-    return problems
+    return load_mod.normalize_caps(caps)[1]
 
 
 # --------------------------------------------------------------------------- #
@@ -422,10 +416,14 @@ def _why_leaving(source: str, cands: dict[str, _Candidate], declared: dict[str, 
         return f"{source} is not a provider ds-router manages"
     if cand.exhausted:
         return f"{source} is exhausted"
+    if over_cap:
+        # Ahead of the unreadable case on purpose: an over-cap provider is the real
+        # trigger here, and the README says an unreadable reading is never a reason
+        # to move. Reporting the reading as the cause would contradict that rule and
+        # hide the measurement that actually justified the move.
+        return f"{source} is over its concurrency cap"
     if cand.unreadable:
         return f"{source} quota is unreadable"
-    if over_cap:
-        return f"{source} is over its concurrency cap"
     return f"{source} cannot take it"
 
 
@@ -461,6 +459,9 @@ def plan(sessions: Iterable[Any], quotas_or_load: Any = None, caps: Any = None,
                        + "; ".join(problems)
                        + " (a cap is a positive integer; remove it or fix the value, "
                          "because a cap that cannot be read is not 'unlimited')")
+    # Normalised once here, so every consumer inside the plan (capacity, the
+    # destination ranking, the load tie-break) reads the same number.
+    caps = load_mod.normalize_caps(caps)[0]
     weights = dict(weights or WEIGHTS)
     now = time.time() if now is None else now
     declared = dict(providers or {})
@@ -1054,6 +1055,10 @@ class ProviderJoinError(RuntimeError):
     """Live sessions were listed, but their providers could not be read at all."""
 
 
+class StoreUnreadable(RuntimeError):
+    """The session store exists but could not be read, which is not an empty fleet."""
+
+
 def _read_db(db_path: Optional[Path]) -> dict[str, str]:
     """``{session_id: provider}`` from the state DB, read-only. {} on any failure.
 
@@ -1095,11 +1100,13 @@ def sessions_from_db(db_path: Optional[Path] = None, *,
     """
     path = state_db_path(db_path)
     if not path.exists():
+        print(f"  note: no session store at {path}; nothing to enumerate from it.",
+              file=sys.stderr)
         return []
     try:
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
-    except sqlite3.Error:
-        return []
+    except sqlite3.Error as exc:
+        raise StoreUnreadable(f"cannot open {path}: {exc}") from exc
     try:
         cols = _session_columns(con)
         wanted = [c for c in ("id", "session_key", "billing_provider", "model_config",
@@ -1116,8 +1123,8 @@ def sessions_from_db(db_path: Optional[Path] = None, *,
             sql += " where " + " and ".join(where)
         sql += order
         rows = list(con.execute(sql))
-    except sqlite3.Error:
-        return []
+    except sqlite3.Error as exc:
+        raise StoreUnreadable(f"cannot read sessions from {path}: {exc}") from exc
     finally:
         con.close()
 
@@ -1450,6 +1457,11 @@ def main(argv: Optional[list[str]] = None) -> int:
               "look provider-less and be moved.", file=sys.stderr)
         print("  Check that state.db is readable, or pass --db-path.", file=sys.stderr)
         return 5
+    except StoreUnreadable as exc:
+        print(f"refusing to plan: {exc}", file=sys.stderr)
+        print("  An unreadable session store is not an empty fleet: reporting no sessions "
+              "would look like a clean run.", file=sys.stderr)
+        return 5
     quotas = collect_quotas(providers, config)
     # The concurrency reading has to be handed to the planner, or the rule that a
     # provider already busy from work outside this plan takes no new session holds
@@ -1476,8 +1488,13 @@ def main(argv: Optional[list[str]] = None) -> int:
               "only and knows nothing about headroom.", file=sys.stderr)
         print("  note: check the provider keys and the quota endpoints "
               "(router.py --dry-run shows what each provider reports).", file=sys.stderr)
+    if live_load.error:
+        # Surface the reading's own note whenever there is one, readable or not: a
+        # partial count is smaller than reality, and a silent undercount looks
+        # exactly like a healthy fleet.
+        print(f"  note: load reading: {live_load.error}", file=sys.stderr)
     if not live_load.readable:
-        print(f"  note: the concurrency reading is unusable ({live_load.error or live_load.source}), "
+        print(f"  note: the concurrency reading is unusable ({live_load.source}), "
               "so no provider is charged for work already running on it.", file=sys.stderr)
         print("  note: caps still hold for the sessions in this plan.", file=sys.stderr)
     elif live_load.counts:

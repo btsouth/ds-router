@@ -15,6 +15,8 @@ Run: python3 test_placement.py
 
 from __future__ import annotations
 
+import sys
+
 import json
 import sqlite3
 import tempfile
@@ -807,5 +809,108 @@ def test_live_transport_is_not_built_at_import_and_fails_clearly_without_a_backe
         pl.discover_backends = original
 
 
+def test_a_draining_provider_is_passed_over_on_percent_alone():
+    """The other draining test's fixture is over its pace line too, so it passes even
+    with the percent rule deleted. This one is under pace and only over the line."""
+    fleet = sessions(*[(f"oc{i}", "ollama-cloud") for i in range(4)],
+                     *[(f"cp{i}", "clinepass") for i in range(5)],
+                     *[(f"cc{i}", "commandcode") for i in range(6)])
+    quotas = healthy_quotas()
+    # 90% of a weekly window with six of its seven days already gone is ON pace
+    # (0.86 expected), so only the "at or above the skip point" rule can catch it.
+    quotas["opencode-go"] = q.Quota("opencode-go", [win("weekly", 0.90, resets_in=86400)])
+    result = pl.plan(fleet, quotas, CAPS, PROVIDERS, ALIAS)
+    assert len(moved(result)) == 1, [a.reason for a in moved(result)]
+    assert moved(result)[0].provider != "opencode-go", moved(result)[0].reason
+
+
+def test_an_unreadable_session_store_refuses_instead_of_reporting_no_sessions():
+    """--db mapped every read failure to an empty list, so a corrupt store printed
+    'sessions : 0' and exited 0, which looks like a clean run."""
+    import tempfile
+    from pathlib import Path as P
+    broken = P(tempfile.mkdtemp(prefix="ds-broken-store-")) / "state.db"
+    broken.write_text("this is not a database")
+    try:
+        pl.sessions_from_db(broken)
+    except pl.StoreUnreadable as exc:
+        assert "cannot open" in str(exc) or "cannot read" in str(exc), exc
+    else:
+        raise AssertionError("an unreadable store must not enumerate as empty")
+    # A missing store is a different thing: nothing to enumerate, not a failure.
+    absent = P(tempfile.mkdtemp(prefix="ds-absent-store-")) / "state.db"
+    assert pl.sessions_from_db(absent) == []
+
+
+def test_the_cli_reports_the_load_reading_when_it_is_partial():
+    """An unattributed session makes the count smaller than reality, and a silent
+    undercount looks exactly like a healthy fleet."""
+    import io
+    import tempfile
+    from contextlib import redirect_stderr
+    from pathlib import Path as P
+    store = P(tempfile.mkdtemp(prefix="ds-load-note-")) / "state.db"
+    con = sqlite3.connect(store)
+    con.execute("create table sessions (id text primary key, session_key text, "
+                "billing_provider text, model_config text, title text, model text, "
+                "last_activity_at real, ended_at real)")
+    con.execute("create table session_turn_leases (conversation_id text, holder text, "
+                "acquired_at real, expires_at real)")
+    now = time.time()
+    con.execute("insert into sessions values (?,?,?,?,?,?,?,?)",
+                ("s1", "k1", "custom", "{not json", "t", "ds", now, None))
+    con.execute("insert into session_turn_leases values (?,?,?,?)", ("k1", "h", now, now + 600))
+    con.commit()
+    con.close()
+    cfg = P(tempfile.mkdtemp(prefix="ds-load-note-cfg-")) / "config.yaml"
+    cfg.write_text("default_model: ds\nproviders:\n"
+                   + "".join(f"  {name}:\n    base_url: https://x/v1\n    key_env: K\n"
+                             for name in PROVIDERS)
+                   + "models:\n  ds:\n" + "".join(f"    {name}: {name}-m\n" for name in PROVIDERS))
+    real_config, real_collect = pl.CONFIG, pl.collect_quotas
+    pl.CONFIG = cfg
+    pl.collect_quotas = lambda providers, config: healthy_quotas()
+    stderr = io.StringIO()
+    try:
+        with redirect_stderr(stderr):
+            code = pl.main(["--db", "--db-path", str(store), "--plan"])
+    finally:
+        pl.CONFIG, pl.collect_quotas = real_config, real_collect
+    assert code == 0, (code, stderr.getvalue())
+    assert "no readable provider" in stderr.getvalue(), stderr.getvalue()
+
+
+def test_the_router_json_names_usage_and_says_whether_health_was_measured():
+    """`headroom` was the fullest window's USAGE, so sorting on it picked the worst
+    provider, and an empty health map meant 'not probed', not 'all healthy'."""
+    import io
+    import json
+    from contextlib import redirect_stdout
+    import load as q_load
+    import router as R
+    real_collect, real_load = R.collect, q_load.active_by_provider
+    R.collect = lambda providers, env, routing_cfg=None: {
+        n: q.Quota(n, [win("monthly", 0.2)]) for n in providers}
+    q_load.active_by_provider = lambda: q_load.Load({}, "none")
+    stdout = io.StringIO()
+    old_argv = sys.argv
+    sys.argv = ["router.py", "--dry-run", "--json"]
+    try:
+        with redirect_stdout(stdout):
+            code = R.main()
+    finally:
+        R.collect, q_load.active_by_provider = real_collect, real_load
+        sys.argv = old_argv
+    assert code == 0, code
+    payload = json.loads(stdout.getvalue())
+    assert payload["health_measured"] is False, payload["health_measured"]
+    assert payload["health"] == {}, payload["health"]
+    for candidate in payload["candidates"]:
+        assert "usage" in candidate and "headroom" not in candidate, candidate
+        assert 0.0 <= candidate["usage"] <= 1.5, candidate
+
+
 if __name__ == "__main__":
     raise SystemExit(testkit.run(globals()))
+
+

@@ -140,8 +140,16 @@ def score(quota: Quota, model_id: Optional[str], weights: dict[str, float],
     if model_id is None:
         return Candidate("", "", 9.9, 9.9, False, False, "model not offered here")
     if quota.stale:
-        return Candidate(quota.provider, model_id, skip_at + 0.001, 9.9, False, False,
-                         quota.error or "no reading")
+        # An unreadable quota cannot place anything, and on its own it says nothing
+        # about the provider. A health probe DOES: it is a real request, so a probe
+        # that failed makes this provider hard-unusable even here, which is what
+        # keeps a dead provider from being held onto by stickiness.
+        probed_dead = bool(isinstance(health, dict) and health.get("ok") is False)
+        detail = quota.error or "no reading"
+        if probed_dead:
+            detail = f"{detail}; health probe FAILED ({str(health.get('error') or 'probe failed')[:60]})"
+        return Candidate(quota.provider, model_id, skip_at + 0.001, 9.9, False, probed_dead,
+                         detail)
 
     now = time.time() if now is None else now
     default_weight = weights.get("session", 1.0)
@@ -179,11 +187,21 @@ def score(quota: Quota, model_id: Optional[str], weights: dict[str, float],
         if window.resets_at and window.resets_at > now:
             soonest = window.resets_at if soonest is None else min(soonest, window.resets_at)
 
-    if concurrency_cap and active_sessions > concurrency_cap:
-        over = active_sessions - concurrency_cap
-        load_risk = min(max_load_pressure, over * pressure_per_over)
-        risk = max(risk, load_risk)
-        shown.append(f"{active_sessions} active / cap {concurrency_cap} (+{over} queued)")
+    if concurrency_cap:
+        # Coerced rather than compared directly: a quoted cap used to raise
+        # TypeError from this comparison and take the whole decision down. The
+        # boundaries (router.py, placement.py) refuse an unreadable cap outright,
+        # so a library caller passing one gets no load pressure term instead of a
+        # crash.
+        try:
+            cap = int(concurrency_cap)
+        except (TypeError, ValueError):
+            cap = 0
+        if cap and active_sessions > cap:
+            over = active_sessions - cap
+            load_risk = min(max_load_pressure, over * pressure_per_over)
+            risk = max(risk, load_risk)
+            shown.append(f"{active_sessions} active / cap {cap} (+{over} queued)")
 
     # A provider that failed its health probe is treated as unusable rather than
     # merely unattractive: quota says what a plan allows, health says whether the
@@ -274,10 +292,21 @@ def choose(
     if sticky_provider:
         match = next((c for c in ranked if c.provider == sticky_provider), None)
         # Stickiness tolerates soft pressure: a switch costs a cache reset and
-        # drops reasoning, and a pace prediction can simply be wrong. It does
-        # not tolerate hard exhaustion or an unreadable quota.
-        if match and match.quota_ok and not match.hard:
-            return Decision(match.provider, match.model_id, f"sticky; {match.detail}", ranked)
+        # drops reasoning, and a pace prediction can simply be wrong. It also
+        # tolerates a reading that could not be taken: the failure is in the
+        # telemetry, not in the provider, so abandoning a working provider over it
+        # pays the cache reset this design exists to avoid. Hermes' own fallback
+        # chain covers the case where the provider really is spent.
+        #
+        # What it does not tolerate is evidence about the provider itself: hard
+        # exhaustion, or a health probe that failed. Both arrive as `hard`.
+        # An unreadable provider is still never CHOSEN as a destination (see the
+        # `safe` list below), which is the other half of the rule.
+        if match and not match.hard:
+            detail = match.detail
+            if not match.quota_ok:
+                detail = f"{detail or 'no reading'} (its reading is unusable; staying put)"
+            return Decision(match.provider, match.model_id, f"sticky; {detail}", ranked)
 
     safe = [c for c in ranked if c.quota_ok and not c.hard and c.pressure < skip_at]
     if not safe:

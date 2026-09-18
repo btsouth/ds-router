@@ -18,18 +18,13 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import apply as A
-
-PASSED = FAILED = 0
+import testkit
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
-    global PASSED, FAILED
-    if ok:
-        PASSED += 1
-        print(f"  pass  {label}")
-    else:
-        FAILED += 1
-        print(f"  FAIL {label}" + (f"\n       {detail}" if detail else ""))
+    """A named assertion: raise, so the runner reports the test, the label and the line."""
+    if not ok:
+        raise AssertionError(label + (f": {detail}" if detail else ""))
 
 
 def fake_hermes(tmp: pathlib.Path, *, fail_on: str = "", calls: pathlib.Path | None = None,
@@ -47,7 +42,8 @@ def fake_hermes(tmp: pathlib.Path, *, fail_on: str = "", calls: pathlib.Path | N
     # pattern would match every "config set" call.
     fail_branch = f'  *"config set {fail_on}"*)      echo "boom" >&2; exit 1 ;;\n' if fail_on else ""
     fail_get_branch = f'  *"config get {fail_get}"*)      echo "keyring locked" >&2; exit 1 ;;\n' if fail_get else ""
-    not_set_branch = f'  *"config get {not_set}"*)        echo "config key not set"; exit 0 ;;\n' if not_set else ""
+    not_set_branch = (f'  *"config get {not_set}"*)        echo "Config key not set: {not_set}" >&2; exit 1 ;;\n'
+                      if not_set else "")
     script = f"""#!/bin/sh
 {log}case "$*" in
 {fail_get_branch}{not_set_branch}  *"config get model.provider"*) echo "ORIGINAL_PROV"; exit 0 ;;
@@ -269,6 +265,50 @@ def test_main_leaves_the_config_alone_when_the_sticky_read_fails(tmp: pathlib.Pa
           not any("router.py" in line for line in written.splitlines()), repr(written))
 
 
+def test_an_unset_key_does_not_block_the_first_write(tmp: pathlib.Path) -> None:
+    """The real CLI answers an unset key with 'Config key not set: <key>' on stderr
+    AND exit 1. Reading that exit status as a failed read refused to write anything
+    at all on a machine that had simply never been routed, which is the documented
+    first step for a new install. This shim exits 1 the way the real one does."""
+    calls = tmp / "first-use.log"
+    bin_dir = fake_hermes(tmp, not_set="model.base_url", calls=calls)
+    old_path = os.environ["PATH"]
+    os.environ["PATH"] = f"{bin_dir}:{old_path}"
+    try:
+        try:
+            model_id, _ = A.set_provider("clinepass", {"base_url": "https://x/v1"}, "ds",
+                                         dry=False, models={"ds": {"clinepass": "cline-pass/ds"}})
+            raised = None
+        except Exception as exc:  # noqa: BLE001 - any failure here is the finding
+            raised, model_id = exc, ""
+    finally:
+        os.environ["PATH"] = old_path
+    check("an unset key is an answer, not a failure", raised is None, str(raised))
+    check("the write went through", model_id == "cline-pass/ds", model_id)
+    written = calls.read_text() if calls.exists() else ""
+    check("all three keys were written", written.count("config set") == 3, repr(written))
+    check("no config unset was issued for a key that was read",
+          "config unset" not in written, repr(written))
+
+
+def test_a_failing_get_with_no_notice_still_looks_like_a_failure(tmp: pathlib.Path) -> None:
+    """A nonzero exit WITHOUT the notice is a real read failure. Otherwise the
+    distinction would collapse the other way."""
+    bin_dir = fake_hermes(tmp, fail_get="model.default")
+    old_path = os.environ["PATH"]
+    os.environ["PATH"] = f"{bin_dir}:{old_path}"
+    try:
+        try:
+            A.current_value("model.default")
+            raised = None
+        except A.ConfigReadError as exc:
+            raised = str(exc)
+    finally:
+        os.environ["PATH"] = old_path
+    check("a failing read with no notice raises", raised is not None, str(raised))
+    check("and the reason is preserved", "keyring locked" in (raised or ""), str(raised))
+
+
 def test_a_malformed_config_reports_instead_of_crashing(tmp: pathlib.Path) -> None:
     """A stranger's first edit to config.yaml is a typo. A traceback there is worse
     than a message, because the timer swallows the traceback into the journal."""
@@ -299,25 +339,5 @@ def test_a_malformed_config_reports_instead_of_crashing(tmp: pathlib.Path) -> No
         A.CONFIG = real_config
 
 
-def main() -> int:
-    tmp = pathlib.Path(tempfile.mkdtemp(prefix="ds-apply-"))
-    for sub in ("a", "b", "c", "d", "e", "f", "g", "h", "i"):
-        (tmp / sub).mkdir()
-    try:
-        test_a_failed_write_rolls_back_the_ones_before_it(tmp / "a")
-        test_success_writes_all_three_keys_in_order(tmp / "b")
-        test_dry_run_writes_nothing(tmp / "c")
-        test_a_provider_that_does_not_serve_the_alias_is_refused(tmp / "d")
-        test_current_value_reads_through_the_not_set_notice(tmp / "e")
-        test_a_failed_config_read_raises_instead_of_looking_unset(tmp / "f")
-        test_an_unreadable_previous_value_stops_the_write_entirely(tmp / "g")
-        test_main_leaves_the_config_alone_when_the_sticky_read_fails(tmp / "h")
-        test_a_malformed_config_reports_instead_of_crashing(tmp / "i")
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    print(f"\n{PASSED} passed, {FAILED} failed")
-    return 1 if FAILED else 0
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(testkit.run(globals(), scratch_prefix="ds-apply-"))

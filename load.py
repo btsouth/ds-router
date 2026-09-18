@@ -184,10 +184,10 @@ def active_by_provider(
                 failures.append(f"sessions by lease: {exc}")
                 counts = {}
 
-    if not counts and source != "leases":
-        # No lease data (or the leases matched no session). Fall back to recent
-        # activity, which is a weaker signal: a session that finished a turn
-        # recently still occupies its provider's connection briefly.
+    if not counts:
+        # No leases matched a session row, or the lease table is absent. Fall back
+        # to recent activity, which is a weaker signal but a real one: without this
+        # a store whose leases resolve to nothing reported zero load and looked idle.
         try:
             rows = con.execute(
                 "select id, session_key, billing_provider, model_config from sessions "
@@ -208,16 +208,64 @@ def active_by_provider(
         # Nothing could be read. An empty count here is ignorance, not idleness,
         # and the caller has to be able to tell which.
         return Load({}, "unreadable", detail)
+    if not counts:
+        # The store was read and nothing is running: a real zero, not a failure.
+        source = "none"
     return Load(counts, source, detail)
+
+
+def _as_cap(value: Any) -> Optional[int]:
+    """A concurrency limit as a whole number, or None when it cannot be read as one."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if float(value).is_integer() else None
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def normalize_caps(caps: Any) -> tuple[dict[str, int], list[str]]:
+    """Readable caps, and the entries that are not. The one reader for all modules.
+
+    Each module used to read a cap its own way: a quoted `'3'` (an ordinary YAML
+    typo) crashed the scorer with a TypeError, while `placement.plan` enforced it
+    and the OVER CAP line ignored it, so a limit one part of the tool honoured
+    another could not see. Absent and 0 keep meaning "no declared cap", which is a
+    real configuration; anything present but unreadable is reported instead of
+    being treated as unlimited.
+    """
+    if caps in (None, {}):
+        return {}, []
+    if not isinstance(caps, dict):
+        return {}, [f"the caps block must map a provider to a limit, found {type(caps).__name__}"]
+    out: dict[str, int] = {}
+    problems: list[str] = []
+    for name, value in caps.items():
+        if value is None or value == 0:
+            continue  # no declared cap
+        number = _as_cap(value)
+        if number is None or number < 1:
+            problems.append(f"{name}: {value!r}")
+            continue
+        out[str(name)] = number
+    return out, problems
 
 
 def over_capacity(load: Load, caps: dict[str, int]) -> dict[str, int]:
     """Providers over their concurrency cap, with the overflow count.
 
-    A provider with no declared cap is never over it.
+    A provider with no declared cap is never over it. Caps are normalised first, so
+    a quoted limit is honoured here as well as in the planner.
     """
+    readable, _problems = normalize_caps(caps)
     return {
         name: load.count(name) - cap
-        for name, cap in caps.items()
-        if isinstance(cap, int) and cap > 0 and load.count(name) > cap
+        for name, cap in readable.items()
+        if load.count(name) > cap
     }

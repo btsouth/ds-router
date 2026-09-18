@@ -180,6 +180,11 @@ def _finite_percent(value: Any) -> Optional[float]:
         number = float(value)
     except (TypeError, ValueError):
         return None
+    if isinstance(value, bool):
+        # float(False) is 0.0 and float(True) is 1.0, so a garbled boolean field
+        # would become the emptiest possible window (or a full one). Every other
+        # numeric reader in this project rejects bools; so does this one now.
+        return None
     if number != number or number in (float("inf"), float("-inf")):  # NaN / inf
         return None
     return number if number >= 0.0 else None
@@ -350,6 +355,44 @@ _PARSERS: dict[str, Callable[[dict], list[Window]]] = {
 }
 
 
+# The windows each provider is expected to report. A response that omits one is not
+# a smaller plan, it is a reading with a hole in it: the missing window cannot be
+# reasoned about, and scoring the rest as if the provider had fewer limits is how a
+# partially-read provider wins a destination on data nobody checked.
+_EXPECTED_WINDOWS = {
+    "commandcode": ("session", "weekly", "monthly"),
+    "opencode-go": ("session", "weekly", "monthly"),
+    "ollama-cloud": ("monthly",),
+    "clinepass": ("session", "weekly", "monthly"),
+}
+
+
+def missing_windows(windows: list, provider: str) -> list[str]:
+    """Window kinds *provider* is expected to report but did not."""
+    expected = _EXPECTED_WINDOWS.get(str(provider))
+    if not expected:
+        return []
+    have = {w.kind for w in windows if w.kind}
+    return [kind for kind in expected if kind not in have]
+
+
+def describe_windows(windows: list) -> str:
+    """What was read, for a message that has to say what is missing AND what is not."""
+    return ", ".join(f"{w.label or w.kind} {w.percent:.0%}" for w in windows) or "nothing"
+
+
+def partial_note(provider: str, windows: list, *, skip: tuple = ()) -> str:
+    """The "a window went missing" note, or '' when the reading looks complete.
+
+    *skip* is for windows that legitimately come from another endpoint (CommandCode's
+    monthly window is fetched separately, and has its own note).
+    """
+    missing = [kind for kind in missing_windows(windows, provider) if kind not in skip]
+    if not missing:
+        return ""
+    return f"partial reading: no {', '.join(missing)} window (read: {describe_windows(windows)})"
+
+
 def fetch_quota(provider: str, spec: dict, key: str, timeout: float = 12.0) -> Quota:
     """Read one provider's windows. A failure yields an error Quota, never raises."""
     kind = str(spec.get("quota") or "")
@@ -378,9 +421,13 @@ def fetch_quota(provider: str, spec: dict, key: str, timeout: float = 12.0) -> Q
                 else:
                     note = ("monthly window unread: the spend summary carried no usable "
                             "credit figures")
+            # Every window the credits payload was supposed to carry, on top of the
+            # monthly one handled above.
+            if note == "":
+                note = partial_note(provider, windows, skip=("monthly",))
             if note:
-                read = ", ".join(f"{w.label} {w.percent:.0%}" for w in windows) or "nothing"
-                note = f"{note} (read: {read})"
+                # " (read: " and not "read:", which the note's own "unread:" would match.
+                note = note if " (read: " in note else f"{note} (read: {describe_windows(windows)})"
             plan = ""
             try:
                 data = _http_json(f"{base}/alpha/billing/subscriptions", key, timeout).get("data") or {}
@@ -395,15 +442,18 @@ def fetch_quota(provider: str, spec: dict, key: str, timeout: float = 12.0) -> Q
 
         if kind == "opencode_go":
             payload = _http_json("https://opencode.ai/zen/go/v1/usage", key, timeout)
-            return Quota(provider, _PARSERS["opencode_go"](payload), time.time())
+            windows = _PARSERS["opencode_go"](payload)
+            return Quota(provider, windows, time.time(), partial_note(provider, windows))
 
         if kind == "ollama":
             payload = _http_json("https://ollama.com/api/usage", key, timeout)
             plan = payload.get("plan") if isinstance(payload.get("plan"), str) else ""
-            return Quota(provider, _PARSERS["ollama"](payload), time.time(), "", plan)
+            windows = _PARSERS["ollama"](payload)
+            return Quota(provider, windows, time.time(), partial_note(provider, windows), plan)
 
         if kind == "clinepass":
             payload = _http_json("https://api.cline.bot/api/v1/users/me/plan/usage-limits", key, timeout)
+            windows = parse_clinepass(payload)
             plan = ""
             try:
                 meta = _http_json("https://api.cline.bot/api/v1/users/me/plan", key, timeout)
@@ -412,7 +462,7 @@ def fetch_quota(provider: str, spec: dict, key: str, timeout: float = 12.0) -> Q
             except Exception:
                 # Cosmetic label only; never fail the quota read over it.
                 pass
-            return Quota(provider, parse_clinepass(payload), time.time(), "", plan)
+            return Quota(provider, windows, time.time(), partial_note(provider, windows), plan)
 
         return Quota(provider, [], time.time(), f"no quota reader for {kind!r}")
     except Exception as exc:
@@ -449,6 +499,11 @@ def from_collector(provider: str, state_dir: "Path", ttl_seconds: float = 300.0)
         payload = json.loads(path.read_text())
     except (OSError, ValueError):
         return None
+    if not isinstance(payload, dict):
+        # Valid JSON that is not an object ([1,2], "x", 3, null) used to raise
+        # AttributeError from payload.get below, which took the whole router down
+        # with a traceback rather than reading as "no usable snapshot".
+        return None
     if payload.get("error"):
         return None
     attempted = payload.get("attemptedAt")
@@ -467,6 +522,10 @@ def from_collector(provider: str, state_dir: "Path", ttl_seconds: float = 300.0)
             continue  # a reset we cannot read is not a window we can reason about
         windows.append(Window(str(row.get("label") or ""), fraction, reset))
     if not windows:
+        return None
+    if missing_windows(windows, provider):
+        # A snapshot missing a window must not become the reading: poll the real
+        # endpoint instead, which is one request and answers completely.
         return None
     return Quota(provider, windows, float(attempted), "", str(payload.get("plan") or ""))
 

@@ -161,7 +161,14 @@ def main() -> int:
             print(f"  note: ignoring the peak pricing config ({exc}).", file=sys.stderr)
 
     conc_cfg = routing_cfg.get("concurrency") or {}
-    caps = (conc_cfg.get("caps") or {}) if conc_cfg.get("enabled", True) else {}
+    declared_caps = (conc_cfg.get("caps") or {}) if conc_cfg.get("enabled", True) else {}
+    caps, cap_problems = load_mod.normalize_caps(declared_caps)
+    if cap_problems:
+        print("refusing to route: unreadable concurrency cap(s) in config.yaml: "
+              + "; ".join(cap_problems), file=sys.stderr)
+        print("  a cap is a positive integer, and a cap that cannot be read is not "
+              "'unlimited'. Fix it or remove the entry.", file=sys.stderr)
+        return 2
     live_load = load_mod.active_by_provider() if caps else load_mod.Load({}, "disabled")
 
     # Health is measured BEFORE the decision so it can inform it: a provider that
@@ -192,9 +199,15 @@ def main() -> int:
             "concurrency_caps": caps,
             "load": {"source": live_load.source, "readable": live_load.readable,
                      "error": live_load.error},
+            # An empty health map means "not probed", not "all healthy", so say so
+            # rather than leaving a caller to infer it from an empty object.
+            "health_measured": bool(args.health),
             "health": health,
             "candidates": [
-                {"provider": c.provider, "risk": round(c.pressure, 4), "headroom": round(c.headroom, 4),
+                # `usage` is the fullest window's usage fraction: 1.0 is spent and
+                # 0.0 is empty. It was called "headroom", which reads the other way
+                # round and made sorting on it pick the worst provider.
+                {"provider": c.provider, "risk": round(c.pressure, 4), "usage": round(c.headroom, 4),
                  "quota_ok": c.quota_ok, "hard": c.hard, "detail": c.detail}
                 for c in decision.ranked
             ],
@@ -209,6 +222,10 @@ def main() -> int:
     over = load_mod.over_capacity(live_load, caps)
     load_desc = ", ".join(f"{n}={live_load.count(n)}/{caps.get(n, '-')}" for n in providers)
     print(f"  active      : {load_desc}  (via {live_load.source})")
+    if live_load.error:
+        # Printed whether or not the reading was usable: a partial count is smaller
+        # than reality, and a silent undercount looks like a healthy fleet.
+        print(f"  load note   : {live_load.error}")
     if not live_load.readable:
         # An unreadable store and an idle one both count zero, so say which this
         # is: the concurrency pressure term is silently absent otherwise.
@@ -217,7 +234,9 @@ def main() -> int:
     if over:
         print(f"  OVER CAP    : " + ", ".join(f"{n} by {o}" for n, o in over.items()))
     print()
-    print(f"  {'provider':<15}{'risk':>8}{'headroom':>10}   detail")
+    # "usage", not "headroom": this is the fullest window's usage fraction, so 0 is
+    # the best value and 1.0 is spent. The old name read the other way round.
+    print(f"  {'provider':<15}{'risk':>8}{'usage':>10}   detail")
     print("  " + "-" * 84)
     for c in decision.ranked:
         flag = "EXHAUSTED" if c.hard else ("" if c.quota_ok else "no reading")

@@ -67,28 +67,46 @@ def load_config() -> dict:
     return cfg
 
 
-def hermes(*args: str) -> str:
-    """Run a hermes CLI command, returning stripped stdout."""
+def _run(*args: str) -> tuple[int, str, str]:
+    """Run a hermes CLI command, returning (returncode, stdout, stderr)."""
     proc = subprocess.run(["hermes", *args], capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"hermes {' '.join(args)} failed: {proc.stderr.strip()[:200]}")
-    return proc.stdout.strip()
+    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+
+def hermes(*args: str) -> str:
+    """Run a hermes CLI command that must succeed, returning stripped stdout."""
+    code, out, err = _run(*args)
+    if code != 0:
+        raise RuntimeError(f"hermes {' '.join(args)} failed: {(err or out)[:200]}")
+    return out
+
+
+# Hermes answers an unset key with this notice AND a nonzero exit code, so the
+# exit status alone cannot mean "the read failed". Treating it as a failure made
+# every unset key a read error, which on a machine that had never been routed
+# refused to write anything at all.
+_NOT_SET_NOTICE = "config key not set"
 
 
 def _config_get(key: str) -> str:
     """The stored value of a config key, or '' when it is genuinely unset.
 
-    A failed `hermes config get` raises. The two cases were the same value before,
-    and conflating them made the tool drop the sticky provider (so a healthy
-    conversation could be moved, paying a prompt-cache reset) and, worse, made the
-    rollback issue `config unset` for a key whose real value had never been read,
-    which deletes a setting while reporting it as restored.
+    Three outcomes, deliberately distinct:
+    * the value was read                     -> the value
+    * the CLI said the key is not set        -> '' (an answer, not a failure)
+    * anything else nonzero                  -> raise, because an unread value must
+      not be confused with an empty one: that is what made the rollback restore a
+      key it had never read as "unset", deleting whatever was really there.
     """
-    out = hermes("config", "get", key)
-    # `hermes config get` prints the value, or a "not set" notice.
+    code, out, err = _run("config", "get", key)
+    notice = _NOT_SET_NOTICE in f"{out}\n{err}".lower()
+    if notice:
+        return ""
+    if code != 0:
+        raise ConfigReadError(f"hermes config get {key} failed ({(err or out)[:200]})")
     for line in reversed(out.splitlines()):
         value = line.strip()
-        if value and not value.lower().startswith("config key not set"):
+        if value:
             return value
     return ""
 

@@ -5,9 +5,13 @@ Run: python3 test_routing.py
 
 from __future__ import annotations
 
+import sys
+
 import time
 from pathlib import Path
 
+import load as q_load
+import placement as pl
 import quota as q
 import routing as r
 import testkit
@@ -187,7 +191,146 @@ def test_clinepass_nanosecond_reset_times_are_parsed():
     assert abs(window.resets_at - expected) < 1e-6, (window.resets_at, expected)
 
 
-def test_a_malformed_peak_window_is_reported_not_silently_off_peak():
+def test_a_partial_reading_is_not_a_complete_one():
+    """Any parser used to accept one window of three: the reading was non-stale and
+    the provider was a valid destination, scored as if the missing windows did not
+    exist. A hole in a reading is not a smaller plan."""
+    full = {"usage": {"rolling": {"status": "ok", "percent": 4, "resetsAt": "2026-09-18T12:00:00Z"},
+                      "weekly": {"status": "ok", "percent": 88, "resetsAt": "2026-09-21T00:00:00Z"},
+                      "monthly": {"status": "ok", "percent": 80, "resetsAt": "2026-09-27T00:00:00Z"}}}
+    windows = q.parse_opencode_go(full)
+    assert q.missing_windows(windows, "opencode-go") == [], q.missing_windows(windows, "opencode-go")
+    assert q.partial_note("opencode-go", windows) == ""
+
+    partial = {"usage": {"weekly": {"status": "ok", "percent": 10,
+                                    "resetsAt": "2026-09-21T00:00:00Z"}}}
+    windows = q.parse_opencode_go(partial)
+    assert q.missing_windows(windows, "opencode-go") == ["session", "monthly"]
+    note = q.partial_note("opencode-go", windows)
+    assert "partial reading" in note and "session" in note and "monthly" in note, note
+    assert "read: " in note, note
+
+    # The note is what makes the reading stale, so it is not a destination and its
+    # existing sessions stay put.
+    quota = q.Quota("opencode-go", windows, time.time(), note)
+    assert quota.stale
+    import placement as pl
+    providers = {"opencode-go": spec({"ds": "m"}), "other": spec({"ds": "m"})}
+    healthy_other = q.Quota("other", [win("monthly", 0.1)])
+    decision = r.choose("ds", providers, {"opencode-go": quota, "other": healthy_other},
+                        WEIGHTS, SKIP, now=time.time())
+    assert decision.provider == "other", decision.reason
+    fleet = [pl.Session(id="o1", provider="opencode-go", model="m")]
+    assert pl.plan(fleet, {"opencode-go": quota, "other": healthy_other}, {},
+                   providers, "ds")[0].keep
+
+    # A provider that only ever has one window is not partial.
+    ollama = q.parse_ollama({"limits": {"monthly": {"usage": 0.5, "models": []}}})
+    assert q.missing_windows(ollama, "ollama-cloud") == []
+    assert q.partial_note("ollama-cloud", ollama) == ""
+
+
+def test_a_partial_snapshot_is_not_used_as_the_reading():
+    """A snapshot that lost a window must send the caller to the real endpoint
+    rather than become the reading: one request answers completely."""
+    import json
+    import tempfile
+    from pathlib import Path as P
+    state = P(tempfile.mkdtemp(prefix="ds-partial-snapshot-"))
+    now = time.time()
+    weekly_only = {"attemptedAt": now, "limits": [
+        {"label": "Weekly (7-day)", "percent": 0.9, "resetsAt": "2026-09-21T00:00:00Z"}]}
+    (state / q.COLLECTOR_FILES["opencode-go"]).write_text(json.dumps(weekly_only))
+    assert q.from_collector("opencode-go", state, 300) is None
+    complete = {"attemptedAt": now, "limits": [
+        {"label": "5 hours", "percent": 0.1, "resetsAt": "2026-09-18T12:00:00Z"},
+        {"label": "Weekly (7-day)", "percent": 0.9, "resetsAt": "2026-09-21T00:00:00Z"},
+        {"label": "Monthly", "percent": 0.8, "resetsAt": "2026-09-27T00:00:00Z"}]}
+    (state / q.COLLECTOR_FILES["opencode-go"]).write_text(json.dumps(complete))
+    assert q.from_collector("opencode-go", state, 300) is not None
+
+
+def test_a_boolean_percentage_is_unusable():
+    """float(False) is 0.0, so a garbled boolean would become the emptiest window."""
+    assert q._finite_percent(False) is None and q._finite_percent(True) is None
+    assert q._finite_percent(0) == 0.0 and q._finite_percent(0.0) == 0.0
+
+
+def test_a_snapshot_that_is_valid_json_but_not_an_object_is_not_a_reading():
+    """[1,2] used to raise AttributeError from payload.get and take the whole router
+    down with a traceback instead of reading as no usable snapshot."""
+    import tempfile
+    from pathlib import Path as P
+    state = P(tempfile.mkdtemp(prefix="ds-bad-snapshot-"))
+    for text in ("[1, 2]", '"x"', "3", "null"):
+        (state / q.COLLECTOR_FILES["opencode-go"]).write_text(text)
+        assert q.from_collector("opencode-go", state, 300) is None, text
+    # And the router keeps working with such a snapshot present.
+    import router as R
+    cfg = {"reuse_collector_state": True, "collector_state_dir": str(state),
+           "quota_ttl_seconds": 300}
+    real = q._http_json
+    q._http_json = lambda url, key, timeout=12.0: {"usage": {}}
+    try:
+        quotas = R.collect({"opencode-go": {"quota": "opencode_go"}}, {"opencode-go": "k"}, routing_cfg=cfg)
+    finally:
+        q._http_json = real
+    assert quotas["opencode-go"].stale, quotas["opencode-go"]
+
+
+def test_a_cap_is_read_the_same_way_by_every_module():
+    """A quoted cap crashed the scorer with a TypeError while the planner enforced
+    it and the OVER CAP line ignored it: one limit, three readings."""
+    for caps, expected in (({"a": 3}, {"a": 3}), ({"a": "3"}, {"a": 3}), ({"a": 3.0}, {"a": 3}),
+                           ({"a": None}, {}), ({"a": 0}, {}), ({}, {})):
+        got, problems = q_load.normalize_caps(caps)
+        assert got == expected and problems == [], (caps, got, problems)
+    for bad in ({"a": "three"}, {"a": {"limit": 3}}, {"a": [3]}, {"a": True}, {"a": -1}, {"a": 3.5}):
+        got, problems = q_load.normalize_caps(bad)
+        assert problems and got == {}, (bad, got, problems)
+    # A caps block that is not a mapping at all is a problem, not a traceback.
+    for bad_block in (3, [3], "3"):
+        got, problems = q_load.normalize_caps(bad_block)
+        assert got == {} and problems, (bad_block, problems)
+
+    # The scorer no longer crashes on a quoted cap, and honours it.
+    quotas = {"p": q.Quota("p", [win("monthly", 0.1)])}
+    providers = {"p": spec({"ds": "m"})}
+    decision = r.choose("ds", providers, quotas, WEIGHTS, SKIP, now=time.time(),
+                        load={"p": 5}, concurrency_caps={"p": "2"})
+    assert "cap 2" in decision.reason or decision.ranked[0].pressure > 0, decision.reason
+    # And the OVER CAP display sees the same limit the planner does.
+    assert q_load.over_capacity(q_load.Load({"p": 5}, "leases"), {"p": "2"}) == {"p": 3}
+
+
+def test_a_cap_that_cannot_be_read_is_refused_by_both_entry_points():
+    """The library refuses with CapError; both CLIs must name the entry and exit
+    nonzero rather than crashing or ignoring it."""
+    import io
+    import tempfile
+    from contextlib import redirect_stderr
+    from pathlib import Path as P
+    import router as R
+    cfg = P(tempfile.mkdtemp(prefix="ds-caps-")) / "config.yaml"
+    cfg.write_text("default_model: ds\nrouting:\n  concurrency:\n    caps: 3\n"
+                   "providers:\n  commandcode:\n    base_url: https://x/v1\n    key_env: K\n"
+                   "models:\n  ds:\n    commandcode: m\n")
+    real_router_config = R.CONFIG
+    R.CONFIG = cfg
+    stderr = io.StringIO()
+    old_argv = sys.argv
+    sys.argv = ["router.py", "--dry-run"]
+    try:
+        with redirect_stderr(stderr):
+            code = R.main()
+    finally:
+        R.CONFIG = real_router_config
+        sys.argv = old_argv
+    assert code == 2, (code, stderr.getvalue())
+    assert "unreadable concurrency cap" in stderr.getvalue(), stderr.getvalue()
+    assert "caps block" in stderr.getvalue(), stderr.getvalue()
+
+
     """A span written as [12, 18] instead of [[12, 18]] used to be skipped, which
     says "this provider is never at peak" and makes the tie-break prefer it for the
     whole window on the strength of a claim that failed to parse."""
@@ -224,11 +367,12 @@ def test_from_collector_uses_a_fresh_snapshot_and_refuses_anything_else():
     payload = {"attemptedAt": now, "plan": "Go", "limits": [
         {"label": "5 hours", "percent": 0.07, "resetsAt": "2026-09-18T12:00:00Z"},
         {"label": "Weekly (7-day)", "percent": 0.98, "resetsAt": "2026-09-21T00:00:00Z"},
+        {"label": "Monthly", "percent": 0.87, "resetsAt": "2026-09-27T00:00:00Z"},
     ]}
     snapshot = state / q.COLLECTOR_FILES["opencode-go"]
     snapshot.write_text(json.dumps(payload))
     got = q.from_collector("opencode-go", state, 300)
-    assert got is not None and [w.kind for w in got.windows] == ["session", "weekly"], got
+    assert got is not None and [w.kind for w in got.windows] == ["session", "weekly", "monthly"], got
     assert got.windows[1].percent == 0.98
     assert got.plan == "Go" and not got.stale
 
@@ -424,7 +568,12 @@ def test_sticky_leaves_immediately_once_a_provider_is_actually_spent():
     assert decision.provider == "commandcode", decision.reason
 
 
-def test_sticky_leaves_when_its_quota_cannot_be_read():
+def test_sticky_holds_a_provider_whose_reading_failed():
+    """A failed reading is a telemetry failure, not evidence the provider is spent,
+    so it is not a reason to move: moving pays a prompt-cache reset for every
+    conversation on that provider to avoid an outage that may not exist. The
+    provider is still never CHOSEN for anything new, which the next assertion pins.
+    Hard exhaustion and a failed health probe are different and still evict."""
     now = time.time()
     live = {
         "commandcode": q.Quota("commandcode", [win("weekly", 0.30, resets_in=4 * DAY, now=now)]),
@@ -432,7 +581,23 @@ def test_sticky_leaves_when_its_quota_cannot_be_read():
         "ollama-cloud": q.Quota("ollama-cloud", [win("monthly", 0.45)]),
     }
     decision = r.choose("ds", PROVIDERS, live, WEIGHTS, SKIP, sticky_provider="opencode-go", now=now)
-    assert decision.provider == "commandcode"
+    assert decision.provider == "opencode-go", decision.reason
+    assert "unusable" in decision.reason or "no reading" in decision.reason, decision.reason
+
+    # Not a destination: with NO sticky provider, the unreadable one is not chosen.
+    fresh = r.choose("ds", PROVIDERS, live, WEIGHTS, SKIP, now=now)
+    assert fresh.provider != "opencode-go", fresh.reason
+
+    # Hard exhaustion still evicts, reading or no reading.
+    spent = dict(live)
+    spent["opencode-go"] = q.Quota("opencode-go", [win("weekly", 1.0, resets_in=4 * DAY, now=now)])
+    assert r.choose("ds", PROVIDERS, spent, WEIGHTS, SKIP,
+                    sticky_provider="opencode-go", now=now).provider != "opencode-go"
+
+    # A failed health probe is evidence about the provider, so it evicts too.
+    probed = r.choose("ds", PROVIDERS, live, WEIGHTS, SKIP, sticky_provider="opencode-go",
+                      now=now, health={"opencode-go": {"ok": False, "error": "refused"}})
+    assert probed.provider != "opencode-go", probed.reason
 
 
 def test_imminent_exhaustion_is_flagged_for_the_caller():

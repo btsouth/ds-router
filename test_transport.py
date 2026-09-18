@@ -19,18 +19,13 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import placement as pl
-
-PASSED = FAILED = 0
+import testkit
 
 
 def check(label: str, ok: bool, detail: str = "") -> None:
-    global PASSED, FAILED
-    if ok:
-        PASSED += 1
-        print(f"  pass  {label}")
-    else:
-        FAILED += 1
-        print(f"  FAIL {label}" + (f"\n       {detail}" if detail else ""))
+    """A named assertion: raise, so the runner reports the test, the label and the line."""
+    if not ok:
+        raise AssertionError(label + (f": {detail}" if detail else ""))
 
 
 class StubClient:
@@ -247,21 +242,5 @@ def test_apply_refuses_a_write_with_no_transport() -> None:
     check("the message suggests the dry run", "dry_run" in (raised or ""), str(raised))
 
 
-def main() -> int:
-    test_a_good_reply_is_returned()
-    test_a_server_error_is_final_and_not_repeated()
-    test_a_timeout_after_the_send_is_not_retried()
-    test_a_closed_socket_mid_reply_is_not_retried()
-    test_a_connection_failure_is_retried_once()
-    test_a_failed_send_is_retried_once()
-    test_a_reply_to_another_request_is_ignored()
-    test_a_reply_with_no_result_is_unconfirmed_not_moved()
-    test_read_reply_classifies_every_shape_it_documents()
-    test_apply_does_not_count_an_unconfirmed_move_as_done()
-    test_apply_refuses_a_write_with_no_transport()
-    print(f"\n{PASSED} passed, {FAILED} failed")
-    return 1 if FAILED else 0
-
-
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(testkit.run(globals(), scratch_prefix="ds-transport-"))
