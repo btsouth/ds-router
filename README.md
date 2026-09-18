@@ -23,11 +23,14 @@ subscription until it throttles you.
 ## Quick start
 
 ```sh
-git clone <this repo> ~/Projects/ds-router
+git clone https://github.com/btsouth/ds-router ~/Projects/ds-router
 cd ~/Projects/ds-router
 ./install.sh --dry-run    # see exactly what it would do, change nothing
 ./install.sh              # do it
 ```
+
+Any clone location works — the installer rewrites the systemd units and the
+manifest to wherever you put it, so `~/ds-router` or a nested path is fine.
 
 `install.sh` checks your prerequisites, runs the test suite as a preflight,
 installs a systemd timer (Linux) or prints the macOS equivalent, enables it, and
