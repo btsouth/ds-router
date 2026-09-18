@@ -83,10 +83,56 @@ Only the providers you actually have need entries. Delete the others from
 | `./router.py --dry-run --health` | Also probe each provider with a real request |
 | `./router.py --dry-run --json` | Machine-readable output |
 | `./router.py --list-models` | Fetch each provider's live catalog |
-| `python3 test_routing.py` | Run the tests |
+| `./placement.py` | Spread your open sessions across providers (see below) |
+| `python3 run_tests.py` | Run every test suite |
 
 Every command that changes something has a read-only counterpart. `--show`,
-`--check`, and `--dry-run` never write.
+`--check`, `--dry-run`, and `--plan` never write.
+
+## Spreading many sessions
+
+`ds-switch` sets one provider for Hermes, so every session you open inherits it.
+If you run several agents at once, they all land on the same provider — and
+providers cap concurrency. Ollama Cloud Pro allows 3 simultaneous requests, so a
+4th session queues and a full queue is rejected.
+
+`placement.py` fixes that by giving sessions *different* providers:
+
+```sh
+./placement.py --plan          # show the target spread, write nothing
+./placement.py --apply         # do it
+```
+
+It uses Hermes' own per-session provider override, so this is session-scoped
+state, not a global config write. Real output from a 21-session fleet:
+
+```
+  alias       : deepseek-v4.1-flash
+  sessions    : 21 (live backend pid=<pid> port=<port> (serve))
+  caps        : ollama-cloud=3
+  target      : clinepass=4, commandcode=10, ollama-cloud=3, opencode-go=3
+  keep 16    move 5
+    ollama-cloud   3/3
+
+  session        from           to             model                          why
+  ---------------------------------------------------------------------------
+  02340f5c       nous           nous           -                              nous is not managed by ds-router; left alone
+  036e75ea       ollama-cloud   ollama-cloud   deepseek-v4.1-flash            stays on ollama-cloud (1/3 of its cap)
+  418ca809       ollama-cloud   opencode-go    deepseek-v4.1-flash            moved off ollama-cloud is over its concurrency cap
+```
+
+Design rules, all asserted by tests:
+
+- **Never exceed a declared cap.** `routing.concurrency.caps` in `config.yaml`.
+- **Leave sessions alone unless there is a reason.** Moving a session resets its
+  prompt cache, so a session only moves when its provider is over cap or
+  exhausted. 16 of 21 stayed put above.
+- **Never send a session to a provider that does not serve your model.**
+- **A provider ds-router does not manage is never touched.**
+- **Deterministic** — the same fleet always produces the same plan.
+
+It reads sessions from the running Hermes backend when one is available, and
+falls back to reading `state.db` read-only when not.
 
 ## How it decides
 
@@ -181,6 +227,23 @@ exactly this (dashboard-only allowance) plus a 53s median response time.
 - **`x-opencode-session`** is forwarded upstream, or OpenCode Go rejects the
   request with `400 MissingSessionID`.
 
+## What is verified
+
+Claims in this README that have been measured, rather than reasoned about:
+
+- All four providers' quota endpoints, read live; each returns the windows
+  documented above.
+- Ollama Cloud Pro's 3-concurrent cap: at 10 simultaneous requests, 2 returned
+  HTTP 429 within ~0.15s while the rest queued 40-80 seconds.
+- Hermes' fallback chain: a dead primary walks the chain and answers on the next
+  provider.
+- ClinePass tool calling, streaming, and its usage API on a personal plan.
+- `placement.py --plan` against a live 21-session desktop backend.
+- `install.sh` / `uninstall.sh` in an isolated sandbox, including that
+  `--dry-run` writes nothing and a re-run is a no-op.
+
+Claims that are reasoned but **not** verified end to end are flagged inline.
+
 ## Requirements
 
 - Python 3.10+ with `pyyaml`
@@ -193,6 +256,10 @@ exactly this (dashboard-only allowance) plus a 53s median response time.
 - **Selection is per-session, not per-request.** The router chooses a provider
   for a Hermes session; it is not a proxy sitting in the request path. Hermes'
   own fallback chain handles mid-turn failures.
+- **`placement.py --plan` is verified against a live 21-session fleet.
+  `--apply` is not.** The plan path has been run against a real backend many
+  times; the write path is implemented and unit-tested against a fake transport,
+  but has not yet been exercised end to end on a live fleet. Try `--plan` first.
 - **A hang is not bounded by ds-router.** A provider that accepts a connection
   and never replies stalls that request until the SDK's own timeout. Health
   probing catches a *dead* provider before you are routed to it, but cannot

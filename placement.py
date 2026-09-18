@@ -71,9 +71,9 @@ def state_db_path(db_path: Optional[Path] = None) -> Path:
     """
     if db_path is not None:
         return Path(db_path)
-    home = os.environ.get("HERMES_HOME")
-    base = Path(home) if home else Path.home() / ".hermes"
-    return base / "state.db"
+    # One resolver for the whole project (src/paths.py).
+    from paths import state_db
+    return state_db()
 
 # Matches config.yaml's routing defaults. Only used when the caller passes no
 # value, so a config change is never silently ignored by this module.
@@ -1049,8 +1049,9 @@ def build_providers(config: dict) -> dict[str, dict]:
 
 
 def hermes_home() -> Path:
-    home = os.environ.get("HERMES_HOME")
-    return Path(home) if home else Path.home() / ".hermes"
+    """Delegates to the shared resolver so the rule lives in one place."""
+    from paths import hermes_home as _hermes_home
+    return _hermes_home()
 
 
 def collect_quotas(providers: dict, config: dict) -> dict:
