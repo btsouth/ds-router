@@ -116,6 +116,71 @@ def test_no_declared_cap_means_no_provider_is_ever_over_one():
     assert dest_counts(result) == {"ollama-cloud": 9}
 
 
+def test_a_draining_provider_is_passed_over_while_a_healthier_one_has_room():
+    """Population first, but not onto a provider that is about to throttle.
+
+    opencode-go is the emptiest destination here, so load-first ranking alone
+    would send the overflow to it while its weekly window sits at 98%. clinepass
+    has room and headroom, so it takes the session instead.
+    """
+    fleet = sessions(*[(f"oc{i}", "ollama-cloud") for i in range(4)],
+                     *[(f"cp{i}", "clinepass") for i in range(5)],
+                     *[(f"cc{i}", "commandcode") for i in range(6)])
+    quotas = healthy_quotas()
+    quotas["opencode-go"] = q.Quota("opencode-go", [
+        win("weekly", 0.98, resets_in=2 * 86400),
+        win("session", 0.0, resets_in=3600),
+    ])
+    result = pl.plan(fleet, quotas, CAPS, PROVIDERS, ALIAS)
+
+    assert len(moved(result)) == 1, [a.reason for a in moved(result)]
+    assert moved(result)[0].provider == "clinepass", moved(result)[0].reason
+    assert dest_counts(result).get("opencode-go", 0) == 0, dest_counts(result)
+
+
+def test_a_provider_burning_toward_its_reset_is_passed_over_too():
+    """Half of a weekly window is not headroom when it is climbing this fast."""
+    fleet = sessions(*[(f"oc{i}", "ollama-cloud") for i in range(4)],
+                     *[(f"cp{i}", "clinepass") for i in range(5)],
+                     *[(f"cc{i}", "commandcode") for i in range(6)])
+    quotas = healthy_quotas()
+    # 50% used with six of the seven days gone: on pace. One day elapsed instead
+    # means a 3.3x burn, which reaches 100% long before the window refills.
+    quotas["opencode-go"] = q.Quota("opencode-go", [win("weekly", 0.50, resets_in=6 * 86400)])
+    result = pl.plan(fleet, quotas, CAPS, PROVIDERS, ALIAS)
+
+    assert moved(result)[0].provider == "clinepass", moved(result)[0].reason
+
+
+def test_a_window_that_already_reset_is_not_a_reason_to_pass_a_provider_over():
+    """A spent window with a past reset time is a stale reading, not a drain."""
+    fleet = sessions(*[(f"oc{i}", "ollama-cloud") for i in range(4)],
+                     *[(f"cp{i}", "clinepass") for i in range(5)],
+                     *[(f"cc{i}", "commandcode") for i in range(6)])
+    quotas = healthy_quotas()
+    # 99% and 100% are both ignored: upstream is known to have refilled.
+    quotas["opencode-go"] = q.Quota("opencode-go", [
+        win("weekly", 0.99, resets_in=-60),
+        win("session", 1.0, resets_in=-3600),
+    ])
+    result = pl.plan(fleet, quotas, CAPS, PROVIDERS, ALIAS)
+
+    # Emptiest provider, nothing draining: it takes the overflow.
+    assert moved(result)[0].provider == "opencode-go", moved(result)[0].reason
+
+
+def test_a_fleet_where_every_destination_is_draining_is_still_placed():
+    """Fail open, not refuse: draining providers are a second tier, not a veto."""
+    fleet = sessions(*[(f"oc{i}", "ollama-cloud") for i in range(4)])
+    quotas = {name: q.Quota(name, [win("weekly", 0.90, resets_in=2 * 86400)])
+              for name in PROVIDERS}
+    result = pl.plan(fleet, quotas, CAPS, PROVIDERS, ALIAS)
+
+    assert len(moved(result)) == 1, [a.reason for a in moved(result)]
+    assert moved(result)[0].unassigned is False
+    assert moved(result)[0].provider not in ("", "ollama-cloud"), moved(result)[0].reason
+
+
 def test_exhausted_provider_sheds_all_of_its_sessions():
     """Hard exhaustion is not negotiable: every session leaves, even under cap."""
     quotas = healthy_quotas()

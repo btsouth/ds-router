@@ -117,21 +117,21 @@ providers cap concurrency. Ollama Cloud Pro allows 3 simultaneous requests, so a
 ```
 
 It uses Hermes' own per-session provider override, so this is session-scoped
-state, not a global config write. Real output from a 21-session fleet:
+state, not a global config write. Real output from a 25-session fleet:
 
 ```
   alias       : deepseek-v4.1-flash
-  sessions    : 21 (live backend pid=<pid> port=<port> (serve))
+  sessions    : 25 (live backend pid=<pid> port=<port> (serve))
   caps        : ollama-cloud=3
-  target      : clinepass=4, commandcode=10, ollama-cloud=3, opencode-go=3
-  keep 16    move 5
+  target      : clinepass=9, commandcode=11, nous=1, ollama-cloud=3, opencode-go=1
+  keep 20    move 5
     ollama-cloud   3/3
 
   session        from           to             model                          why
   ---------------------------------------------------------------------------
   02340f5c       nous           nous           -                              nous is not managed by ds-router; left alone
   036e75ea       ollama-cloud   ollama-cloud   deepseek-v4.1-flash            stays on ollama-cloud (1/3 of its cap)
-  418ca809       ollama-cloud   opencode-go    deepseek-v4.1-flash            moved to opencode-go: ollama-cloud is over its concurrency cap
+  418ca809       ollama-cloud   clinepass      cline-pass/deepseek-v4.1-flash moved to clinepass: ollama-cloud is over its concurrency cap
 ```
 
 Design rules, all asserted by tests:
@@ -142,10 +142,18 @@ Design rules, all asserted by tests:
   the planner will not add to it.
 - **Leave sessions alone unless there is a reason.** Moving a session resets its
   prompt cache, so a session only moves when its provider is over cap, hard
-  exhausted, or cannot serve your chosen model. 16 of 21 stayed put above.
+  exhausted, or cannot serve your chosen model. 20 of 25 stayed put above.
   A provider whose *usage endpoint* fails is not a reason to move: that is a
   telemetry outage, not a broken endpoint, so a session already there stays. It
   does stop the provider being chosen as a *destination* until it reads again.
+- **Never send a session to a provider that is about to throttle while a healthier
+  one has room.** Destinations are ranked by how many sessions already sit there,
+  so that the fleet stays spread, but a provider is held back to a second tier
+  when a window that has not reset is already at 85% or is burning toward 100%
+  before its own reset. In the output above that is why the overflow lands on
+  clinepass rather than on opencode-go, whose weekly window sat at 98%. If every
+  provider is in that state the tier is ignored: a drained fleet still gets
+  placed, because refusing would strand the sessions.
 - **Never send a session to a provider that does not serve your model.**
 - **A provider ds-router does not manage is never touched.**
 - **Deterministic** — the same fleet always produces the same plan.

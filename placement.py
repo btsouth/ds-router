@@ -293,6 +293,38 @@ def _risk(candidate: _Candidate, skip_at: float, weights: dict[str, float],
     return float(scored.pressure)
 
 
+def _draining(candidate: _Candidate, skip_at: float, now: float) -> bool:
+    """True when *candidate* is heading for a throttle before it refills.
+
+    A destination can be technically usable — neither hard-exhausted nor
+    unreadable — and still be the wrong place to put a session that will live for
+    hours. Two readings say so, both already used elsewhere in the router:
+
+    * a window that has not reset yet is at or above ``skip_at``, the point the
+      router stops *choosing* a provider even though it is not spent; this reads a
+      window's own percentage, so it is stricter than the router's composite
+      pressure line, which is deliberate: a placed session outlives one turn;
+    * a window whose current burn rate reaches 100% before its own reset, which is
+      the projection ``predicted_to_run_out`` is built on. Coming up short here is
+      what a throttled conversation actually feels like.
+
+    A window whose reset has already passed is ignored: upstream refilled it and
+    the reading is stale, exactly as ``hard_exhausted`` treats it.
+    """
+    quota = candidate.quota
+    if quota is None or quota.stale:
+        return False
+    for window in quota.windows:
+        if window.resets_at is not None and window.resets_at <= now:
+            continue
+        if window.percent >= skip_at:
+            return True
+        pace = window.pace(now)
+        if pace is not None and pace > 1.0:
+            return True
+    return False
+
+
 def _destination(cands: dict[str, _Candidate], assigned: dict[str, int], *,
                  skip_at: float, weights: dict[str, float], now: float) -> Optional[_Candidate]:
     """The best place to put one more session, or None if nowhere can take it.
@@ -301,8 +333,15 @@ def _destination(cands: dict[str, _Candidate], assigned: dict[str, int], *,
     what keeps every provider under its cap — with quota risk as a tie-break so
     two equally loaded providers resolve toward the healthier one. The name
     tiebreak is what makes the result deterministic.
+
+    Providers that are draining (see ``_draining``) are held back as a second
+    tier: they are used only when no destination with room is still healthy. Spare
+    capacity on a provider that is about to throttle is not spare capacity, and a
+    session sent there pays a prompt-cache reset when it is bounced again. Falling
+    back keeps the fail-open promise: a fleet where every provider is draining
+    still gets placed rather than stranded.
     """
-    best: Optional[tuple[tuple, _Candidate]] = None
+    ranked: list[tuple[tuple, _Candidate]] = []
     for name in sorted(cands):
         cand = cands[name]
         if not cand.usable:
@@ -310,10 +349,11 @@ def _destination(cands: dict[str, _Candidate], assigned: dict[str, int], *,
         load = cand.external + assigned.get(name, 0)
         if cand.cap is not None and load >= cand.cap:
             continue
-        key = (load, _risk(cand, skip_at, weights, assigned.get(name, 0), now), name)
-        if best is None or key < best[0]:
-            best = (key, cand)
-    return best[1] if best else None
+        ranked.append(((load, _risk(cand, skip_at, weights, assigned.get(name, 0), now), name), cand))
+    if not ranked:
+        return None
+    healthy = [row for row in ranked if not _draining(row[1], skip_at, now)]
+    return min(healthy or ranked, key=lambda row: row[0])[1]
 
 
 def _running_other_model(session: Session, alias: str, alias_ids: "set[str]") -> bool:
@@ -376,6 +416,8 @@ def plan(sessions: Iterable[Any], quotas_or_load: Any = None, caps: Any = None,
     * a session stays where it is unless its provider is over cap, exhausted,
       unreadable, undeclared, or does not serve the alias;
     * a provider that does not serve the alias is never a destination;
+    * a destination that is draining is used only when no destination that is not
+      draining can take the session (see ``_destination``);
     * the same input always produces the same output (every ordering in here is
       a sort on names and session ids, never on dict iteration order).
 
