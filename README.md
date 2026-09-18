@@ -256,10 +256,21 @@ Claims that are reasoned but **not** verified end to end are flagged inline.
 - **Selection is per-session, not per-request.** The router chooses a provider
   for a Hermes session; it is not a proxy sitting in the request path. Hermes'
   own fallback chain handles mid-turn failures.
-- **`placement.py --plan` is verified against a live 21-session fleet.
-  `--apply` is not.** The plan path has been run against a real backend many
-  times; the write path is implemented and unit-tested against a fake transport,
-  but has not yet been exercised end to end on a live fleet. Try `--plan` first.
+- **`placement.py --plan` is verified against a live 21-session fleet. The write
+  path is verified for the create-time case, and only partly for the move case.**
+  Measured against a real backend with throwaway sessions:
+
+  | case | what happens |
+  |---|---|
+  | `session.create` with `{model, provider}` | **Works.** The session is created on that provider; `info.provider` reports it and the stored `model_config.provider` agrees. This is the reliable path. |
+  | `config.set` on a new session | Persists `model_config.provider` correctly, and the RPC confirms `scope: "session"`. |
+  | `config.set` on a session that has *already run a turn* | The override persists for the next rebuild, but that session's in-flight agent kept its original provider for one turn. |
+
+  So the dependable behaviour today is **choosing a provider when a session
+  starts**, which is exactly the concurrency fix needed. Moving a session that is
+  mid-conversation costs a cache reset and may take a turn to take effect — which
+  is also why the planner only moves sessions whose provider is over cap or
+  exhausted, and leaves the rest alone.
 - **A hang is not bounded by ds-router.** A provider that accepts a connection
   and never replies stalls that request until the SDK's own timeout. Health
   probing catches a *dead* provider before you are routed to it, but cannot
