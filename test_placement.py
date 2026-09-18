@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tempfile
 import time
 from pathlib import Path
 
@@ -33,6 +34,12 @@ PROVIDERS = {
     "clinepass": {"models": {ALIAS: "cline-pass/deepseek-v4.1-flash"}},
 }
 CAPS = {"ollama-cloud": 3}
+
+
+def tmp_path(*parts: str) -> Path:
+    """A path under a fresh temp dir, for tests that must not read the real HOME."""
+    base = Path(tempfile.mkdtemp(prefix="ds-placement-"))
+    return base.joinpath(*parts)
 
 
 def win(label: str, percent: float, resets_in=None, now=None) -> q.Window:
@@ -223,16 +230,28 @@ def test_an_unreadable_provider_join_refuses_instead_of_moving_the_fleet():
         def close(self):
             pass
 
-    missing = Path("/tmp/definitely-not-a-real-state-db/nope.db")
+    missing = tmp_path("no-such-dir", "nope.db")
     try:
         pl.enumerate_sessions(T(), db_path=missing)
         raise AssertionError("must refuse when no provider could be read for any session")
     except pl.ProviderJoinError as exc:
         assert "no provider could be read" in str(exc), exc
 
-    # A partial join is fine: some sessions readable means the store works.
-    sessions_out = pl.enumerate_sessions(T(), db_path=None)
+    # A readable store is read normally. Built here rather than pointing at the
+    # developer's own ~/.hermes/state.db, which would make this test pass on one
+    # machine and fail on a clean checkout.
+    store = tmp_path("state.db")
+    con = sqlite3.connect(str(store))
+    con.executescript(
+        "create table sessions (id text, session_key text, billing_provider text, model_config text);"
+    )
+    con.execute("insert into sessions values ('a','ka','commandcode',null)")
+    con.execute("insert into sessions values ('b','kb','opencode-go',null)")
+    con.commit()
+    con.close()
+    sessions_out = pl.enumerate_sessions(T(), db_path=store)
     assert len(sessions_out) == 2
+    assert {s.provider for s in sessions_out} == {"commandcode", "opencode-go"}, sessions_out
 
 
 def test_apply_reports_a_reply_that_means_nothing_happened():

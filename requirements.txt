@@ -1,0 +1,8 @@
+# ds-router runtime dependency.
+#
+# The router itself is standard library only. PyYAML is needed to read
+# config.yaml, which is the project's single source of truth for provider
+# endpoints, model ids and routing weights.
+#
+# Python 3.10+ is required (PEP 604 unions and builtin generics in annotations).
+PyYAML>=6.0
