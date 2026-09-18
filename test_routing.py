@@ -10,6 +10,7 @@ from pathlib import Path
 
 import quota as q
 import routing as r
+import testkit
 
 WEIGHTS = {"session": 1.0, "weekly": 1.0, "monthly": 0.6}
 SKIP = 0.85
@@ -184,6 +185,123 @@ def test_clinepass_nanosecond_reset_times_are_parsed():
     expected = datetime.datetime(
         2026, 9, 18, 9, 6, 35, 170792, tzinfo=datetime.timezone.utc).timestamp()
     assert abs(window.resets_at - expected) < 1e-6, (window.resets_at, expected)
+
+
+def test_a_malformed_peak_window_is_reported_not_silently_off_peak():
+    """A span written as [12, 18] instead of [[12, 18]] used to be skipped, which
+    says "this provider is never at peak" and makes the tie-break prefer it for the
+    whole window on the strength of a claim that failed to parse."""
+    import peak as pk
+    friday_1230 = 1789734600.0  # 2026-09-18 12:30 UTC, a Friday
+    assert pk.in_peak([[12, 18]], friday_1230) is True
+    assert pk.peak_providers({"windows": {"ollama-cloud": [[12, 18]]}}, friday_1230) == {"ollama-cloud"}
+    for bad in ([12, 18], [[12]], [[18, 12]], [[-1, 5]], [[1, 25]], [["a", "b"]]):
+        try:
+            pk.in_peak(bad, friday_1230)
+        except ValueError as exc:
+            assert "peak window" in str(exc), exc
+        else:
+            raise AssertionError(f"malformed peak span {bad!r} was accepted silently")
+        try:
+            pk.peak_providers({"windows": {"ollama-cloud": bad}}, friday_1230)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"peak_providers accepted {bad!r}")
+    # A provider with no windows at all is simply never at peak, which is real.
+    assert pk.peak_providers({"windows": {"commandcode": []}}, friday_1230) == set()
+
+
+def test_from_collector_uses_a_fresh_snapshot_and_refuses_anything_else():
+    """Something else already polls these endpoints, so a fresh snapshot avoids a
+    second call. A missing, stale or errored snapshot must send the caller to the
+    endpoint rather than being turned into a reading."""
+    import json
+    import tempfile
+    from pathlib import Path as P
+    state = P(tempfile.mkdtemp(prefix="ds-snapshot-"))
+    now = time.time()
+    payload = {"attemptedAt": now, "plan": "Go", "limits": [
+        {"label": "5 hours", "percent": 0.07, "resetsAt": "2026-09-18T12:00:00Z"},
+        {"label": "Weekly (7-day)", "percent": 0.98, "resetsAt": "2026-09-21T00:00:00Z"},
+    ]}
+    snapshot = state / q.COLLECTOR_FILES["opencode-go"]
+    snapshot.write_text(json.dumps(payload))
+    got = q.from_collector("opencode-go", state, 300)
+    assert got is not None and [w.kind for w in got.windows] == ["session", "weekly"], got
+    assert got.windows[1].percent == 0.98
+    assert got.plan == "Go" and not got.stale
+
+    snapshot.write_text(json.dumps({**payload, "attemptedAt": now - 4000}))
+    assert q.from_collector("opencode-go", state, 300) is None, "a stale snapshot is not a reading"
+    snapshot.write_text(json.dumps({**payload, "error": "HTTP 500"}))
+    assert q.from_collector("opencode-go", state, 300) is None, "an errored snapshot is not a reading"
+    snapshot.write_text("{not json")
+    assert q.from_collector("opencode-go", state, 300) is None
+    snapshot.unlink()
+    assert q.from_collector("opencode-go", state, 300) is None
+    assert q.from_collector("commandcode", state, 300) is None, "no snapshot file, no reading"
+
+
+def test_a_failing_quota_endpoint_produces_a_reading_and_never_a_crash():
+    """Every HTTP failure shape the audit listed, through the real code path. The
+    result must be a stale quota whose message names the failure, and it must never
+    carry a response body, which can hold credential-bearing fields."""
+    import io
+    import json as jsonlib
+    import socket
+    import urllib.error
+
+    real = q.urllib.request.urlopen
+
+    class Response:
+        def __init__(self, body: bytes) -> None:
+            self.body = body
+        def read(self) -> bytes:
+            return self.body
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+
+    cases = {
+        "401": (urllib.error.HTTPError("u", 401, "Unauthorized", {}, io.BytesIO(b"nope")), "HTTPError"),
+        "403": (urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b"nope")), "HTTPError"),
+        "429": (urllib.error.HTTPError("u", 429, "Too Many Requests", {}, io.BytesIO(b"nope")), "HTTPError"),
+        "500": (urllib.error.HTTPError("u", 500, "Server Error", {}, io.BytesIO(b"nope")), "HTTPError"),
+        "timeout": (socket.timeout("timed out"), "TimeoutError"),
+        "html": (None, "JSONDecodeError"),
+        "empty": (None, "JSONDecodeError"),
+        "null": (None, "AttributeError"),
+    }
+
+    for label, (exc, expected) in cases.items():
+        def fake_urlopen(request, timeout=None, _label=label, _exc=exc):
+            if _exc is not None:
+                raise _exc
+            return Response(b"<html>not json</html>" if _label == "html"
+                            else (b"" if _label == "empty" else b"null"))
+        q.urllib.request.urlopen = fake_urlopen
+        try:
+            quota = q.fetch_quota("p", {"quota": "opencode_go"}, "k")
+        finally:
+            q.urllib.request.urlopen = real
+        assert quota.stale, (label, quota.error)
+        assert expected in quota.error, (label, quota.error)
+        assert quota.windows == [], (label, quota.windows)
+        assert "nope" not in quota.error and "<html>" not in quota.error, (label, quota.error)
+
+    # A provider with no reader for its kind is reported, not silently healthy.
+    quota = q.fetch_quota("p", {"quota": "nonsense"}, "k")
+    assert quota.stale and "no quota reader" in quota.error, quota.error
+
+    # A 200 carrying nothing usable is a reading failure, not an empty plan.
+    q.urllib.request.urlopen = lambda request, timeout=None: Response(jsonlib.dumps({"usage": {}}).encode())
+    try:
+        quota = q.fetch_quota("p", {"quota": "opencode_go"}, "k")
+    finally:
+        q.urllib.request.urlopen = real
+    assert quota.stale and "no recognised windows" in quota.error, quota.error
 
 
 def test_ollama_reports_only_the_windows_the_plan_has():
@@ -489,12 +607,25 @@ def test_a_slow_but_working_provider_is_deprioritised_not_excluded():
 
 
 def test_health_absent_changes_nothing():
-    """No health data must behave exactly as before it existed."""
+    """No health data must behave exactly as before it existed: an empty dict, an
+    explicit None and a dict that simply lacks an 'ok' key are all "no signal", and
+    none of them may be read as a failed probe."""
     now = time.time()
     live = {n: q.Quota(n, [win("monthly", 0.10)]) for n in PROVIDERS}
     without = r.choose("ds", PROVIDERS, live, WEIGHTS, SKIP, now=now)
     explicit_none = r.choose("ds", PROVIDERS, live, WEIGHTS, SKIP, now=now, health=None)
-    assert without.provider == explicit_none.provider
+    empty = r.choose("ds", PROVIDERS, live, WEIGHTS, SKIP, now=now, health={})
+    no_ok = r.choose("ds", PROVIDERS, live, WEIGHTS, SKIP, now=now,
+                     health={n: {"seconds": 0.2} for n in PROVIDERS})
+    assert without.provider == explicit_none.provider == empty.provider == no_ok.provider
+    def chosen(decision):
+        return next(c for c in decision.ranked if c.provider == decision.provider)
+    for decision in (without, empty, no_ok):
+        assert not chosen(decision).hard, chosen(decision).detail
+    # A probe that FAILED is different: that provider cannot be chosen.
+    failed = r.choose("ds", PROVIDERS, live, WEIGHTS, SKIP, now=now,
+                      health={without.provider: {"ok": False, "error": "refused"}})
+    assert failed.provider != without.provider, failed.reason
 
 
 def test_an_unusable_percentage_can_never_look_like_free_capacity():
@@ -658,14 +789,4 @@ def test_adding_a_model_is_config_only():
 
 
 if __name__ == "__main__":
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"  pass  {name}")
-            except AssertionError as exc:
-                failures += 1
-                print(f"  FAIL  {name}: {exc}")
-    print(f"\n{'FAILED' if failures else 'all tests passed'} ({failures} failures)")
-    raise SystemExit(1 if failures else 0)
+    raise SystemExit(testkit.run(globals()))

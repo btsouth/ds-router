@@ -117,14 +117,14 @@ providers cap concurrency. Ollama Cloud Pro allows 3 simultaneous requests, so a
 ```
 
 It uses Hermes' own per-session provider override, so this is session-scoped
-state, not a global config write. Real output from a 25-session fleet:
+state, not a global config write. Real output from a 27-session fleet:
 
 ```
   alias       : deepseek-v4.1-flash
-  sessions    : 25 (live backend pid=<pid> port=<port> (serve))
+  sessions    : 27 (live backend pid=<pid> port=<port> (serve))
   caps        : ollama-cloud=3
-  target      : clinepass=9, commandcode=11, nous=1, ollama-cloud=3, opencode-go=1
-  keep 20    move 5
+  target      : clinepass=9, commandcode=13, nous=1, ollama-cloud=3, opencode-go=1
+  keep 22    move 5
     ollama-cloud   3/3
 
   session        from           to             model                          why
@@ -137,12 +137,17 @@ state, not a global config write. Real output from a 25-session fleet:
 Design rules, all asserted by tests:
 
 - **Never assign more sessions to a provider than its cap allows**, counting the
-  sessions already there that are not part of the plan. Note that a provider can
-  still be *running* over its cap if something outside ds-router started work;
-  the planner will not add to it.
+  sessions already active on it that are not part of the plan (read from Hermes'
+  own turn leases, so work started outside ds-router still holds a slot). If that
+  reading is unavailable the planner says so and charges nobody for it, rather
+  than pretending the provider is idle.
+- **A cap that cannot be read is not "no cap".** `caps: {ollama-cloud: three}`, or
+  a nested `{limit: 3}` where a number belongs, stops the plan with exit 7 and
+  names the entry. Reading it as unlimited would fill a provider past a limit it
+  really has, which is the queueing this exists to prevent.
 - **Leave sessions alone unless there is a reason.** Moving a session resets its
   prompt cache, so a session only moves when its provider is over cap, hard
-  exhausted, or cannot serve your chosen model. 20 of 25 stayed put above.
+  exhausted, or cannot serve your chosen model. 22 of 27 stayed put above.
   A provider whose *usage endpoint* fails is not a reason to move: that is a
   telemetry outage, not a broken endpoint, so a session already there stays. It
   does stop the provider being chosen as a *destination* until it reads again.
@@ -173,6 +178,18 @@ says the telemetry endpoint did not answer, not that the provider is down, so a
 session already there stays where it is — moving it would pay a prompt-cache reset
 to avoid an outage that may not exist. What it does block is choosing that provider
 for anything new, until it reads again.
+
+A reading that is *incomplete* is treated the same way, and it used to be treated
+as healthy. CommandCode's monthly window needs a second endpoint for the period's
+spend; when that figure cannot be read, the window is absent rather than zero, and
+the provider is not a destination until it reads. Three rules follow from the same
+idea, and each of them was once the opposite:
+
+- a percentage that cannot be trusted (NaN, infinity, negative) is dropped, never
+  rewritten to `0%`, because `0%` is both the lowest risk and the best headroom;
+- a window whose reset time is present but unreadable is dropped, rather than
+  silently losing its burn-rate rule;
+- a reading with nothing recognisable in it is unreadable, not empty.
 
 **2. Burn rate, not raw percent.** A window is only dangerous if it will run out
 before it refills, so usage is compared against how much of the window has
@@ -284,11 +301,21 @@ Claims in this README that have been measured, rather than reasoned about:
 - Hermes' fallback chain: a dead primary walks the chain and answers on the next
   provider.
 - ClinePass tool calling, streaming, and its usage API on a personal plan.
-- `placement.py --plan` against a live 21-session desktop backend.
-- Three critical failures found by an independent audit and fixed: an unreadable
-  session store rewriting the whole fleet, `apply` reporting success for replies
-  that mean nothing happened, and a crafted clone path executing as shell through
-  the uninstall manifest.
+- `placement.py --plan` against a live desktop backend, and the concurrency
+  reading it now uses: `load.py` counted the sessions active on each provider and
+  the plan printed them as holding slots.
+- Every HTTP failure shape for a quota endpoint (401, 403, 429, 500, a hang,
+  HTML, an empty body, a null body) against the real fetch path: each produces a
+  stale reading that names the failure and carries no response body.
+- The transport contract: a reply with no result is unconfirmed rather than a
+  completed move, a JSON-RPC error is never retried, and a fault from before the
+  request went out is retried exactly once.
+- Four critical failures found by an independent audit of this codebase and
+  fixed, each with the test that would have caught it: an unreadable session
+  store rewriting the whole fleet, `apply` reporting success for replies that mean
+  nothing happened, a crafted clone path executing as shell through the uninstall
+  manifest, and a reading that could not be trusted scoring as the healthiest
+  provider.
 - `install.sh` / `uninstall.sh` in an isolated sandbox, including that
   `--dry-run` writes nothing and a re-run is a no-op.
 
@@ -296,7 +323,7 @@ Claims that are reasoned but **not** verified end to end are flagged inline.
 
 ## Requirements
 
-- Python 3.10+ with `pyyaml`
+- Python 3.10+ with `pyyaml` (the suite is green on 3.10, 3.11 and 3.12)
 - The `hermes` CLI on PATH
 - Linux (systemd user units) or macOS (installer prints the launchd/cron
   equivalent; the router itself is pure Python and POSIX sh)
@@ -306,9 +333,9 @@ Claims that are reasoned but **not** verified end to end are flagged inline.
 - **Selection is per-session, not per-request.** The router chooses a provider
   for a Hermes session; it is not a proxy sitting in the request path. Hermes'
   own fallback chain handles mid-turn failures.
-- **`placement.py --plan` is verified against a live 21-session fleet. The write
-  path is verified for the create-time case, and only partly for the move case.**
-  Measured against a real backend with throwaway sessions:
+- **`placement.py --plan` is verified against a live fleet of 25+ sessions. The
+  write path is verified for the create-time case, and only partly for the move
+  case.** Measured against a real backend with throwaway sessions:
 
   | case | what happens |
   |---|---|

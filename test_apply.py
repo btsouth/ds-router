@@ -108,20 +108,43 @@ def test_success_writes_all_three_keys_in_order(tmp: pathlib.Path) -> None:
     check("provider written", "config set model.provider clinepass" in written)
     check("model written", "config set model.default cline-pass/ds" in written)
     check("base_url written", "config set model.base_url https://x/v1" in written)
+    # Order matters: a half-written config must never be left with the provider
+    # changed and the model still pointing at the previous provider.
+    order = [line.split()[2] for line in written.splitlines() if line.startswith("config set ")]
+    check("the three keys are written in the documented order",
+          order == ["model.provider", "model.default", "model.base_url"], str(order))
 
 
 def test_dry_run_writes_nothing(tmp: pathlib.Path) -> None:
+    """--show must not touch the config AND must not run the hermes binary at all.
+    The previous check only looked for a "config set" line in a log, which cannot
+    fail while the early return exists."""
     calls = tmp / "dry.log"
-    bin_dir = fake_hermes(tmp, calls=calls)
+    shim_dir = tmp / "shim"
+    shim_dir.mkdir(exist_ok=True)
+    shim = shim_dir / "hermes"
+    shim.write_text(f"""#!/bin/sh
+echo "$*" >> "{calls}"
+echo "hermes must not be run for --show" >&2
+exit 1
+""")
+    shim.chmod(0o755)
     old_path = os.environ["PATH"]
-    os.environ["PATH"] = f"{bin_dir}:{old_path}"
+    os.environ["PATH"] = f"{shim_dir}:{old_path}"
     try:
-        A.set_provider("clinepass", {"base_url": "https://x/v1"}, "ds",
-                       dry=True, models={"ds": {"clinepass": "cline-pass/ds"}})
+        model_id, base_url = A.set_provider(
+            "clinepass", {"base_url": "https://x/v1"}, "ds",
+            dry=True, models={"ds": {"clinepass": "cline-pass/ds"}})
+        raised = None
+    except Exception as exc:  # noqa: BLE001 - any failure here is the finding
+        raised, model_id, base_url = exc, "", ""
     finally:
         os.environ["PATH"] = old_path
-    check("--show writes no config keys",
-          not calls.exists() or "config set" not in calls.read_text())
+    check("--show succeeds without the hermes binary", raised is None, str(raised))
+    check("--show reports what it would set", model_id == "cline-pass/ds", model_id)
+    check("--show never invoked hermes",
+          not calls.exists() or calls.read_text().strip() == "",
+          calls.read_text() if calls.exists() else "")
 
 
 def test_a_provider_that_does_not_serve_the_alias_is_refused(tmp: pathlib.Path) -> None:

@@ -11,6 +11,7 @@ import time
 
 import quota as q
 import routing as r
+import testkit
 
 WEIGHTS = {"session": 1.0, "weekly": 1.0, "monthly": 0.6}
 SKIP = 0.85
@@ -63,17 +64,4 @@ def test_peak_alone_never_causes_a_mid_conversation_move():
 
 
 if __name__ == "__main__":
-    failures = 0
-    passed = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"  pass  {name}")
-                passed += 1
-            except AssertionError as exc:
-                failures += 1
-                print(f"  FAIL  {name}: {exc}")
-    print(f"\n{'FAILED' if failures else 'all tests passed'} "
-          f"({passed} passed, {failures} failed)")
-    raise SystemExit(1 if failures else 0)
+    raise SystemExit(testkit.run(globals()))

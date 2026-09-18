@@ -23,6 +23,7 @@ from pathlib import Path
 
 import placement as pl
 import quota as q
+import testkit
 
 ALIAS = "ds"
 OTHER_ALIAS = "only-here"
@@ -174,6 +175,88 @@ def test_a_malformed_cap_stops_the_cli_with_a_message():
     assert code == 7, (code, stderr.getvalue())
     assert "unreadable concurrency cap" in stderr.getvalue(), stderr.getvalue()
     assert "ollama-cloud" in stderr.getvalue(), stderr.getvalue()
+
+
+def test_a_partial_provider_join_does_not_move_what_it_could_not_read():
+    """The all-or-nothing guard has a narrower hole. When SOME sessions resolve and
+    others do not, the unresolved ones look exactly like sessions that never had a
+    provider, which the planner treats as a reason to move them."""
+    class T:
+        def call(self, method, params):
+            return {"sessions": [
+                {"id": "AAA111", "session_key": "k.a", "model": "deepseek/deepseek-v4.1-flash",
+                 "title": "a"},
+                {"id": "BBB222", "session_key": "k.b", "model": "deepseek/deepseek-v4.1-flash",
+                 "title": "b"},
+            ]}
+
+    import io
+    from contextlib import redirect_stderr
+
+    real = pl._read_db
+    pl._read_db = lambda db_path=None: {"k.a": "commandcode"}
+    stderr = io.StringIO()
+    try:
+        with redirect_stderr(stderr):
+            fleet = pl.enumerate_sessions(T())
+    finally:
+        pl._read_db = real
+    by_id = {s.id: s for s in fleet}
+    assert by_id["AAA111"].provider == "commandcode"
+    assert by_id["BBB222"].provider == "" and by_id["BBB222"].provider_known is False, by_id["BBB222"]
+    assert "no readable provider" in stderr.getvalue(), stderr.getvalue()
+
+    quotas = healthy_quotas()
+    assignments = pl.plan(fleet, quotas, {}, PROVIDERS, ALIAS)
+    for a in assignments:
+        assert a.keep, (a.session_id, a.reason)
+    unread = [a for a in assignments if a.session_id == "BBB222"][0]
+    assert "could not be read" in unread.reason, unread.reason
+    # A session that genuinely has no provider (not a partial join) is still placed,
+    # which is the case this must not break.
+    fresh = pl.Session(id="CCC333", provider="", model="deepseek/deepseek-v4.1-flash")
+    placed = pl.plan([fresh], quotas, {}, PROVIDERS, ALIAS)[0]
+    assert not placed.keep and placed.provider, placed.reason
+
+
+def test_a_partial_apply_reports_the_counts_and_exits_nonzero():
+    """Three of five moves succeeding must not read as a clean run, and every
+    session must still be attempted."""
+    import io
+    from contextlib import redirect_stdout
+    import tempfile
+
+    fleet = [pl.Session(id=f"s{i}", provider="ollama-cloud", model="ollama-cloud-m")
+             for i in range(5)]
+    cfg = Path(tempfile.mkdtemp(prefix="ds-apply-cfg-")) / "config.yaml"
+    cfg.write_text(
+        "default_model: " + ALIAS + "\n"
+        "routing:\n  concurrency:\n    caps:\n      ollama-cloud: 3\n"
+        "providers:\n"
+        + "".join(f"  {name}:\n    base_url: https://x/v1\n    key_env: K\n"
+                 for name in PROVIDERS)
+        + f"models:\n  {ALIAS}:\n" + "".join(f"    {name}: {name}-m\n" for name in PROVIDERS))
+
+    transport = pl.FakeTransport(fail={"s3"})
+    # main() prints which backend it read the fleet from, so the stand-in needs one.
+    import types
+    transport.backend = types.SimpleNamespace(describe=lambda: "test backend")
+    real = (pl.LiveTransport, pl.enumerate_sessions, pl.collect_quotas, pl.CONFIG)
+    pl.CONFIG = cfg
+    pl.LiveTransport = lambda **kwargs: transport          # type: ignore[assignment]
+    pl.enumerate_sessions = lambda transport=None, **kwargs: fleet  # type: ignore[assignment]
+    pl.collect_quotas = lambda providers, config: healthy_quotas()   # type: ignore[assignment]
+    stdout = io.StringIO()
+    try:
+        with redirect_stdout(stdout):
+            code = pl.main(["--apply"])
+    finally:
+        pl.LiveTransport, pl.enumerate_sessions, pl.collect_quotas, pl.CONFIG = real
+    out = stdout.getvalue()
+    assert code == 1, (code, out)
+    assert "FAILED s3" in out, out
+    assert "failed 1" in out, out
+    assert len([sid for sid in transport.session_ids()]) == 2, transport.session_ids()
 
 
 def test_the_cli_hands_the_concurrency_reading_to_the_planner():
@@ -704,7 +787,10 @@ def test_enumerate_sessions_prefers_active_list_and_falls_back_to_the_db():
 
 def test_live_transport_is_not_built_at_import_and_fails_clearly_without_a_backend():
     """Requirement: importing this module must not scan /proc or hold a socket."""
-    assert not hasattr(pl, "_LIVE"), "no module-level LiveTransport instance"
+    # The module must hold no transport instance at all: a module-level one would
+    # mean importing placement opens a socket as a side effect.
+    instances = [name for name, value in vars(pl).items() if isinstance(value, pl.LiveTransport)]
+    assert instances == [], f"module-level transport instance(s): {instances}"
     assert pl.LiveTransport  # the class exists; only construction is gated
 
     original = pl.discover_backends
@@ -722,14 +808,4 @@ def test_live_transport_is_not_built_at_import_and_fails_clearly_without_a_backe
 
 
 if __name__ == "__main__":
-    failures = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"  pass  {name}")
-            except AssertionError as exc:
-                failures += 1
-                print(f"  FAIL  {name}: {exc}")
-    print(f"\n{'FAILED' if failures else 'all tests passed'} ({failures} failures)")
-    raise SystemExit(1 if failures else 0)
+    raise SystemExit(testkit.run(globals()))

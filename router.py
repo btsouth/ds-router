@@ -149,7 +149,16 @@ def main() -> int:
 
     quotas = collect(providers, env, routing_cfg=routing_cfg)
     peak_cfg = config.get("peak") or {}
-    on_peak = p.peak_providers(peak_cfg) if peak_cfg.get("preferred_tiebreak") else set()
+    on_peak: set = set()
+    if peak_cfg.get("preferred_tiebreak"):
+        try:
+            on_peak = p.peak_providers(peak_cfg)
+        except ValueError as exc:
+            # Peak pricing is only ever a tie-break, so a malformed window must not
+            # stop the router. It must not be silent either: without this note a
+            # broken span reads as "never at peak" and the tie-break quietly
+            # prefers the wrong provider.
+            print(f"  note: ignoring the peak pricing config ({exc}).", file=sys.stderr)
 
     conc_cfg = routing_cfg.get("concurrency") or {}
     caps = (conc_cfg.get("caps") or {}) if conc_cfg.get("enabled", True) else {}

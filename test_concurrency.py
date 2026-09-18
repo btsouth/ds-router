@@ -11,6 +11,7 @@ import time
 
 import quota as q
 import routing as r
+import testkit
 
 WEIGHTS = {"session": 1.0, "weekly": 1.0, "monthly": 0.6}
 SKIP = 0.85
@@ -98,24 +99,20 @@ def test_sticky_stays_on_an_over_cap_provider():
 
 
 def test_no_caps_declared_means_no_load_scoring():
+    """Load without a cap is not information: nothing declares what "too many" is,
+    so the same pick must come out with or without the load figure."""
     now = time.time()
-    d = r.choose("ds", PROVIDERS, healthy_quotas(now), WEIGHTS, SKIP,
-                 now=now, load={"ollama-cloud": 50}, concurrency_caps={})
-    assert d.ok  # never refuses merely because load was supplied
+    quotas = healthy_quotas(now)
+    crowded = r.choose("ds", PROVIDERS, quotas, WEIGHTS, SKIP,
+                       now=now, load={"ollama-cloud": 50}, concurrency_caps={})
+    empty = r.choose("ds", PROVIDERS, quotas, WEIGHTS, SKIP, now=now)
+    assert crowded.ok, crowded.reason
+    assert crowded.provider == empty.provider, (crowded.provider, empty.provider)
+    def chosen(decision):
+        return next(c for c in decision.ranked if c.provider == decision.provider)
+    assert chosen(crowded).pressure == chosen(empty).pressure, (chosen(crowded).pressure, chosen(empty).pressure)
+    assert "queued" not in crowded.reason, crowded.reason
 
 
 if __name__ == "__main__":
-    failures = 0
-    passed = 0
-    for name, fn in sorted(globals().items()):
-        if name.startswith("test_") and callable(fn):
-            try:
-                fn()
-                print(f"  pass  {name}")
-                passed += 1
-            except AssertionError as exc:
-                failures += 1
-                print(f"  FAIL  {name}: {exc}")
-    print(f"\n{'FAILED' if failures else 'all tests passed'} "
-          f"({passed} passed, {failures} failed)")
-    raise SystemExit(1 if failures else 0)
+    raise SystemExit(testkit.run(globals()))

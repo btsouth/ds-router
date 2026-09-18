@@ -101,6 +101,10 @@ class Session:
     session_key: str = ""
     model: str = ""
     title: str = ""
+    # False when the provider could not be established for this session, which is
+    # not the same as a session that genuinely has none. Only the enumeration can
+    # tell those apart, so it is the enumeration that clears this.
+    provider_known: bool = True
 
 
 @dataclass
@@ -531,6 +535,13 @@ def plan(sessions: Iterable[Any], quotas_or_load: Any = None, caps: Any = None,
     # over cap nor exhausted, and a move would cost a cache reset for nothing.
     for session, over_cap in sorted(movers, key=lambda row: row[0].id):
         source = session.provider or ""
+        if not session.provider_known:
+            # Its provider could not be read, which is NOT the same as a session
+            # that has none: acting on it would move a session that was probably
+            # fine, on a claim we could not read.
+            out.append(Assignment(session.id, source, "", source, keep=True,
+                                  reason="its provider could not be read; left alone"))
+            continue
         if source and source not in declared:
             out.append(Assignment(session.id, source, "", source, keep=True,
                                   reason=f"{source} is not managed by ds-router; left alone"))
@@ -1181,6 +1192,19 @@ def enumerate_sessions(transport: Optional[Transport] = None, *, db_path: Option
             f"{len(out)} live session(s) found but no provider could be read for any of them "
             f"(state store: {state_db_path(db_path)}). Refusing to act, because every session "
             f"would look provider-less and be moved.")
+    # A PARTIAL join is the same hazard with a narrower trigger. If some sessions
+    # resolved and others did not, the unresolved ones look like sessions that
+    # never had a provider, which the planner treats as a reason to move them: that
+    # is a prompt-cache reset for a session that was probably fine, justified by a
+    # claim we could not read. Mark them, so the planner leaves them where they are
+    # and says why.
+    unjoined = [s for s in out if not s.provider]
+    if unjoined and len(unjoined) < len(out):
+        print(f"  note: {len(unjoined)} of {len(out)} live session(s) have no readable "
+              "provider; they are left where they are rather than moved as if they had none.",
+              file=sys.stderr)
+        for session in unjoined:
+            session.provider_known = False
     return out
 
 
