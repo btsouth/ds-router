@@ -53,6 +53,19 @@ def current_provider() -> str:
     return ""
 
 
+def current_value(key: str) -> str:
+    """The stored value of a config key, or '' when unset/unreadable."""
+    try:
+        out = hermes("config", "get", key)
+    except Exception:
+        return ""
+    for line in reversed(out.splitlines()):
+        value = line.strip()
+        if value and not value.lower().startswith("config key not set"):
+            return value
+    return ""
+
+
 def router_decision(sticky: str | None, alias: str) -> dict:
     """Ask router.py for a decision. Raises on failure."""
     args = ["./router.py", "--dry-run", "--json", "--model", alias]
@@ -74,12 +87,23 @@ def model_id_for(provider: str, alias: str, models: dict) -> str:
     return str(table.get(provider) or "")
 
 
+# The three keys that must agree. Written together or not at all: a provider
+# pointing at another provider's model id is rejected at request time with
+# "Model not supported on this endpoint", which is confusing to diagnose.
+_ROUTED_KEYS = ("model.provider", "model.default", "model.base_url")
+
+
 def set_provider(name: str, spec: dict, alias: str, *, dry: bool,
                  models: dict | None = None) -> tuple[str, str]:
-    """Write model.provider/default/base_url for one provider.
+    """Write model.provider/default/base_url for one provider, as a unit.
 
     Returns (model_id, base_url). Raises when the alias is not served there,
     rather than writing a provider with no usable model.
+
+    Each key is written with a separate `hermes config set` call, so any of them
+    can fail part-way. If one does, the previous values are restored: leaving
+    provider and model disagreeing produces a config that fails on the next
+    request, and the user has no way to tell it was half-written.
     """
     model_id = model_id_for(name, alias, models or {})
     if not model_id:
@@ -88,11 +112,38 @@ def set_provider(name: str, spec: dict, alias: str, *, dry: bool,
             f"provider {name!r} does not serve alias {alias!r} (it serves: {offered})"
         )
     base_url = str(spec.get("base_url") or "")
-    if not dry:
-        hermes("config", "set", "model.provider", name)
-        hermes("config", "set", "model.default", model_id)
-        if base_url:
-            hermes("config", "set", "model.base_url", base_url)
+    if dry:
+        return model_id, base_url
+
+    previous = {key: current_value(key) for key in _ROUTED_KEYS}
+    pending = [("model.provider", name), ("model.default", model_id)]
+    if base_url:
+        pending.append(("model.base_url", base_url))
+
+    written: list[str] = []
+    try:
+        for key, value in pending:
+            hermes("config", "set", key, value)
+            written.append(key)
+    except Exception as exc:
+        restored, failed = [], []
+        for key in reversed(written):
+            old = previous.get(key)
+            try:
+                if old:
+                    hermes("config", "set", key, old)
+                else:
+                    hermes("config", "unset", key)
+                restored.append(key)
+            except Exception:
+                failed.append(key)
+        detail = f"restored {', '.join(restored)}" if restored else "nothing needed restoring"
+        if failed:
+            detail += f"; COULD NOT RESTORE {', '.join(failed)}"
+        raise RuntimeError(
+            f"writing {name!r} failed after {len(written)} of {len(pending)} keys "
+            f"({exc}); {detail}. Check `hermes config get model.provider`."
+        ) from exc
     return model_id, base_url
 
 
