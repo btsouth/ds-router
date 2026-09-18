@@ -307,6 +307,8 @@ def fetch_quota(provider: str, spec: dict, key: str, timeout: float = 12.0) -> Q
                 if isinstance(plan_id, str) and plan_id:
                     plan = plan_id.split("-")[-1].upper()
             except Exception:
+                # The plan name is cosmetic (it only labels the output). A failure
+                # here must not discard the windows that were read successfully.
                 pass
             return Quota(provider, windows, time.time(), "", plan)
 
@@ -327,6 +329,7 @@ def fetch_quota(provider: str, spec: dict, key: str, timeout: float = 12.0) -> Q
                 data = meta.get("data") if isinstance(meta.get("data"), dict) else {}
                 plan = str((data.get("plan") or {}).get("displayName") or "")
             except Exception:
+                # Cosmetic label only; never fail the quota read over it.
                 pass
             return Quota(provider, parse_clinepass(payload), time.time(), "", plan)
 

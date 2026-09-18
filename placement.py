@@ -605,6 +605,8 @@ class _WSClient:
                 return b"".join(chunks).decode("utf-8", "replace")
 
     def close(self) -> None:
+        # Best-effort teardown: the socket may already be gone, and raising from
+        # close() would mask the original error that prompted the cleanup.
         try:
             if self._sock is not None:
                 self._send_frame(0x8, b"")
