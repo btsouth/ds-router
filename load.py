@@ -44,7 +44,9 @@ class Load:
 def _store_path(session_db: Optional[Path] = None) -> Path:
     if session_db is not None:
         return Path(session_db)
-    return Path.home() / ".hermes" / "state.db"
+    # Hermes-home aware: a bare ~/.hermes misreads state under HERMES_HOME.
+    from paths import state_db
+    return state_db()
 
 
 def active_by_provider(

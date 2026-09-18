@@ -27,7 +27,9 @@ import quota as q  # noqa: E402
 import routing as r  # noqa: E402
 
 CONFIG = HERE / "config.yaml"
-HERMES_ENV = Path.home() / ".hermes" / ".env"
+from paths import env_file as _hermes_env_file  # noqa: E402
+
+HERMES_ENV = _hermes_env_file()
 
 
 def load_config() -> dict:

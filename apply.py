@@ -208,12 +208,12 @@ def check(cfg: dict, providers: dict, models: dict, alias: str) -> int:
 
 def _env_present(name: str) -> bool:
     import os
+    from paths import env_file
     if os.environ.get(name):
         return True
-    env_file = Path.home() / ".hermes" / ".env"
     try:
         return any(line.split("=", 1)[0].strip() == name
-                   for line in env_file.read_text().splitlines()
+                   for line in env_file().read_text().splitlines()
                    if "=" in line and not line.strip().startswith("#"))
     except OSError:
         return False
