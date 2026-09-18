@@ -168,6 +168,48 @@ Design rules, all asserted by tests:
 It reads sessions from the running Hermes backend when one is available, and
 falls back to reading `state.db` read-only when not.
 
+### When it cannot find the backend
+
+Reading `state.db` only gets you a plan. `--apply` needs the running backend,
+because changing a live session's provider is a session-scoped RPC, and ids read
+from the database are refused (a stored id is not a live session; `--apply --db`
+says so up front rather than failing one session at a time).
+
+Discovery looks for a `hermes_cli.main serve`/`dashboard` process with
+`HERMES_DASHBOARD_SESSION_TOKEN` in `/proc/<pid>/environ`, which is how the
+Desktop app spawns its own backend. A backend bound to a **non-loopback**
+address never carries that token, because Hermes engages its ticket-only auth
+gate for any non-loopback bind, and that gate refuses the session token by
+design. A non-loopback `dashboard.public_url` engages the same gate even for a
+loopback bind, which is the trap on a headless box whose dashboard is published
+over Tailscale or a reverse proxy.
+
+The fix is a second backend, loopback-bound, alongside whatever serves your
+dashboard. This is the arrangement the Desktop app creates for itself, and the
+tailnet/LAN backend stays exactly as it was:
+
+```ini
+[Service]
+User=youruser
+Environment=HOME=/home/youruser
+Environment=HERMES_HOME=/home/youruser/.hermes
+Environment=HERMES_DASHBOARD_PUBLIC_URL=http://127.0.0.1:9118
+EnvironmentFile=-/home/youruser/.hermes/.env   # holds HERMES_DASHBOARD_SESSION_TOKEN
+ExecStart=/path/to/venv/bin/python -m hermes_cli.main serve --host 127.0.0.1 --port 9118 --skip-build
+```
+
+with a stable line in that `.env` so discovery works across restarts:
+
+```sh
+HERMES_DASHBOARD_SESSION_TOKEN=<openssl rand -hex 32>
+```
+
+Two things not to do. Do not run that backend with `HERMES_DESKTOP=1` to get
+past the gate: that flag also makes the process fire cron jobs itself, so a
+second scheduler in the same `HERMES_HOME` runs every job twice. And do not bind
+the dashboard backend to loopback and expect it to stay reachable: that is a
+deliberate change to how you reach it, not a side effect to accept.
+
 ## How it decides
 
 Four inputs, in order of authority:

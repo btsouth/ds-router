@@ -925,6 +925,12 @@ class LiveTransport(Transport):
             raise TransportError(
                 "no Hermes backend found: looked for a `hermes_cli.main serve`/`dashboard` "
                 "process with HERMES_DASHBOARD_SESSION_TOKEN in /proc/<pid>/environ. "
+                "A backend bound to a non-loopback address never carries that token: Hermes "
+                "engages a ticket-only auth gate for any non-loopback bind (and for a "
+                "non-loopback dashboard.public_url even on a loopback bind), and that gate "
+                "refuses the session token by design. Point this at a loopback-bound backend "
+                "instead: `serve --host 127.0.0.1` with a stable HERMES_DASHBOARD_SESSION_TOKEN "
+                "and HERMES_DASHBOARD_PUBLIC_URL set to a loopback URL. "
                 "Pass --port and --token to point at one explicitly, or read the state DB "
                 "with `--db`.")
         return found[0]
