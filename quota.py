@@ -79,13 +79,18 @@ class Window:
     resets_at: Optional[float] = None
 
     def __post_init__(self) -> None:
-        # Enforce at the boundary, not only in the parsers: a NaN compares false
-        # against every threshold, so an unsanitized window reads as perfect
-        # headroom and makes a broken reading look like the best provider.
-        # Sanitising here means no caller -- present or future, parser or test --
-        # can inject one.
-        cleaned = _finite_percent(self.percent)
-        self.percent = 0.0 if cleaned is None else cleaned
+        # Enforce at the boundary, not only in the parsers. A percentage that
+        # cannot be trusted must never be rewritten into a number the scorer reads
+        # as healthy: 0.0 is simultaneously the lowest risk and the best headroom,
+        # so turning NaN into 0 made a broken reading the most attractive provider
+        # on the board. Invalid input raises here, and every parser drops such a
+        # window before constructing it, which turns a bad reading into an
+        # unreadable provider instead of a healthy-looking one.
+        if _finite_percent(self.percent) is None:
+            raise ValueError(
+                f"window {self.label!r} carries an unusable percentage "
+                f"({self.percent!r}); a window that cannot be trusted must not be scored")
+        self.percent = float(self.percent)
 
     @property
     def kind(self) -> Optional[str]:
@@ -163,8 +168,13 @@ def _finite_percent(value: Any) -> Optional[float]:
     Guards against NaN/inf, which arrive from a broken upstream reading. A NaN
     compares false against every threshold, so an unsanitized NaN window reads as
     *perfect headroom* and the provider looks like the healthiest option -- the
-    worst possible failure direction. Negative values clamp to 0 because a
-    provider cannot report negative usage.
+    worst possible failure direction.
+
+    A negative value is unusable rather than zero. A provider cannot report
+    negative usage, so a negative number is either a broken reading or a sentinel
+    for "unknown", and clamping it to 0 hands the same best-possible score to a
+    reading nobody can trust. Callers drop the window, and when nothing survives
+    the provider reads as unreadable instead of empty.
     """
     try:
         number = float(value)
@@ -172,21 +182,41 @@ def _finite_percent(value: Any) -> Optional[float]:
         return None
     if number != number or number in (float("inf"), float("-inf")):  # NaN / inf
         return None
-    return max(0.0, number)
+    return number if number >= 0.0 else None
 
 
 # Fractional seconds beyond microsecond precision, which `datetime.fromisoformat`
 # refused before Python 3.11.
 _EXTRA_FRACTION = re.compile(r"(\.\d{6})\d+")
 
+# The short numeric offset ("+0000") and the basic date form ("20260918T090635"),
+# both of which `datetime.fromisoformat` rejects before Python 3.11. A provider
+# changing its encoding must not silently cost us a reset time.
+_ISO_SHORT_OFFSET = re.compile(r"([+-]\d{2})(\d{2})$")
+_ISO_BASIC = re.compile(r"^(\d{4})(\d{2})(\d{2})(T\d{2})(\d{2})(\d{2})")
+
+
+def _present(value: Any) -> bool:
+    """True when a field carries something, as opposed to being absent or zero."""
+    return value not in (None, "", 0)
+
 
 def _reset(value: Any) -> Optional[float]:
-    """Normalise epoch seconds, epoch milliseconds, or an ISO string."""
-    if value in (None, "", 0):
+    """Normalise epoch seconds, epoch milliseconds, or an ISO string.
+
+    Returns None both when the value is absent and when it cannot be read. Callers
+    that must tell those apart use ``_present``: an absent reset is normal, since
+    Ollama publishes none, while a reset that is PRESENT and unreadable means the
+    window cannot be reasoned about and is dropped rather than silently losing its
+    pace and exhaustion rules.
+    """
+    if not _present(value):
         return None
     if isinstance(value, (int, float)):
         seconds = float(value)
-        # Anything past year 2286 in seconds is really milliseconds.
+        # Milliseconds are the only numeric encoding any provider sends. The
+        # threshold is a magnitude test and not a calendar claim: 1e11 seconds is
+        # year 5138, while every millisecond epoch is around 1.7e12.
         return seconds / 1000.0 if seconds > 1e11 else seconds
     try:
         from datetime import datetime
@@ -199,14 +229,29 @@ def _reset(value: Any) -> Optional[float]:
         # window lost its reset silently and pace/hard-exhaustion rules quietly
         # degraded. Trim the extra digits instead: three digits of a reset time are
         # worth nothing, the reset time itself is load-bearing.
-        return datetime.fromisoformat(_EXTRA_FRACTION.sub(r"\1", text)).timestamp()
+        text = _EXTRA_FRACTION.sub(r"\1", text)
+        text = _ISO_SHORT_OFFSET.sub(r"\1:\2", text)
+        basic = _ISO_BASIC.match(text)
+        if basic:
+            year, month, day, hour, minute, second = basic.groups()
+            text = f"{year}-{month}-{day}{hour}:{minute}:{second}" + text[basic.end():]
+        return datetime.fromisoformat(text).timestamp()
     except Exception:
         return None
 
 
 def parse_commandcode(payload: dict) -> list[Window]:
-    """GOAT/Pro windows: dollar-denominated, with real reset times."""
-    windows = payload.get("windowLimits") or {}
+    """GOAT/Pro windows carried by the credits endpoint: five hour and weekly.
+
+    The monthly window needs this period's spend, which lives in a second
+    endpoint, so it is added by ``fetch_quota`` once that figure is known. It is
+    deliberately NOT created here as a zero placeholder: a window that was never
+    read must be absent from the reading, because "0% used" is the emptiest and
+    safest value the scorer knows, and a fabricated one wins the decision.
+    """
+    windows = payload.get("windowLimits")
+    if not isinstance(windows, dict):
+        raise ValueError("commandcode returned no windowLimits block")
     out: list[Window] = []
     for name, label in (("fiveHour", "session"), ("weekly", "weekly")):
         window = windows.get(name)
@@ -215,14 +260,16 @@ def parse_commandcode(payload: dict) -> list[Window]:
         used, cap = window.get("used"), window.get("cap")
         if not isinstance(used, (int, float)) or not isinstance(cap, (int, float)) or cap <= 0:
             continue
-        out.append(Window(label, max(0.0, used / cap), _reset(window.get("resetAt"))))
-    monthly = (payload.get("credits") or {}).get("monthlyCredits")
-    if isinstance(monthly, (int, float)) and monthly == monthly:
-        # The endpoint reports remaining credits; the spent figure is not
-        # carried here, so express headroom as the fraction already consumed of
-        # what is left plus what this period spent (filled in by the caller).
-        out.append(Window("monthly", 0.0, None))
-        out[-1].percent = 0.0
+        fraction = _finite_percent(used / cap)
+        if fraction is None:
+            continue
+        raw_reset = window.get("resetAt")
+        reset = _reset(raw_reset)
+        if reset is None and _present(raw_reset):
+            continue  # a reset we cannot read is not a window we can reason about
+        out.append(Window(label, fraction, reset))
+    if not out:
+        raise ValueError("commandcode returned no recognised windows")
     return out
 
 
@@ -238,7 +285,11 @@ def parse_opencode_go(payload: dict) -> list[Window]:
         fraction = _finite_percent(window.get("percent"))
         if fraction is None:
             continue
-        out.append(Window(label, fraction / 100.0, _reset(window.get("resetsAt"))))
+        raw_reset = window.get("resetsAt")
+        reset = _reset(raw_reset)
+        if reset is None and _present(raw_reset):
+            continue  # a reset we cannot read is not a window we can reason about
+        out.append(Window(label, fraction / 100.0, reset))
     if not out:
         raise ValueError("opencode-go returned no recognised windows")
     return out
@@ -283,7 +334,11 @@ def parse_clinepass(payload: dict) -> list[Window]:
         # Provider labels: five_hour / weekly / monthly. Normalize underscores so
         # the shared label mapper classifies them.
         label = str(row.get("type") or "").replace("_", " ")
-        out.append(Window(label, fraction / 100.0, _reset(row.get("resetsAt"))))
+        raw_reset = row.get("resetsAt")
+        reset = _reset(raw_reset)
+        if reset is None and _present(raw_reset):
+            continue  # a reset we cannot read is not a window we can reason about
+        out.append(Window(label, fraction / 100.0, reset))
     if not out:
         raise ValueError("clinepass returned no recognised windows")
     return out
@@ -304,16 +359,28 @@ def fetch_quota(provider: str, spec: dict, key: str, timeout: float = 12.0) -> Q
             credits = _http_json(f"{base}/alpha/billing/credits", key, timeout)
             windows = parse_commandcode(credits)
             # The monthly window needs the period's spend, which lives in a
-            # second endpoint. Without it the monthly window is reported as
-            # unknown rather than guessed.
+            # second endpoint. When that figure cannot be read, the reading is
+            # incomplete rather than healthy: the monthly cap is the window that
+            # actually throttles a GOAT plan, so a provider whose monthly usage is
+            # unknown must not be chosen as a new destination. It says so in
+            # `note`, which makes the quota stale, which is exactly the "readings
+            # gate destinations, exhaustion gates keeping" rule -- sessions
+            # already there stay put.
+            note = ""
             try:
                 spent = _http_json(f"{base}/alpha/usage/summary", key, timeout).get("totalCredits")
-                monthly = (credits.get("credits") or {}).get("monthlyCredits")
+            except Exception as exc:
+                spent, note = None, f"monthly window unread: {type(exc).__name__}"
+            monthly = (credits.get("credits") or {}).get("monthlyCredits")
+            if not note:
                 if isinstance(spent, (int, float)) and isinstance(monthly, (int, float)) and (monthly + spent) > 0:
-                    windows = [w for w in windows if w.label != "monthly"]
                     windows.append(Window("monthly", spent / (monthly + spent), None))
-            except Exception:
-                windows = [w for w in windows if w.label != "monthly"]
+                else:
+                    note = ("monthly window unread: the spend summary carried no usable "
+                            "credit figures")
+            if note:
+                read = ", ".join(f"{w.label} {w.percent:.0%}" for w in windows) or "nothing"
+                note = f"{note} (read: {read})"
             plan = ""
             try:
                 data = _http_json(f"{base}/alpha/billing/subscriptions", key, timeout).get("data") or {}
@@ -324,7 +391,7 @@ def fetch_quota(provider: str, spec: dict, key: str, timeout: float = 12.0) -> Q
                 # The plan name is cosmetic (it only labels the output). A failure
                 # here must not discard the windows that were read successfully.
                 pass
-            return Quota(provider, windows, time.time(), "", plan)
+            return Quota(provider, windows, time.time(), note, plan)
 
         if kind == "opencode_go":
             payload = _http_json("https://opencode.ai/zen/go/v1/usage", key, timeout)
@@ -394,7 +461,11 @@ def from_collector(provider: str, state_dir: "Path", ttl_seconds: float = 300.0)
         fraction = _finite_percent(row.get("percent"))
         if fraction is None:
             continue
-        windows.append(Window(str(row.get("label") or ""), fraction, _reset(row.get("resetsAt"))))
+        raw_reset = row.get("resetsAt")
+        reset = _reset(raw_reset)
+        if reset is None and _present(raw_reset):
+            continue  # a reset we cannot read is not a window we can reason about
+        windows.append(Window(str(row.get("label") or ""), fraction, reset))
     if not windows:
         return None
     return Quota(provider, windows, float(attempted), "", str(payload.get("plan") or ""))

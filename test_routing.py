@@ -51,10 +51,96 @@ def test_commandcode_parses_dollar_windows_into_fractions():
     payload = {"credits": {"monthlyCredits": 63.21},
                "windowLimits": {"fiveHour": {"used": 6.79, "cap": 14, "resetAt": 1789698497290},
                                 "weekly": {"used": 6.79, "cap": 35, "resetAt": 1790253387497}}}
-    windows = [w for w in q.parse_commandcode(payload) if w.label != "monthly"]
+    windows = q.parse_commandcode(payload)
+    assert [w.label for w in windows] == ["session", "weekly"], [w.label for w in windows]
     assert round(windows[0].percent, 4) == round(6.79 / 14, 4)
     import datetime
     assert datetime.datetime.fromtimestamp(windows[0].resets_at, datetime.timezone.utc).year == 2026
+
+
+def test_commandcode_never_invents_a_monthly_window():
+    """The credits endpoint reports what is LEFT, not what was spent, so a monthly
+    window cannot be computed from it. It used to be appended as 0% used, which is
+    the emptiest and safest value the scorer knows: a payload with no readable
+    windows at all therefore scored as the healthiest provider on the board."""
+    for payload in ({"credits": {"monthlyCredits": 63.21}},
+                    {"credits": {"monthlyCredits": 63.21}, "windowLimits": {}},
+                    {"windowLimits": {"weekly": {"used": "a", "cap": "b"}}}):
+        try:
+            windows = q.parse_commandcode(payload)
+        except ValueError:
+            continue
+        raise AssertionError(f"a payload with nothing readable produced {windows}")
+    # With real windows present, none of them is a monthly one.
+    windows = q.parse_commandcode({"credits": {"monthlyCredits": 63.21},
+                                   "windowLimits": {"weekly": {"used": 1, "cap": 10,
+                                                               "resetAt": 1790253387497}}})
+    assert [w.label for w in windows] == ["weekly"]
+
+
+def _live_quota(**responses):
+    """fetch_quota against stubbed endpoints. `responses` maps a URL fragment to a
+    payload or to an exception instance."""
+    real = q._http_json
+
+    def fake(url, key, timeout=12.0):
+        for fragment, value in responses.items():
+            if fragment in url:
+                if isinstance(value, Exception):
+                    raise value
+                return value
+        raise AssertionError(f"unstubbed url {url}")
+
+    q._http_json = fake
+    try:
+        return q.fetch_quota("commandcode", {"quota": "commandcode"}, "k")
+    finally:
+        q._http_json = real
+
+
+def test_commandcode_monthly_window_appears_only_when_the_spend_is_known():
+    credits = {"credits": {"monthlyCredits": 58.43},
+               "windowLimits": {"fiveHour": {"used": 1, "cap": 14, "resetAt": 1789698497290},
+                                "weekly": {"used": 11, "cap": 35, "resetAt": 1790253387497}}}
+    good = _live_quota(**{"billing/credits": credits,
+                          "usage/summary": {"totalCredits": 11.55},
+                          "subscriptions": {"data": {"planId": "goat-pro"}}})
+    assert [w.label for w in good.windows] == ["session", "weekly", "monthly"]
+    monthly = [w for w in good.windows if w.label == "monthly"][0]
+    assert round(monthly.percent, 4) == round(11.55 / (58.43 + 11.55), 4)
+    assert not good.stale, good.error
+
+    # A 200 that carries no spend figure is not a monthly window at 0%.
+    partial = _live_quota(**{"billing/credits": credits,
+                             "usage/summary": {"totalCost": 4.0},
+                             "subscriptions": {"data": {"planId": "goat-pro"}}})
+    assert "monthly" not in [w.label for w in partial.windows]
+    assert partial.stale and "monthly window unread" in partial.error, partial.error
+    assert "session 7%" in partial.error, partial.error  # what WAS read is still reported
+
+    # A failed summary read is the same shape as a summary without figures.
+    broken = _live_quota(**{"billing/credits": credits,
+                            "usage/summary": RuntimeError("503"),
+                            "subscriptions": {"data": {"planId": "goat-pro"}}})
+    assert broken.stale and "monthly window unread" in broken.error, broken.error
+
+
+def test_a_partial_commandcode_read_is_not_a_destination_but_keeps_its_sessions():
+    """Readings gate destinations; exhaustion gates keeping. An unreadable monthly
+    window is a reading failure, so no NEW session goes there, while a session
+    already on it stays put rather than paying a prompt-cache reset."""
+    import placement as pl
+    now = time.time()
+    providers = {"commandcode": spec({"ds": "m"}), "other": spec({"ds": "m"})}
+    partial = q.Quota("commandcode", [win("weekly", 0.10, resets_in=3 * DAY, now=now)],
+                      now, "monthly window unread: the spend summary carried no usable credit figures")
+    healthy = q.Quota("other", [win("weekly", 0.20, resets_in=3 * DAY, now=now)], now)
+    decision = r.choose("ds", providers, {"commandcode": partial, "other": healthy}, WEIGHTS, SKIP, now=now)
+    assert decision.provider == "other", decision.detail
+
+    fleet = [pl.Session(id="cc1", provider="commandcode")]
+    plan = pl.plan(fleet, {"commandcode": partial, "other": healthy}, {}, providers, "ds")
+    assert plan[0].keep, plan[0].reason
 
 
 def test_clinepass_parses_the_nested_data_wrapper():
@@ -411,18 +497,38 @@ def test_health_absent_changes_nothing():
     assert without.provider == explicit_none.provider
 
 
-def test_a_nan_percentage_cannot_look_like_free_capacity():
-    """NaN compares false against every threshold, so an unsanitized NaN window
-    reads as perfect headroom and makes a broken reading look like the healthiest
-    provider. It must sanitise to 0 instead."""
-    bad = q.Quota("p", [q.Window("weekly", float("nan"), time.time() + 3 * DAY)])
-    assert bad.windows[0].percent == 0.0
-    c = r.score(bad, "m", WEIGHTS, SKIP)
-    assert c.pressure == 0.0 and not c.hard
-    # inf is the opposite direction and must not become 0 (that would hide a
-    # genuinely spent provider).
-    inf = q.Quota("p", [q.Window("weekly", float("inf"), time.time() + 3 * DAY)])
-    assert inf.windows[0].percent == 0.0, "inf sanitises too, so it cannot poison a sort"
+def test_an_unusable_percentage_can_never_look_like_free_capacity():
+    """NaN and inf compare false against every threshold, so an unsanitised window
+    reads as perfect headroom and makes a broken reading the healthiest provider on
+    the board. 0.0 is the worst possible destination for that value: it is both the
+    lowest risk and the best headroom. Such a window must not exist at all."""
+    for bad in (float("nan"), float("inf"), float("-inf"), None, "abc"):
+        assert q._finite_percent(bad) is None, bad
+        try:
+            q.Window("weekly", bad, time.time() + 3 * DAY)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad!r} was accepted as a window percentage")
+    assert q._finite_percent(0.0) == 0.0
+    assert q._finite_percent(1.4) == 1.4, "overage past 100% is real and must survive"
+
+
+def test_a_provider_reporting_nan_windows_reads_as_unreadable_not_healthy():
+    """The parser drops the unusable window, so a payload made only of them has no
+    windows and the provider reads as unreadable. That keeps it from being chosen
+    as a destination while leaving its existing sessions alone."""
+    payload = {"usage": {"rolling": {"status": "ok", "percent": float("nan"),
+                                     "resetsAt": "2026-09-18T05:24:13.354Z"}}}
+    try:
+        q.parse_opencode_go(payload)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a NaN-only payload produced a usable window set")
+    quota = q.Quota("p", [], time.time(), "opencode-go returned no recognised windows")
+    c = r.score(quota, "m", WEIGHTS, SKIP)
+    assert not c.quota_ok and c.pressure >= SKIP, (c.pressure, c.quota_ok, c.detail)
 
 
 def test_a_window_past_its_reset_is_not_treated_as_spent():
@@ -449,9 +555,64 @@ def test_a_tilde_in_the_collector_path_is_expanded_at_the_boundary():
     assert R._expanded("/tmp/plain") == Path("/tmp/plain")
 
 
-def test_a_negative_percentage_clamps_to_zero():
-    w = q.Window("weekly", -0.4, time.time() + 3 * DAY)
-    assert w.percent == 0.0
+def test_a_negative_percentage_is_unusable_rather_than_empty():
+    """Nothing can be -40% consumed, so a negative number is a broken reading or a
+    sentinel for "unknown". Clamping it to 0 would hand the emptiest, safest score
+    to a reading nobody can trust, so the window is dropped instead."""
+    assert q._finite_percent(-0.4) is None
+    try:
+        q.Window("weekly", -0.4, time.time() + 3 * DAY)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a negative percentage was accepted as a window")
+
+
+def test_a_reset_time_parses_identically_in_every_encoding_in_use():
+    """Same instant, five encodings. Two of them (the short numeric offset and the
+    basic date form) are rejected by datetime.fromisoformat before Python 3.11,
+    which is a supported target, so they are normalised rather than dropped."""
+    import datetime
+    expected = datetime.datetime(2026, 9, 18, 9, 6, 35, 170792,
+                                tzinfo=datetime.timezone.utc).timestamp()
+    encodings = (
+        "2026-09-18T09:06:35.170792893Z",      # clinepass: nanoseconds, Z
+        "2026-09-18T09:06:35.170792+00:00",    # extended offset
+        "2026-09-18T09:06:35.170792+0000",     # short offset
+        "20260918T090635.170792Z",             # basic date form
+    )
+    for text in encodings:
+        got = q._reset(text)
+        assert got is not None, f"{text!r} did not parse"
+        assert abs(got - expected) < 1e-6, (text, got, expected)
+    # A payload with no fractional seconds at all is exact to the second.
+    whole = q._reset("2026-09-18T09:06:35Z")
+    assert abs(whole - float(int(expected))) < 1e-6, whole
+    # Milliseconds, which is what CommandCode really sends. Milliseconds carry
+    # three decimal places, so a microsecond fraction cannot round-trip exactly.
+    ms = int(expected * 1000)
+    assert abs(q._reset(ms) - ms / 1000.0) < 1e-9, (ms, q._reset(ms))
+    assert q._reset(None) is None and q._reset("") is None
+
+
+def test_a_reset_that_is_present_but_unreadable_drops_its_window():
+    """An absent reset is normal (Ollama publishes none) and the window keeps its
+    raw-percentage rule. A reset that IS there but cannot be read is different: the
+    window would silently lose its pace rule and, at or above the skip point, would
+    then be treated as spent. Drop it and let the provider read as unreadable."""
+    assert q._reset(None) is None
+    assert not q._present(None) and q._present("2026-09-18T09:06:35Z")
+    payload = {"usage": {"rolling": {"status": "ok", "percent": 10, "resetsAt": "September 18 2026"}}}
+    try:
+        q.parse_opencode_go(payload)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a window with an unreadable reset survived the parser")
+    # With one good window alongside, the good one survives.
+    payload["usage"]["weekly"] = {"status": "ok", "percent": 20, "resetsAt": "2026-09-21T00:00:00Z"}
+    windows = q.parse_opencode_go(payload)
+    assert [w.label for w in windows] == ["weekly"], [w.label for w in windows]
 
 
 def test_ticks_resolve_deterministically_regardless_of_input_order():
