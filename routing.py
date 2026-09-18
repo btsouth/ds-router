@@ -15,7 +15,9 @@ Three ideas carry the whole design:
 
 3. Stay put until there is a reason. A switch resets the upstream prompt cache
    and drops the model's reasoning traces, so moving is only correct when the
-   current provider is exhausted, unreadable, or predicted to die mid-turn.
+   current provider is exhausted or predicted to die mid-turn. A provider whose
+   reading failed is not "unreadable" in that sense: it simply cannot win, because
+   a real reading outranks a missing one.
 """
 
 from __future__ import annotations

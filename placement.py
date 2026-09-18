@@ -14,9 +14,11 @@ instead of letting them share one.
 Three rules carry this module, and they are the same three as `routing.py`:
 
 1. **Leave sessions where they are.** A move resets the upstream prompt cache
-   and drops reasoning traces, so it must be justified. A session only moves
-   when its provider is over its declared concurrency cap, or exhausted, or
-   unreadable.
+   and drops reasoning traces, so it must be justified. A session only moves when
+   its provider is over its declared concurrency cap, exhausted, or cannot serve
+   the requested alias. A provider whose *reading* failed is not a reason to move:
+   the reading failed, not the endpoint, so a session already there stays and the
+   provider is merely blocked as a destination until it reads again.
 2. **A cap is a hard limit on the plan, not a scoring nudge.** `routing.py`
    prices a queue overage as soft pressure (queueing still completes). Here the
    plan must not create the queue in the first place.
