@@ -25,7 +25,10 @@ while [ -h "$self" ]; do
     *)  self=$(dirname "$self")/$link ;;
   esac
 done
-ROUTER_DIR=${DS_ROUTER_DIR:-$(cd "$(dirname "$self")" && pwd)}
+# pwd -P (physical) to match install.sh/uninstall.sh, which both resolve
+# through symlinked directories the same way; otherwise the wrapper and the
+# installed units would disagree about the project directory.
+ROUTER_DIR=${DS_ROUTER_DIR:-$(cd "$(dirname "$self")" && pwd -P)}
 
 if [ ! -f "$ROUTER_DIR/apply.py" ]; then
   echo "apply.py not found in $ROUTER_DIR" >&2

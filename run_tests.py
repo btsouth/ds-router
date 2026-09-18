@@ -47,17 +47,24 @@ def main() -> int:
         # rather than trusting the exit code.
         declared = _declared_total(out)
         miscounted = declared is not None and declared != passes and proc.returncode == 0
-        if miscounted:
+        # A suite that ran nothing is not a passing suite. Catching this is the
+        # whole reason this runner exists: a renamed or silently-skipped test used
+        # to vanish from the count while the run stayed green.
+        empty = passes == 0 and fails == 0 and proc.returncode == 0
+        if miscounted or empty:
             passes, fails = passes, fails + 1
         total_pass += passes
         total_fail += fails
-        if proc.returncode != 0 or miscounted:
+        if proc.returncode != 0 or miscounted or empty:
             failed_suites += 1
-        status = "ok  " if proc.returncode == 0 and not miscounted else "FAIL"
+        status = "ok  " if proc.returncode == 0 and not miscounted and not empty else "FAIL"
         print(f"  {status} {path.name:28} {passes:>3} passed, {fails} failed")
         if miscounted:
             print(f"        suite declared {declared} passed but printed {passes} "
                   f"'  pass' lines; its output format is unreadable to this runner")
+        if empty:
+            print(f"        suite reported no tests at all (exit 0). Either it ran "
+                  f"nothing, or its result lines do not start with '  pass'.")
         if proc.returncode != 0:
             for line in out.splitlines():
                 if line.startswith("  FAIL"):
@@ -66,7 +73,12 @@ def main() -> int:
                 print(f"        stderr: {proc.stderr.strip()[:300]}")
 
     print()
-    print(f"{len(found)} suite(s), {total_pass} tests passed, {total_fail} failed")
+    summary = f"{len(found)} suite(s), {total_pass} tests passed, {total_fail} failed"
+    if failed_suites:
+        # Named explicitly: a crashing suite contributes no `  FAIL` line, so
+        # "0 failed" next to a FAIL row reads as a clean run.
+        summary += f", {failed_suites} suite(s) did not report cleanly"
+    print(summary)
     return 1 if (total_fail or failed_suites) else 0
 
 

@@ -126,12 +126,21 @@ run_cmd() {
 
 run_cmd_soft() {
   # Same, but a failure is a warning rather than a fatal error.
+  #
+  # Always returns 0. Returning nonzero here looks harmless but is not: under
+  # `set -e` the status becomes the function's own, so a bare call at the call
+  # site would kill the script right after printing "continuing" -- leaving a
+  # half-install (units written, symlink and manifest missing) with no message
+  # saying so. The warning is the report; the status is not a verdict.
   if [ "$DRY_RUN" = 1 ]; then
     printf '  dry   %s\n' "$*"
     return 0
   fi
   printf '  run   %s\n' "$*"
-  "$@" || { warn "command failed (continuing): $*"; return 1; }
+  if ! "$@"; then
+    warn "command failed (continuing): $*"
+  fi
+  return 0
 }
 
 do_mkdir() {
@@ -211,7 +220,7 @@ check_pyyaml() {
     answer=y
   elif [ -t 0 ]; then
     printf '  ask   install pyyaml now with pip --user? [y/N] '
-    read answer 2>/dev/null || answer=n
+    read -r answer 2>/dev/null || answer=n
   else
     note "not a terminal: assuming no (use --yes to install unattended)"
   fi
@@ -387,6 +396,12 @@ install_units_linux() {
 
   if [ -f "$SYSTEMD_USER_DIR/ds-router.timer" ] || [ "$DRY_RUN" = 1 ]; then
     run_cmd_soft systemctl --user enable --now ds-router.timer
+    # Verify rather than assume: systemctl can fail against a bus that is not
+    # reachable, and a silently un-enabled timer is a half-install.
+    if ! systemctl --user is-active ds-router.timer >/dev/null 2>&1; then
+      warn "the timer is not active; start it with:"
+      note "  systemctl --user daemon-reload && systemctl --user enable --now ds-router.timer"
+    fi
   fi
   note "check it with: systemctl --user list-timers ds-router.timer"
 }
@@ -539,6 +554,8 @@ if [ "$DRY_RUN" = 1 ]; then
 else
   do_mkdir "$STATE_DIR"
   {
+    # Raw values: uninstall.sh parses this file as data (never sources it), so a
+    # path containing a space or a shell metacharacter survives intact.
     printf 'VERSION=%s\n' "$VERSION"
     printf 'PROGRAM=%s\n' "$PROG"
     printf 'ROUTER_DIR=%s\n' "$ROUTER_DIR"

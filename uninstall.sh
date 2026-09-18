@@ -89,10 +89,34 @@ LAUNCHD_PLIST=$HOME/Library/LaunchAgents/com.ds-router.switch.plist
 # fall back to the same paths install.sh would have used, so an uninstall still
 # cleans up after an older install or a hand-copied unit.
 # ---------------------------------------------------------------------------
+# Read the manifest as DATA. It used to be sourced, which meant a clone path
+# containing & or | ran as shell code, and a path containing a space truncated the
+# value and aborted the uninstall having removed nothing. Values are now taken
+# literally from the first '=' onward, so every character round-trips. Only the
+# keys this script needs are read; an unknown key is ignored.
+manifest_load() {
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in ''|'#'*) continue ;; esac
+    case $line in *=*) ;; *) continue ;; esac
+    mkey=${line%%=*}
+    mval=${line#*=}
+    # Tolerate a value the older installer wrote shell-quoted.
+    case $mval in
+      \'*\') mval=${mval#\'}; mval=${mval%\'} ;;
+    esac
+    case $mkey in
+      ROUTER_DIR)        ROUTER_DIR=$mval ;;
+      SYSTEMD_USER_DIR)  SYSTEMD_USER_DIR=$mval ;;
+      SYMLINK)           SYMLINK=$mval ;;
+      LAUNCHD_PLIST)     LAUNCHD_PLIST=$mval ;;
+      HERMES_BIN)        HERMES_BIN=$mval ;;
+    esac
+  done < "$1"
+}
+
 FROM_MANIFEST=0
 if [ -f "$MANIFEST" ]; then
-  # shellcheck disable=SC1090  # a flat KEY=VALUE file written by install.sh
-  . "$MANIFEST"
+  manifest_load "$MANIFEST"
   FROM_MANIFEST=1
 fi
 SYSTEMD_USER_DIR=${SYSTEMD_USER_DIR:-$CONFIG_HOME/systemd/user}

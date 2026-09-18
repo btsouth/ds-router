@@ -122,17 +122,32 @@ def test_exhausted_provider_sheds_all_of_its_sessions():
     assert all(a.provider != "ollama-cloud" and "exhausted" in a.reason for a in moved(result))
 
 
-def test_unreadable_provider_sheds_all_of_its_sessions():
-    """A failed reading is information, not a free pass: don't strand work on it."""
+def test_an_unreadable_provider_takes_no_new_sessions_but_keeps_its_own():
+    """A failed READING is not a failed endpoint.
+
+    A provider whose usage endpoint 503s may be serving inference perfectly well,
+    so a session already on it must stay: ejecting it costs a prompt-cache reset
+    and the model's reasoning traces to avoid a telemetry outage. What an
+    unreadable reading does change is that the planner will not put anything new
+    there, because it cannot vouch for headroom it could not measure.
+    """
     quotas = healthy_quotas()
     quotas["opencode-go"] = q.Quota("opencode-go", [], error="HTTPError: 503")
     fleet = sessions(("a", "opencode-go"), ("b", "commandcode"))
 
     result = pl.plan(fleet, quotas, CAPS, PROVIDERS, ALIAS)
 
-    assert dest_counts(result).get("opencode-go", 0) == 0, dest_counts(result)
-    assert [a.session_id for a in moved(result)] == ["a"]
-    assert "unreadable" in moved(result)[0].reason
+    assert dest_counts(result).get("opencode-go", 0) == 1, dest_counts(result)
+    assert moved(result) == [], [a.reason for a in moved(result)]
+
+    # A session that must be re-homed still must not land on it either.
+    providers = dict(PROVIDERS)
+    providers["kimi-only"] = {"models": {"kimi-k3": "kimi-k3"}}
+    rehomed = pl.plan(sessions(("c", "kimi-only")), quotas,
+                      {"ollama-cloud": 3, "kimi-only": 1}, providers, ALIAS)
+    assert moved(rehomed), "a session on a provider that cannot serve the alias must move"
+    assert dest_counts(rehomed).get("opencode-go", 0) == 0, dest_counts(rehomed)
+    assert moved(rehomed)[0].provider != "opencode-go"
 
 
 def test_a_provider_that_does_not_serve_the_alias_is_never_a_destination():
@@ -195,6 +210,72 @@ def test_a_named_custom_provider_is_read_from_the_config_not_the_billing_identit
     # Nothing usable anywhere: the generic identity must not leak through.
     assert pl._provider_of("custom", None) == ""
     assert pl._provider_of(None, "not json") == ""
+
+
+def test_an_unreadable_provider_join_refuses_instead_of_moving_the_fleet():
+    """A missing or unreadable state store made every session look provider-less,
+    and "no provider yet" is a reason to move, so a one-session plan became a
+    whole-fleet rewrite. Verified live: 22/22 sessions to move with a missing DB."""
+    class T:
+        def call(self, method, params):
+            return {"sessions": [{"id": "a", "session_key": "ka"},
+                                 {"id": "b", "session_key": "kb"}]}
+        def close(self):
+            pass
+
+    missing = Path("/tmp/definitely-not-a-real-state-db/nope.db")
+    try:
+        pl.enumerate_sessions(T(), db_path=missing)
+        raise AssertionError("must refuse when no provider could be read for any session")
+    except pl.ProviderJoinError as exc:
+        assert "no provider could be read" in str(exc), exc
+
+    # A partial join is fine: some sessions readable means the store works.
+    sessions_out = pl.enumerate_sessions(T(), db_path=None)
+    assert len(sessions_out) == 2
+
+
+def test_apply_reports_a_reply_that_means_nothing_happened():
+    """A returned call is not a completed move. Hermes answers config.set with
+    confirm_required (its large-context guard, which fires for exactly the
+    cross-provider-id moves the planner makes), deferred, or a nested error --
+    all of which mean the move did NOT happen."""
+    class T:
+        def __init__(self, reply):
+            self.reply, self.calls = reply, []
+        def call(self, method, params):
+            self.calls.append((method, params))
+            return self.reply
+        def close(self):
+            pass
+
+    move = [pl.Assignment("s1", "opencode-go", "m2", "ollama-cloud", reason="t")]
+    for label, reply in (("deferred", {"deferred": True}),
+                         ("nested error", {"error": {"code": 4001, "message": "no live session"}})):
+        t = T(reply)
+        result = pl.apply(move, t, dry_run=False)[0]
+        assert not result.ok, f"{label} must not report success"
+
+    # A blocked move is retried once with the backend's own confirmation flag,
+    # because this run is non-interactive and the intent is unambiguous.
+    t = T({"confirm_required": True, "confirm_message": "expensive"})
+    pl.apply(move, t, dry_run=False)
+    assert len(t.calls) == 2, "must retry once with confirmation"
+    assert t.calls[1][1].get("confirm_expensive_model") is True, t.calls[1][1]
+
+    # A plain success is still a success, and a useless reply is not a failure.
+    for reply in ({"key": "model", "scope": "session"}, None, "ok"):
+        assert pl.apply(move, T(reply), dry_run=False)[0].ok
+
+
+def test_a_failed_quota_read_does_not_eject_sessions_from_a_working_provider():
+    """A usage endpoint 503ing says the reading failed, not that inference did."""
+    quotas = healthy_quotas()
+    quotas["ollama-cloud"] = q.Quota("ollama-cloud", [], error="HTTPError: 503")
+    fleet = sessions(("a", "ollama-cloud"), ("b", "ollama-cloud"))
+
+    result = pl.plan(fleet, quotas, CAPS, PROVIDERS, ALIAS)
+    assert moved(result) == [], [a.reason for a in moved(result)]
 
 
 def test_the_same_input_produces_the_same_plan_twice():

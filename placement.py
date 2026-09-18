@@ -258,7 +258,20 @@ class _Candidate:
 
     @property
     def usable(self) -> bool:
+        """Safe to move a session ONTO. An unreadable reading is not trusted."""
         return not self.unreadable and not self.exhausted
+
+    @property
+    def may_keep(self) -> bool:
+        """Safe to leave a session where it is.
+
+        Deliberately weaker than ``usable``: an unreadable quota says the reading
+        failed, not that the endpoint did, so a session already on that provider
+        stays put. Ejecting it would pay a prompt-cache reset and lose the model's
+        reasoning traces to avoid a provider whose inference path is probably
+        fine. Hard exhaustion still qualifies, because that is real.
+        """
+        return not self.exhausted
 
 
 def _risk(candidate: _Candidate, skip_at: float, weights: dict[str, float],
@@ -376,7 +389,7 @@ def plan(sessions: Iterable[Any], quotas_or_load: Any = None, caps: Any = None,
         for session in sorted((s for s in rows if (s.provider or "") == name),
                               key=lambda s: s.id):
             seen.add(session.id)
-            if cand.usable and (room is None or kept < room):
+            if cand.may_keep and (room is None or kept < room):
                 kept += 1
                 assigned[name] += 1
                 out.append(Assignment(session.id, name, cand.model_id, name, keep=True,
@@ -792,10 +805,18 @@ class LiveTransport(Transport):
         return client
 
     def call(self, method: str, params: dict) -> dict:
-        """One JSON-RPC round trip. Reconnects once on a broken socket."""
+        """One JSON-RPC round trip. Reconnects once on a broken connection.
+
+        Only a CONNECTION fault is retried. A well-formed error reply is a final
+        answer: retrying it would re-send a state mutation like config.set that the
+        backend already processed, and would hide the real error behind an
+        eventual socket error.
+        """
         for attempt in (0, 1):
             try:
                 return self._call_once(method, params)
+            except BackendError:
+                raise  # the server answered; do not repeat the request
             except TransportError:
                 self.close()
                 if attempt:
@@ -814,7 +835,7 @@ class LiveTransport(Transport):
                 if isinstance(frame, dict) and frame.get("id") == self._id:
                     if "error" in frame:
                         error = frame.get("error") or {}
-                        raise TransportError(
+                        raise BackendError(
                             f"{method} failed: {error.get('code')} {error.get('message')}")
                     result = frame.get("result")
                     return result if isinstance(result, dict) else {"result": result}
@@ -876,6 +897,14 @@ def _provider_of(billing_provider: Any, model_config: Any) -> str:
         if name and name != _GENERIC_PROVIDER:
             return name
     return ""
+
+
+class BackendError(RuntimeError):
+    """The backend answered with a JSON-RPC error. Final: never retried."""
+
+
+class ProviderJoinError(RuntimeError):
+    """Live sessions were listed, but their providers could not be read at all."""
 
 
 def _read_db(db_path: Optional[Path]) -> dict[str, str]:
@@ -974,15 +1003,31 @@ def enumerate_sessions(transport: Optional[Transport] = None, *, db_path: Option
     is what the user actually has open). The RPC row does not carry the
     provider, so it is joined from the state DB by session id/key. With no
     transport, or on any RPC failure, it falls back to the state DB alone.
+
+    Raises ``ProviderJoinError`` when the sessions are known but not ONE of their
+    providers could be read. Without that, an unreadable store makes every session
+    look provider-less, and since "no provider yet" is a reason to move, a
+    one-session plan becomes a whole-fleet rewrite.
     """
     rows: list[dict] = []
+    listed = False
     if transport is not None:
         try:
             result = transport.call("session.active_list", {})
             rows = list(result.get("sessions") or [])
-        except Exception:
+            listed = True
+        except Exception as exc:
+            # A failed list silently changes WHICH sessions are acted on, so say so.
+            print(f"  note: session.active_list failed ({exc}); "
+                  f"falling back to the state store.", file=sys.stderr)
             rows = []
+    if listed and not rows:
+        return []  # a successful empty listing means nothing is open
     if not rows:
+        # The DB path yields ``sessions.id``, which is not the same namespace as
+        # the runtime id the RPC view returns. config.set resolves the runtime id,
+        # so a DB-only run may send identifiers the backend cannot match. Read-only
+        # planning is unaffected; a write from here is best-effort.
         return sessions_from_db(db_path, include_children=include_children)
 
     providers = _read_db(db_path)
@@ -995,6 +1040,11 @@ def enumerate_sessions(transport: Optional[Transport] = None, *, db_path: Option
         provider = str(row.get("provider") or "") or providers.get(key, "") or providers.get(sid, "")
         out.append(Session(id=sid, provider=provider, session_key=key,
                            model=str(row.get("model") or ""), title=str(row.get("title") or "")))
+    if out and not providers and not any(s.provider for s in out):
+        raise ProviderJoinError(
+            f"{len(out)} live session(s) found but no provider could be read for any of them "
+            f"(state store: {state_db_path(db_path)}). Refusing to act, because every session "
+            f"would look provider-less and be moved.")
     return out
 
 
@@ -1016,6 +1066,40 @@ def params_for(assignment: Assignment, method: str = DEFAULT_METHOD) -> dict:
                 "command": f"/model {assignment.model_id} --provider {assignment.provider}"}
     return {"session_id": assignment.session_id, "key": "model",
             "value": f"{assignment.model_id} --provider {assignment.provider} --session"}
+
+
+def _read_reply(reply: Any) -> tuple[str, str]:
+    """Interpret a config.set reply: ("ok", "") or ("blocked"/"error", detail).
+
+    A returned call is not a completed move. Hermes answers config.set with
+    envelopes that mean the opposite of success:
+
+    * ``confirm_required`` — the backend deliberately applied NOTHING. Its
+      large-context guard asks for confirmation when the destination uses a
+      different model id than the session holds, which is exactly a
+      cross-provider move, so the biggest sessions silently do not move.
+    * ``deferred`` — the pick was stashed for the next turn, not applied now.
+    * an ``error`` member — a failure delivered inside a well-formed reply.
+
+    Anything else (including None, a plain string, or a dict without these keys)
+    is reported as ok, so a transport that returns nothing useful is not
+    mistaken for a failure.
+    """
+    if not isinstance(reply, dict):
+        return "ok", ""
+    if reply.get("confirm_required"):
+        return "blocked", str(reply.get("confirm_message")
+                              or "the backend asked for confirmation and applied nothing")
+    if reply.get("deferred"):
+        return "deferred", "the backend stashed this change for the next turn instead of applying it"
+    error = reply.get("error")
+    if isinstance(error, dict):
+        code = error.get("code")
+        message = error.get("message") or error.get("data") or "unspecified error"
+        return "error", f"backend error {code}: {message}" if code else str(message)
+    if error:
+        return "error", str(error)
+    return "ok", ""
 
 
 def apply(assignments: Iterable[Any], transport: Optional[Transport], *,
@@ -1045,9 +1129,22 @@ def apply(assignments: Iterable[Any], transport: Optional[Transport], *,
                               method=method, params=params, reason=a.reason))
             continue
         try:
-            transport.call(method, params)
-            out.append(Result(a.session_id, a.provider, a.from_provider, ok=True, method=method,
-                              params=params, reason=a.reason))
+            reply = transport.call(method, params)
+            verdict, detail = _read_reply(reply)
+            if verdict == "blocked":
+                # The backend applied nothing and is waiting for confirmation.
+                # This run is non-interactive and the intent is unambiguous, so
+                # confirm once rather than reporting a move that did not happen.
+                retry = dict(params, confirm_expensive_model=True)
+                reply = transport.call(method, retry)
+                verdict, detail = _read_reply(reply)
+                params = retry
+            if verdict == "ok":
+                out.append(Result(a.session_id, a.provider, a.from_provider, ok=True, method=method,
+                                  params=params, reason=a.reason))
+            else:
+                out.append(Result(a.session_id, a.provider, a.from_provider, ok=False, method=method,
+                                  params=params, reason=a.reason, error=detail))
         except Exception as exc:  # noqa: BLE001 - one bad session must not stop the fleet
             out.append(Result(a.session_id, a.provider, a.from_provider, ok=False, method=method,
                               params=params, error=f"{type(exc).__name__}: {exc}"[:200],
@@ -1158,15 +1255,30 @@ def main(argv: Optional[list[str]] = None) -> int:
         except TransportError as exc:
             print(f"  note: {exc}\n  note: falling back to the state DB.", file=sys.stderr)
 
-    sessions = enumerate_sessions(transport, db_path=Path(args.db_path) if args.db_path else None,
-                                  include_children=args.children)
+    try:
+        sessions = enumerate_sessions(transport, db_path=Path(args.db_path) if args.db_path else None,
+                                      include_children=args.children)
+    except ProviderJoinError as exc:
+        print(f"refusing to plan: {exc}", file=sys.stderr)
+        print("  Reading the provider for every live session failed, so each one would "
+              "look provider-less and be moved.", file=sys.stderr)
+        print("  Check that state.db is readable, or pass --db-path.", file=sys.stderr)
+        return 5
     quotas = collect_quotas(providers, config)
     assignments = plan(sessions, quotas, caps, providers, alias,
                        skip_at=float(routing_cfg.get("skip_at", SKIP_AT)),
                        weights=routing_cfg.get("window_weights") or WEIGHTS)
 
-    if args.limit:
-        assignments = assignments[: args.limit]
+    if not quotas and providers:
+        print("  note: no quota readings were collected, so this plan spreads by load "
+              "only and knows nothing about headroom.", file=sys.stderr)
+        print("  note: check the provider keys and the quota endpoints "
+              "(router.py --dry-run shows what each provider reports).", file=sys.stderr)
+
+    # --limit shortens the PRINTED rows only. Truncating the assignment list
+    # itself would make `--apply --limit N` write an arbitrary prefix of the plan,
+    # chosen by session-id sort order rather than by importance.
+    shown = assignments[: args.limit] if args.limit else assignments
 
     if args.json:
         print(json.dumps({
@@ -1174,13 +1286,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             "source": source,
             "caps": caps,
             "counts": counts(assignments),
+            "printed": len(shown),
             "assignments": [{"session_id": a.session_id, "from": a.from_provider,
                              "to": a.provider, "model_id": a.model_id, "keep": a.keep,
                              "unassigned": a.unassigned, "reason": a.reason} for a in assignments],
         }, indent=2))
     else:
         print()
-        print(_render_table(sessions, assignments, caps, alias, source))
+        print(_render_table(sessions, shown, caps, alias, source))
+        if len(shown) < len(assignments):
+            print(f"  (showing {len(shown)} of {len(assignments)} rows; "
+                  f"the plan itself is not truncated)")
         print()
 
     if not args.apply and not args.dry_run:
