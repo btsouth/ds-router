@@ -17,6 +17,7 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+from typing import Any, Optional
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -50,12 +51,21 @@ def build_view(config: dict, env: dict[str, str]):
     return providers
 
 
+def _expanded(value: Any) -> Optional[Path]:
+    """A config path with ~ resolved, or None when unset."""
+    text = str(value or "").strip()
+    return Path(text).expanduser() if text else None
+
+
 def collect(providers: dict, env: dict[str, str], timeout: float = 12.0,
             routing_cfg: dict | None = None) -> dict[str, q.Quota]:
     """Read every provider's quota, preferring a fresh collector snapshot."""
     routing_cfg = routing_cfg or {}
     reuse = bool(routing_cfg.get("reuse_collector_state", True))
-    state_dir = routing_cfg.get("collector_state_dir")
+    # Expand here, at the boundary: the config holds a display path like
+    # "~/.local/state/...", and a caller that forgot expanduser would silently
+    # find nothing and poll directly, with no error to show for it.
+    state_dir = _expanded(routing_cfg.get("collector_state_dir"))
     ttl = float(routing_cfg.get("quota_ttl_seconds", 300))
     out: dict[str, q.Quota] = {}
     for name, spec in providers.items():

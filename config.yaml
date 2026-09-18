@@ -92,8 +92,16 @@ routing:
     monthly: 0.6
   # Quota snapshots older than this are treated as unknown and ignored.
   quota_ttl_seconds: 300
-  # Reuse the omarchy-usage-dashboard collector's snapshots when they are
-  # fresh, instead of polling the same endpoints a second time.
+  # Reuse cached quota snapshots when they are fresh, instead of polling the same
+  # endpoints a second time.
+  #
+  # Any tool that already polls these usage APIs and drops the result as one JSON
+  # file per provider (`<provider>-quota.json`) can be used as the cache. If you
+  # have no such tool, this does nothing: the directory is absent, so ds-router
+  # polls directly. Nothing else in the project depends on it.
+  #
+  # Point this at wherever your cache lives, or set reuse_collector_state: false
+  # to always poll.
   reuse_collector_state: true
   collector_state_dir: ~/.local/state/omarchy/ai-usage
 

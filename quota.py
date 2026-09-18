@@ -343,23 +343,26 @@ COLLECTOR_FILES = {
     "commandcode": "commandcode-quota.json",
     "opencode-go": "go-quota.json",
     "ollama-cloud": "ollama-quota.json",
-    # Written by the omarchy-usage-dashboard collector once ClinePass is wired
-    # in there. Absent is fine: the caller polls ClinePass directly.
+    # Written by a snapshot cache once it covers ClinePass. Absent is fine: the
+    # caller polls ClinePass directly.
     "clinepass": "clinepass-quota.json",
 }
 
 
 def from_collector(provider: str, state_dir: "Path", ttl_seconds: float = 300.0) -> Optional[Quota]:
-    """Build a Quota from the omarchy-usage-dashboard collector's snapshot.
+    """Build a Quota from a cached snapshot file, if one is present and fresh.
 
-    That collector already polls these same endpoints on its own schedule, so
-    reading its snapshot avoids hammering the usage APIs twice for one answer.
+    Something else on the machine already polls these same endpoints on its own
+    schedule, so reading its snapshot avoids asking the usage APIs twice for one
+    answer. An absent or stale file returns None and the caller polls directly.
     Returns None when the snapshot is missing, stale, or errored, in which case
     the caller polls directly.
     """
     filename = COLLECTOR_FILES.get(provider)
     if not filename:
         return None
+    # expanduser is idempotent, so a caller may pass either a raw config path or
+    # one already resolved.
     path = Path(state_dir).expanduser() / filename
     try:
         payload = json.loads(path.read_text())

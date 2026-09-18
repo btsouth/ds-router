@@ -6,6 +6,7 @@ Run: python3 test_routing.py
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import quota as q
 import routing as r
@@ -428,6 +429,19 @@ def test_a_window_past_its_reset_is_not_treated_as_spent():
     c = r.score(quota, "m", WEIGHTS, SKIP, now=now)
     assert c.pressure == 0.0, c.pressure
     assert not c.hard and not r.hard_exhausted(quota, SKIP, now=now)
+
+
+def test_a_tilde_in_the_collector_path_is_expanded_at_the_boundary():
+    """The config holds a display path like ~/.local/state/...; a caller that
+    forgot expanduser would silently find nothing and poll directly, with no error
+    to show for it. Verified: Path("~/x").exists() is False, so the cache is missed
+    silently rather than loudly."""
+    import router as R
+    assert R._expanded("~/.local/state/x") == Path.home() / ".local" / "state" / "x"
+    assert R._expanded("") is None
+    assert R._expanded(None) is None
+    # A path with no tilde is left alone.
+    assert R._expanded("/tmp/plain") == Path("/tmp/plain")
 
 
 def test_a_negative_percentage_clamps_to_zero():

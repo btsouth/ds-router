@@ -37,11 +37,17 @@ def config_file() -> Path:
     return hermes_home() / "config.yaml"
 
 
-def collector_state_dir() -> Path:
-    """Where the omarchy-usage-dashboard collector writes quota snapshots.
+def default_collector_state_dir() -> Path:
+    """The *fallback* cache location, for reference and documentation only.
 
-    Not under HERMES_HOME: that dashboard is a separate project with its own
-    XDG state dir. Honours XDG_STATE_HOME the way the collector does.
+    The live value comes from ``routing.collector_state_dir`` in config.yaml and is
+    resolved by ``router._expanded``; this function is not in that path. Two
+    implementations of one rule is how they drift, so callers should read the
+    config rather than call this.
+
+    Not under HERMES_HOME: a usage cache belongs to whichever separate tool writes
+    it, with its own XDG state dir, so this honours XDG_STATE_HOME the way such
+    tools do.
     """
     xdg = str(os.environ.get("XDG_STATE_HOME") or "").strip()
     base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"

@@ -216,10 +216,13 @@ exactly this (dashboard-only allowance) plus a 53s median response time.
 
 ## Design notes
 
-- **Quota snapshots are reused** from `~/.local/state/omarchy/ai-usage/` when
-  fresh, so the endpoints are not polled twice for one answer. Entirely optional;
-  with no snapshot present it polls directly. Set `reuse_collector_state: false`
-  to always poll.
+- **Quota snapshots can be reused** from a cache directory, so the usage endpoints
+  are not polled twice for one answer when something else on the machine already
+  polls them. Entirely optional and off in practice for a fresh install: with no
+  such directory present, ds-router polls the endpoints directly. The shipped
+  default points at `~/.local/state/omarchy/ai-usage/` (a dashboard that writes one
+  `<provider>-quota.json` per provider); set `routing.collector_state_dir` to your
+  own cache, or `reuse_collector_state: false` to always poll.
 - **Failures are honest.** An unreadable quota sorts below a real reading rather
   than being silently trusted, and "everything is exhausted" is reported instead
   of papered over. When nothing is safely readable it degrades to the best
