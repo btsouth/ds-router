@@ -10,6 +10,11 @@ listen:
 # fine: the router picks among the providers that list it.
 default_model: deepseek-v4.1-flash
 
+# What --off returns Hermes to, and what `hermes fallback` should list first.
+# This file is the SINGLE SOURCE of provider endpoints and model ids: apply.py
+# and router.py both read it, so nothing is duplicated in the shell wrapper.
+default_provider: commandcode
+
 models:
   deepseek-v4.1-flash:
     commandcode: deepseek/deepseek-v4.1-flash

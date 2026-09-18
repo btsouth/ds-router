@@ -1,0 +1,12 @@
+[Unit]
+Description=Run ds-router every 15 minutes
+
+[Timer]
+# Offset from the top of the clock so it does not collide with other pollers
+# (e.g. a usage-dashboard refresh on the same cadence).
+OnStartupSec=4min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

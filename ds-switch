@@ -1,124 +1,48 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # ds-switch — point Hermes at the provider the router recommends.
 #
-# The router decides; this script applies the decision. Hermes reads
-# model.provider when it builds an agent, so the change lands on the next
-# session (or the next turn, in the desktop app / gateway).
+# A thin wrapper: argument parsing and delegation to apply.py, which holds the
+# logic and reads config.yaml. Deliberately POSIX sh with no arrays, because
+# bash 3.2 (macOS default) has no associative arrays and this has to run there.
 #
 #   ds-switch              apply the router's current recommendation
 #   ds-switch --show       print the recommendation without applying it
-#   ds-switch commandcode  pin a provider explicitly, ignoring the router
-#   ds-switch --off        hand routing back to Hermes (commandcode primary)
+#   ds-switch --check      report whether the config can drive Hermes
+#   ds-switch <provider>   pin a provider explicitly, ignoring the router
+#   ds-switch --off        hand routing back to the default provider
 #
-# Turn it on/off by running it or not. Nothing else in Hermes changes.
+# Turning it off is running --off, or not running it at all.
 
-set -euo pipefail
+set -eu
 
-ROUTER_DIR="${DS_ROUTER_DIR:-$HOME/Projects/ds-router}"
-PROVIDERS="$ROUTER_DIR/providers.yaml"
+# Resolve this script's own directory, following symlinks, so the wrapper works
+# from anywhere (including a symlink on PATH).
+self=$0
+while [ -h "$self" ]; do
+  link=$(readlink "$self")
+  case $link in
+    /*) self=$link ;;
+    *)  self=$(dirname "$self")/$link ;;
+  esac
+done
+ROUTER_DIR=${DS_ROUTER_DIR:-$(cd "$(dirname "$self")" && pwd)}
 
-if [[ ! -d "$ROUTER_DIR" ]]; then
-  echo "ds-router not found at $ROUTER_DIR" >&2
+if [ ! -f "$ROUTER_DIR/apply.py" ]; then
+  echo "apply.py not found in $ROUTER_DIR" >&2
   exit 1
 fi
 
-mode="apply"
-pinned=""
-case "${1:-}" in
-  --show) mode="show" ;;
-  --off)  mode="off" ;;
+case ${1:-} in
   -h|--help)
-    sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
-    exit 0 ;;
-  "");;
-  *) pinned="$1" ;;
+    sed -n '2,17p' "$self" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
 esac
 
-# Provider endpoints and the model id each one calls it. Duplicated from
-# ds-router/config.yaml on purpose: this script must keep working even if the
-# router is mid-edit, and it is the only thing that writes Hermes config.
-declare -A BASE=(
-  [commandcode]="https://api.commandcode.ai/provider/v1"
-  [opencode-go]="https://opencode.ai/zen/go/v1"
-  [ollama-cloud]="https://ollama.com/v1"
-)
-# Logical alias -> per-provider model id.
-declare -A MODEL_CC=(
-  [deepseek-v4.1-flash]="deepseek/deepseek-v4.1-flash"
-)
-declare -A MODEL_GO=(
-  [deepseek-v4.1-flash]="deepseek-v4.1-flash"
-)
-declare -A MODEL_OL=(
-  [deepseek-v4.1-flash]="deepseek-v4.1-flash"
-)
-
-ALIAS="${DS_ALIAS:-deepseek-v4.1-flash}"
-
-model_id_for() {
-  local provider="$1"
-  case "$provider" in
-    commandcode)  echo "${MODEL_CC[$ALIAS]:-}" ;;
-    opencode-go)  echo "${MODEL_GO[$ALIAS]:-}" ;;
-    ollama-cloud) echo "${MODEL_OL[$ALIAS]:-}" ;;
-    *) echo "" ;;
-  esac
-}
-
-if [[ "$mode" == "off" ]]; then
-  hermes config set model.provider commandcode >/dev/null
-  hermes config set model.default "$(model_id_for commandcode)" >/dev/null
-  hermes config set model.base_url "${BASE[commandcode]}" >/dev/null
-  echo "Routing off — Hermes is back on commandcode as a plain provider."
-  exit 0
+# python3 is required; apply.py does the rest.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 is required but not on PATH" >&2
+  exit 1
 fi
 
-if [[ -n "$pinned" ]]; then
-  if [[ -z "${BASE[$pinned]:-}" ]]; then
-    echo "Unknown provider: $pinned" >&2
-    echo "Known: commandcode, opencode-go, ollama-cloud" >&2
-    exit 2
-  fi
-  chosen="$pinned"
-  reason="pinned by hand"
-else
-  # Stay on whatever Hermes is already using unless there is a real reason to
-  # move. Without this the router would flip between near-tied providers on
-  # every run, and each flip rebuilds the agent and resets the prompt cache.
-  current="$(hermes config get model.provider 2>/dev/null | tail -1 | tr -d '[:space:]')"
-  sticky_args=()
-  if [[ -n "${BASE[$current]:-}" ]]; then
-    sticky_args=(--sticky "$current")
-  fi
-
-  if ! out="$(cd "$ROUTER_DIR" && ./router.py --dry-run --json "${sticky_args[@]}" 2>/dev/null)"; then
-    echo "Router failed to produce a decision; leaving Hermes config untouched." >&2
-    exit 3
-  fi
-  chosen="$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("chosen") or "")')"
-  reason="$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("reason") or "")')"
-  if [[ -z "$chosen" ]]; then
-    # Router refused (everything exhausted). Do not guess.
-    echo "Router refused to choose: $reason" >&2
-    echo "Leaving Hermes config untouched." >&2
-    exit 4
-  fi
-fi
-
-model_id="$(model_id_for "$chosen")"
-if [[ -z "$model_id" ]]; then
-  echo "No model id for alias '$ALIAS' on $chosen — check MODEL_* tables in $0" >&2
-  exit 5
-fi
-
-if [[ "$mode" == "show" ]]; then
-  echo "Would set: provider=$chosen model=$model_id"
-  echo "Reason:    $reason"
-  exit 0
-fi
-
-hermes config set model.provider "$chosen" >/dev/null
-hermes config set model.default "$model_id" >/dev/null
-hermes config set model.base_url "${BASE[$chosen]}" >/dev/null
-echo "Routed to $chosen ($model_id)"
-echo "  reason: $reason"
+exec python3 "$ROUTER_DIR/apply.py" "$@"

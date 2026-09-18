@@ -1,0 +1,15 @@
+[Unit]
+Description=ds-router — steer Hermes to the healthiest LLM provider
+# Documentation points at the repo; %h expands to the user's home.
+Documentation=file://%h/Projects/ds-router/README.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+# ds-switch and apply.py call both `hermes` and `python3`. `hermes` lives in the
+# Hermes venv, which a supervisor-started unit does not inherit, so PATH must be
+# set explicitly. Adjust if Hermes is installed somewhere other than ~/.hermes.
+Environment=PATH=%h/.hermes/hermes-agent/venv/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/Projects/ds-router/ds-switch
+# A stuck quota poll must not stack up runs.
+TimeoutStartSec=120
