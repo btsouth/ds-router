@@ -9,6 +9,7 @@
 #     ./install.sh --no-service  files only: no timer and no service unit
 #     ./install.sh --no-symlink  do not create ~/.local/bin/ds-switch
 #     ./install.sh --yes         non-interactive; assume yes to offered steps
+#     ./install.sh --skip-preflight   do not run the test suites as a preflight
 #     ./install.sh --help
 #
 # Safe by default and idempotent: re-running it makes no further changes and
@@ -36,6 +37,7 @@ VERSION=1
 PROG=install.sh
 
 DRY_RUN=0
+SKIP_PREFLIGHT=0
 DO_SERVICE=1
 DO_SYMLINK=1
 ASSUME_YES=0
@@ -67,6 +69,7 @@ while [ $# -gt 0 ]; do
     --no-service)  DO_SERVICE=0 ;;
     --no-symlink)  DO_SYMLINK=0 ;;
     -y|--yes)      ASSUME_YES=1 ;;
+    --skip-preflight) SKIP_PREFLIGHT=1 ;;
     -h|--help)     usage; exit 0 ;;
     *) die "unknown argument: $1 (try --help)" ;;
   esac
@@ -312,7 +315,14 @@ fi
 # ---------------------------------------------------------------------------
 hdr "Preflight: test suites"
 tests_run=0
+if [ "$SKIP_PREFLIGHT" = 1 ]; then
+  # For test_install.py, which cannot run this installer's preflight without running
+  # itself, and for a re-run right after you ran the suites yourself. Not advertised
+  # as a way past a failing tree: it skips the check, it does not pass it.
+  skip "--skip-preflight: not running the suites here"
+fi
 for t in "$ROUTER_DIR"/test_*.py; do
+  [ "$SKIP_PREFLIGHT" = 1 ] && break
   [ -f "$t" ] || continue
   tests_run=$((tests_run + 1))
   name=$(basename "$t")
@@ -325,7 +335,9 @@ for t in "$ROUTER_DIR"/test_*.py; do
     Fix the failure above (or run: cd $ROUTER_DIR && python3 $name), then re-run."
   fi
 done
-if [ "$tests_run" = 0 ]; then
+if [ "$SKIP_PREFLIGHT" = 1 ]; then
+  :
+elif [ "$tests_run" = 0 ]; then
   warn "no test_*.py files found in $ROUTER_DIR — preflight skipped"
 else
   ok "$tests_run test suite(s) passed"
@@ -356,19 +368,21 @@ render_unit() {
 
 install_units_linux() {
   if ! command -v systemctl >/dev/null 2>&1; then
+    TIMER_STATE="NOT installed (no systemd on this system)"
     warn "systemd (systemctl) is not available on this system."
     cron_hint
     return 0
   fi
+  start_later=0
   if ! systemctl --user show-environment >/dev/null 2>&1; then
+    # Said after the writes below, not before them: printed here, "the units were
+    # still installed" reaches a reader who has not yet seen the part that installs
+    # them, and it reads as a contradiction.
+    start_later=1
+    TIMER_STATE="NOT active (no reachable systemd --user session)"
     warn "no reachable systemd --user session (are you in a login session?)."
-    note "the units were still installed; start them later with:"
-    note "  systemctl --user daemon-reload && systemctl --user enable --now ds-router.timer"
-    note "for a timer that survives logout, also run: loginctl enable-linger ${USER:-$(id -un)}"
-    do_mkdir "$SYSTEMD_USER_DIR"
-  else
-    do_mkdir "$SYSTEMD_USER_DIR"
   fi
+  do_mkdir "$SYSTEMD_USER_DIR"
 
   changed=0
   for src in "$ROUTER_DIR"/systemd/*.service "$ROUTER_DIR"/systemd/*.timer; do
@@ -400,10 +414,22 @@ install_units_linux() {
     run_cmd_soft systemctl --user enable --now ds-router.timer
     # Verify rather than assume: systemctl can fail against a bus that is not
     # reachable, and a silently un-enabled timer is a half-install.
-    if ! systemctl --user is-active ds-router.timer >/dev/null 2>&1; then
+    if systemctl --user is-active ds-router.timer >/dev/null 2>&1; then
+      TIMER_STATE="active"
+    elif [ "$start_later" = 1 ]; then
+      # The block below says this, more specifically: two near-identical warnings
+      # about the same missing bus is noise, and noise gets skimmed.
+      TIMER_STATE="NOT active (no reachable systemd --user session)"
+    else
+      TIMER_STATE="NOT active"
       warn "the timer is not active; start it with:"
       note "  systemctl --user daemon-reload && systemctl --user enable --now ds-router.timer"
     fi
+  fi
+  if [ "$start_later" = 1 ]; then
+    note "the units were still installed; start them later with:"
+    note "  systemctl --user daemon-reload && systemctl --user enable --now ds-router.timer"
+    note "for a timer that survives logout, also run: loginctl enable-linger ${USER:-$(id -un)}"
   fi
   note "check it with: systemctl --user list-timers ds-router.timer"
 }
@@ -461,6 +487,7 @@ PLIST_EOF
     fi
   fi
 
+  TIMER_STATE="plist written, NOT loaded (macOS)"
   say ""
   say "  systemd is Linux-only, so on macOS the equivalent is a launchd agent."
   say "  The plist above was written but deliberately NOT loaded: loading it needs"
@@ -477,7 +504,9 @@ PLIST_EOF
 }
 
 hdr "Service / timer"
+TIMER_STATE="not installed"
 if [ "$DO_SERVICE" = 0 ]; then
+  TIMER_STATE="not installed (--no-service)"
   skip "--no-service: printing what would have been installed, changing nothing"
   note "systemd units (Linux): $SYSTEMD_USER_DIR/ds-router.{service,timer}"
   note "launchd plist (macOS): $HOME/Library/LaunchAgents/com.ds-router.switch.plist"
@@ -538,7 +567,9 @@ if [ -x "$ROUTER_DIR/ds-switch" ] || [ "$DRY_RUN" = 1 ]; then
   check_out=$(cd "$ROUTER_DIR" && "$ROUTER_DIR/ds-switch" --check 2>&1) || check_rc=$?
   printf '%s\n' "$check_out" | sed 's/^/        /'
   if [ "$check_rc" = 0 ]; then
-    ok "ds-switch --check passed: the config can drive Hermes"
+    # The check's own summary, not a claim of our own: "config OK" and "no provider
+    # key is set" are different statements and the installer should not merge them.
+    ok "ds-switch --check passed: $(printf '%s\n' "$check_out" | tail -n 1)"
   else
     warn "ds-switch --check reported problems (exit $check_rc) — the files are installed,"
     warn "but Hermes will not be steered correctly until the errors above are fixed."
@@ -587,6 +618,7 @@ say "  project   : $ROUTER_DIR"
 say "  try it    : cd $ROUTER_DIR && ./ds-switch --show     # decide, write nothing"
 say "              cd $ROUTER_DIR && ./ds-switch            # apply the decision"
 say "  verify    : ./ds-switch --check"
+say "  timer     : $TIMER_STATE"
 say "  uninstall : $ROUTER_DIR/uninstall.sh --dry-run       # then without --dry-run"
 if [ "$DRY_RUN" = 1 ]; then
   say ""

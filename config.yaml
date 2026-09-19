@@ -96,9 +96,11 @@ routing:
   # endpoints a second time.
   #
   # Any tool that already polls these usage APIs and drops the result as one JSON
-  # file per provider (`<provider>-quota.json`) can be used as the cache. If you
-  # have no such tool, this does nothing: the directory is absent, so ds-router
-  # polls directly. Nothing else in the project depends on it.
+  # file per provider can be used as the cache. The names are fixed, and one of
+  # them is not the provider's: commandcode-quota.json, go-quota.json (OpenCode
+  # Go), ollama-quota.json, clinepass-quota.json. If you have no such tool, this
+  # does nothing: the directory is absent, so ds-router polls directly. Nothing
+  # else in the project depends on it.
   #
   # Point this at wherever your cache lives, or set reuse_collector_state: false
   # to always poll.
@@ -109,7 +111,7 @@ routing:
 # windows, and the windows barely overlap, which makes time-of-day a real
 # routing dimension rather than a curiosity.
 #
-#   commandcode: peak 01-04 and 06-10 UTC, Mon-Fri  (6h/day at 2x)
+#   commandcode: peak 01-04 and 06-10 UTC, Mon-Fri  (7h/day at 2x)
 #   ollama:      peak 12-18 UTC, Mon-Fri             (6h/day at 2x)
 #
 # Between 12:00 and 18:00 UTC, Ollama pays double and CommandCode does not.
@@ -138,8 +140,9 @@ peak:
 # checked, and there is deliberately no flag that turns verification off. A private or
 # self-signed certificate is trusted by naming its CA below. Plain http also works, on
 # a tailnet or LAN address, and means the password crosses that segment unencrypted.
-# A dashboard under a URL prefix, a wildcard address, a URL carrying userinfo, and a
-# CA file that cannot be loaded are each refused with a message saying so.
+# A dashboard under a URL prefix, a wildcard address, a URL carrying userinfo, a CA
+# file that cannot be loaded, and a CA file given for a plaintext origin are each
+# refused with a message naming the argument to fix.
 #
 # The backend must be on this machine: its sessions' providers are read from the local
 # state.db, so a backend on another host needs its own copy of this router.

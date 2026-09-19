@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Tests for install.sh: the one component that writes outside the repo.
+
+It had no automated coverage at all, and the reason was real: install.sh runs every
+test suite as its preflight, so a suite that runs install.sh would run itself. The
+`--skip-preflight` flag exists for this file (and for a re-run right after you ran the
+suites yourself).
+
+The first test below is not a formality. The usage text is rendered by stripping `#`
+from the leading comment block, so a single un-commented line in that block becomes a
+command the shell executes on startup. That happened: a help line lost its `#` and the
+installer re-ran itself with its own help text as arguments, forking until the box
+refused. `sh -n` passes a line like that, and so does `shellcheck`, because it is
+valid shell. Running `--help` and noticing it never returns is what catches it.
+"""
+from __future__ import annotations
+
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+import testkit
+
+INSTALL = HERE / "install.sh"
+
+
+def check(label: str, ok: bool, detail: str = "") -> None:
+    """A named assertion: raise, so the runner reports the test, the label and the line."""
+    if not ok:
+        raise AssertionError(label + (f": {detail}" if detail else ""))
+
+
+def fake_systemctl(tmp: pathlib.Path, *, bus: bool) -> pathlib.Path:
+    """A `systemctl` stand-in, so these tests never touch the real user manager.
+
+    With `bus=False` it answers the way a box with no reachable `systemd --user`
+    session does: `show-environment` fails, so the installer cannot enable anything.
+    """
+    binary = tmp / "systemctl"
+    binary.write_text(
+        "#!/bin/sh\n"
+        f'BUS={1 if bus else 0}\n'
+        'for arg in "$@"; do\n'
+        '  case $arg in\n'
+        '    show-environment) [ "$BUS" = 1 ] || exit 1 ; exit 0 ;;\n'
+        '    is-active) [ "$BUS" = 1 ] || exit 3 ; echo active ; exit 0 ;;\n'
+        '  esac\n'
+        'done\n'
+        'exit 0\n')
+    binary.chmod(0o755)
+    return binary
+
+
+def fake_hermes(tmp: pathlib.Path) -> pathlib.Path:
+    """A `hermes` stand-in, so this suite needs no Hermes install and no real config.
+
+    install.sh refuses to run without the CLI on PATH, and `ds-switch --check` reads
+    the config through it. The notice below is the one Hermes prints for a key that is
+    not set, which apply.py must treat as an answer rather than a failed read.
+    """
+    binary = tmp / "hermes"
+    binary.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '  *"config get"*) echo "Config key not set: $3" >&2 ; exit 1 ;;\n'
+        'esac\n'
+        'exit 0\n')
+    binary.chmod(0o755)
+    return binary
+
+
+def run_install(tmp: pathlib.Path, *args: str, bus: bool = True,
+                keys: dict[str, str] | None = None,
+                timeout: int = 120) -> subprocess.CompletedProcess:
+    """Run the installer against a throwaway home, with nothing of the caller's.
+
+    The environment is built rather than inherited: an exported HERMES_HOME or a real
+    provider key in the calling shell would make a sandbox test pass while the same
+    code fails on a stranger's machine.
+    """
+    fake = fake_systemctl(tmp, bus=bus)
+    fake_hermes(tmp)
+    home = tmp / "home"
+    (home / ".hermes").mkdir(parents=True, exist_ok=True)
+    env = {
+        # Only the fakes and the system tools: the caller's PATH would let the real
+        # hermes and a real systemctl leak into what is meant to be a sandbox.
+        "PATH": f"{fake.parent}:/usr/local/bin:/usr/bin:/bin",
+        "HOME": str(home),
+        "HERMES_HOME": str(home / ".hermes"),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_STATE_HOME": str(home / ".state"),
+        "XDG_RUNTIME_DIR": str(tmp),
+        "LC_ALL": "C",
+    }
+    if keys:
+        env.update(keys)
+    return subprocess.run([str(INSTALL), *args], capture_output=True, text=True,
+                          env=env, cwd=str(HERE), timeout=timeout)
+
+
+def test_help_returns_and_prints_its_header(tmp: pathlib.Path) -> None:
+    """A stray un-commented line in the header block makes the installer run itself."""
+    try:
+        proc = run_install(tmp, "--help", timeout=30)
+    except subprocess.TimeoutExpired:
+        raise AssertionError(
+            "install.sh --help did not return: a line in the header comment block is "
+            "executing, which re-runs the installer with the help text as arguments")
+    check("--help exits 0", proc.returncode == 0, str(proc.returncode))
+    check("the header is printed", "./install.sh --dry-run" in proc.stdout, proc.stdout[:200])
+    check("the new flag is documented", "--skip-preflight" in proc.stdout)
+    check("nothing recursed", "shell level" not in proc.stderr, proc.stderr[:200])
+    check("no argument was misread", "unknown argument" not in proc.stderr, proc.stderr[:200])
+
+
+def test_a_dry_run_writes_nothing_and_reports_the_timer_state(tmp: pathlib.Path) -> None:
+    """The banner has to carry the timer's state, not just the word Installed."""
+    proc = run_install(tmp, "--dry-run", "--skip-preflight", "--yes", bus=False)
+    check("the dry run exits 0", proc.returncode == 0, proc.stderr[-300:])
+    written = [p.name for p in (tmp / "home").rglob("*") if p.is_file()
+               and ".hermes" not in str(p)]
+    check("nothing was written", not written, str(written))
+    check("the banner says the timer is not active",
+          "NOT active (no reachable systemd --user session)" in proc.stdout,
+          proc.stdout[-400:])
+    check("it says the units were still installed",
+          "the units were still installed" in proc.stdout, proc.stdout[-400:])
+
+    # The note used to be printed before the writes it describes, which reads as a
+    # contradiction: say the units are installed before saying you install them.
+    install_line = next(i for i, line in enumerate(proc.stdout.splitlines())
+                        if "ds-router.timer" in line and "dry" in line)
+    note_line = next(i for i, line in enumerate(proc.stdout.splitlines())
+                     if "the units were still installed" in line)
+    check("the note comes after the write it describes", note_line > install_line,
+          f"install at {install_line}, note at {note_line}")
+
+
+def test_a_reachable_bus_reports_the_timer_active(tmp: pathlib.Path) -> None:
+    proc = run_install(tmp, "--dry-run", "--skip-preflight", "--yes", bus=True)
+    check("the dry run exits 0", proc.returncode == 0, proc.stderr[-300:])
+    check("the banner says the timer is active", "timer     : active" in proc.stdout,
+          proc.stdout[-400:])
+    check("and it does not warn about a missing session",
+          "the units were still installed" not in proc.stdout, proc.stdout[-400:])
+
+
+def test_the_installer_repeats_the_check_summary_rather_than_its_own(
+        tmp: pathlib.Path) -> None:
+    """`config OK` and `no provider key is set` are different statements.
+
+    The installer used to print "the config can drive Hermes" over the check's own
+    output saying no key was set, which is the sentence a reader takes away.
+    """
+    proc = run_install(tmp, "--dry-run", "--skip-preflight", "--yes")
+    check("the dry run exits 0", proc.returncode == 0, proc.stderr[-300:])
+    passed = [line for line in proc.stdout.splitlines() if "--check passed" in line]
+    check("the check ran", bool(passed), proc.stdout[-400:])
+    check("the banner repeats the real summary, not a nicer one",
+          "no provider key is set" in passed[0], passed[0])
+
+
+if __name__ == "__main__":
+    raise SystemExit(testkit.run(globals(), scratch_prefix="ds-install-"))

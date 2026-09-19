@@ -794,7 +794,13 @@ class _WSClient:
         verifies: a certificate that does not validate, or one issued for a different
         name, stops the upgrade here rather than sending a ticket to whatever answered.
         """
-        context = self.ssl_context or ssl.create_default_context()
+        context = self.ssl_context
+        if context is None:
+            # Nothing in the project builds a wss URL without one (LiveTransport always
+            # passes the gateway's), so this fallback was dead. Inventing a context here
+            # would hide a caller that forgot the trust decision instead of naming it.
+            raise TransportError(
+                f"a wss:// upgrade to {host} needs a TLS context and this client has none")
         try:
             return context.wrap_socket(sock, server_hostname=host)
         except ssl.SSLCertVerificationError as exc:
@@ -948,6 +954,9 @@ class Gateway:
         # Gateway is a public shape a caller can build by hand: an invariant that only
         # the configuration path enforces is not an invariant. `resolve_gateway` still
         # says more about the likely mistake.
+        if not isinstance(self.port, int) or isinstance(self.port, bool) \
+                or not 0 < self.port < 65536:
+            raise GatewayAuthError(f"a gateway port is 1-65535, got {self.port!r}")
         if "[" in self.host or "]" in self.host:
             raise GatewayAuthError(
                 f"a gateway host is a bare literal, not a bracketed one: pass "
@@ -1017,7 +1026,7 @@ def read_gateway_credential(path: Path) -> "Credential":
 
     * ``label: value`` (what Hermes' LAN dashboard file holds)
     * ``label value``, indented or not, with a title line and prose paragraphs
-      around it (what a hand-written devbox file holds)
+      around it (what a hand-written file holds)
 
     Anything else that is a single line is taken as a bare secret, which keeps a
     hand-made ``chmod 600`` file working. Neither value is ever printed.
@@ -1062,7 +1071,7 @@ def read_gateway_credential(path: Path) -> "Credential":
             origins.append(tokens[0])
     return Credential(
         username=str(fields.get("username") or fields.get("user") or "").strip(),
-        password=password, origins=tuple(origins), source=str(path))
+        password=password, origins=tuple(origins))
 
 
 @dataclass
@@ -1072,7 +1081,6 @@ class Credential:
     username: str
     password: str = field(repr=False)
     origins: tuple[str, ...] = ()
-    source: str = ""
 
 
 def _is_certificate_failure(exc: BaseException) -> bool:
@@ -1179,7 +1187,10 @@ def resolve_gateway(url: str, *, username: Optional[str] = None,
             f"{safe!r} carries a URL prefix, and a gated gateway must be an origin: the "
             f"sign-in and ticket paths are fixed, so a dashboard served under a subpath "
             f"is not supported")
-    if parts.hostname in ("0.0.0.0", "::", "[::]"):
+    # One predicate for "every interface": the tuple this replaced missed `[::0]`,
+    # `0:0:0:0:0:0:0:0` and `::ffff:0.0.0.0`, and carried an unreachable `[::]`
+    # (urlsplit has already stripped the brackets by the time a hostname is read).
+    if _is_wildcard_host(parts.hostname or ""):
         raise GatewayAuthError(
             f"{safe!r} is a wildcard address, which is what a server binds to, not what a "
             f"client connects to: use the host you reach that backend on (its tailnet "
@@ -1294,8 +1305,12 @@ def _check_file_mode(path: Path) -> None:
     """
     try:
         mode = path.stat().st_mode & 0o777
-    except OSError:
-        return  # the read itself already reported a missing file
+    except OSError as exc:
+        # The read already succeeded, so this is exotic: a race, or a filesystem without
+        # modes. Skipping the check on a file that holds a password is the wrong way to
+        # handle that, so refuse instead.
+        raise GatewayAuthError(
+            f"cannot read the mode of the gateway credential file {path}: {exc}") from exc
     if mode & 0o077:
         raise GatewayAuthError(
             f"the gateway credential file {path} is mode {mode:03o}, which other users can "
@@ -1614,7 +1629,6 @@ class LiveTransport(Transport):
                  gateway: Optional[Gateway] = None,
                  timeout: float = 10.0) -> None:
         self.timeout = float(timeout)
-        self.gateway = gateway
         self.backend = self._resolve(port=port, token=token, pid=pid, gateway=gateway)
         self.host = host
         self._ws: Optional[_WSClient] = None
@@ -1786,19 +1800,6 @@ def _session_columns(con: sqlite3.Connection) -> set[str]:
 # provider name makes those sessions look unmanaged, so their real provider's load
 # is undercounted and they are never spread.
 _GENERIC_PROVIDER = "custom"
-
-
-def _config_provider(model_config: Any) -> str:
-    """The provider named inside a session's stored model config, or ''."""
-    if not model_config:
-        return ""
-    try:
-        parsed = json.loads(model_config) if isinstance(model_config, str) else model_config
-    except (TypeError, ValueError):
-        return ""
-    if isinstance(parsed, dict) and parsed.get("provider"):
-        return str(parsed["provider"])
-    return ""
 
 
 def _provider_of(billing_provider: Any, model_config: Any) -> str:

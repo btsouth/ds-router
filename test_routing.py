@@ -342,9 +342,50 @@ def test_a_cap_that_cannot_be_read_is_refused_by_both_entry_points():
     assert "caps block" in stderr.getvalue(), stderr.getvalue()
 
 
+def test_a_failed_reading_is_not_a_number_in_the_table():
+    """The human table printed the 9.9 sentinel where the JSON says null.
+
+    A sentinel in a column headed `usage` reads as a measurement, which is the one
+    thing an unreadable provider must never look like.
+    """
+    import io
+    import tempfile
+    from contextlib import redirect_stdout
+    from pathlib import Path as P
+    import router as R
+    cfg = P(tempfile.mkdtemp(prefix="ds-sentinel-")) / "config.yaml"
+    cfg.write_text(
+        "default_model: ds\nrouting:\n  concurrency:\n    caps:\n      commandcode: 3\n"
+        "providers:\n  commandcode:\n    base_url: https://127.0.0.1:9/v1\n"
+        "    key_env: DS_TEST_NO_SUCH_KEY\n"
+        "models:\n  ds:\n    commandcode: m\n")
+    real_config = R.CONFIG
+    old_argv = sys.argv
+    R.CONFIG = cfg
+    sys.argv = ["router.py", "--dry-run"]
+    out = io.StringIO()
+    try:
+        with redirect_stdout(out):
+            R.main()
+    finally:
+        R.CONFIG = real_config
+        sys.argv = old_argv
+    body = out.getvalue()
+    assert "9.9" not in body, body
+    assert "no reading" in body, body
+    row = next(line for line in body.splitlines() if line.strip().startswith("commandcode"))
+    assert row.split()[2] == "-", row
+
+
+def test_a_malformed_peak_span_is_refused_not_skipped():
     """A span written as [12, 18] instead of [[12, 18]] used to be skipped, which
     says "this provider is never at peak" and makes the tie-break prefer it for the
-    whole window on the strength of a claim that failed to parse."""
+    whole window on the strength of a claim that failed to parse.
+
+    These assertions used to sit inside the test above with no `def` of their own, so a
+    failure here was reported under that test's name, and an early return added above
+    would have deleted this coverage without a word.
+    """
     import peak as pk
     friday_1230 = 1789734600.0  # 2026-09-18 12:30 UTC, a Friday
     assert pk.in_peak([[12, 18]], friday_1230) is True

@@ -338,7 +338,7 @@ def test_credential_file_reads_the_space_separated_shape(scratch: Path) -> None:
 
 
 def test_an_annotated_origin_line_yields_only_the_url(scratch: Path) -> None:
-    """The real devbox file annotates its second origin on the same line.
+    """The real file annotates its second origin on the same line.
 
     Reading the annotation as part of the URL is not cosmetic: it made the comparison
     raise, and the raise took the whole run down before any credential was sent.
@@ -677,6 +677,16 @@ def test_the_config_path_is_honoured(scratch: Path) -> None:
         check("the sign-in used that config's credential", gate.logins == 1, str(gate.logins))
 
 
+def test_port_and_token_are_reported_as_ignored_with_a_gateway(scratch: Path) -> None:
+    with FakeGate() as gate:
+        proc = _run_placement("--plan", "--config", _wrote_config(scratch),
+                              "--gateway", gate.origin, "--gateway-user", "bts",
+                              "--gateway-password-file", str(gate.credential_file(scratch)),
+                              "--port", "9118", "--token", "tok")
+        check("the inert flags are called out",
+              "--port/--token are ignored" in proc.stderr, proc.stderr[-300:])
+
+
 def test_a_credential_failure_refuses_rather_than_planning_from_the_store(scratch: Path) -> None:
     """The failure that must never degrade into a plan.
 
@@ -919,8 +929,13 @@ def test_a_gateway_refuses_a_host_it_cannot_dial() -> None:
 
 def test_an_ipv6_origin_is_the_same_origin_however_it_is_written() -> None:
     """Otherwise a credential file naming the host it is for produces a false warning."""
-    check("bracketed against bracketed", pl._same_authority("https://[::1]:9119", "[::1]:9119"))
-    check("unbracketed against bracketed", pl._same_authority("https://[::1]:9119", "[::1]:9119"))
+    # The authority a Gateway builds is the form this compares against, so build one:
+    # the line this replaced compared the same two constants twice.
+    literal = pl.Gateway(host="::1", port=9119, username="u", password="p")
+    check("a bracketed origin against the authority a Gateway builds",
+          pl._same_authority("https://[::1]:9119", literal.authority), literal.authority)
+    check("a name that merely looks similar is not the same host",
+          not pl._same_authority("https://[::12]:9119", literal.authority), literal.authority)
     check("a different port is still different",
           not pl._same_authority("https://[::1]:9119", "[::1]:9120"))
 
@@ -944,6 +959,80 @@ def test_ticket_urls_are_wss_under_https() -> None:
     check("the ticket is quoted", "ticket=a%20b" in secure.ticket_url("a b"))
     plain = pl.Gateway(host="devbox", port=9119, username="u", password="p")
     check("http stays ws", plain.ticket_url("t").startswith("ws://devbox:9119/api/ws?ticket=t"))
+
+
+def test_a_gateway_refuses_a_scheme_it_cannot_speak() -> None:
+    """The dataclass check, not only the one in resolve_gateway."""
+    for scheme in ("ftp", "ws", ""):
+        try:
+            pl.Gateway(host="h", port=9119, username="u", password="p", scheme=scheme)
+        except pl.GatewayAuthError as exc:
+            check(f"scheme {scheme!r} is refused", "http or https" in str(exc), str(exc))
+        else:
+            raise AssertionError(f"a Gateway claiming {scheme!r} was constructed")
+
+
+def test_a_gateway_refuses_a_port_it_cannot_dial() -> None:
+    for port in (0, -1, 65536, "9119", True):
+        try:
+            pl.Gateway(host="h", port=port, username="u", password="p")  # type: ignore[arg-type]
+        except pl.GatewayAuthError as exc:
+            check(f"port {port!r} is refused", "1-65535" in str(exc), str(exc))
+        else:
+            raise AssertionError(f"{port!r} was accepted as a gateway port")
+
+
+def test_a_credential_error_is_a_transport_error() -> None:
+    """Callers catch TransportError to mean "no backend", so the hierarchy is a contract."""
+    check("GatewayAuthError is a TransportError",
+          issubclass(pl.GatewayAuthError, pl.TransportError))
+    check("and so is NotSentError", issubclass(pl.NotSentError, pl.TransportError))
+
+
+def test_a_wss_upgrade_needs_a_tls_context() -> None:
+    """A caller that forgot the trust decision is told, rather than handed a default."""
+    port, _ = _fake_upgrade(b"HTTP/1.1 101 Switching Protocols\r\n", accept=True)
+    client = pl._WSClient(f"wss://127.0.0.1:{port}/api/ws?ticket=t", timeout=5.0)
+    try:
+        client.connect()
+    except pl.TransportError as exc:
+        check("the refusal says a context is required", "needs a TLS context" in str(exc),
+              str(exc))
+        return
+    raise AssertionError("a wss upgrade without a context was attempted")
+
+
+def test_a_tls_handshake_against_a_plaintext_server_is_named() -> None:
+    """The other half of the wrap: not a certificate failure, a handshake that cannot work."""
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = int(server.getsockname()[1])
+
+    def serve_plaintext() -> None:
+        try:
+            conn, _ = server.accept()
+        except OSError:
+            return
+        try:
+            conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    threading.Thread(target=serve_plaintext, daemon=True).start()
+    client = pl._WSClient(f"wss://127.0.0.1:{port}/api/ws?ticket=t", timeout=5.0,
+                          ssl_context=ssl.create_default_context())
+    try:
+        client.connect()
+    except pl.TransportError as exc:
+        check("the refusal names the handshake", "TLS handshake with" in str(exc), str(exc))
+        check("it is not reported as a certificate problem",
+              "could not be verified" not in str(exc), str(exc))
+        return
+    raise AssertionError("a plaintext server completed a TLS handshake")
 
 
 def test_a_gateway_refuses_a_ca_file_it_cannot_use() -> None:
@@ -1265,9 +1354,13 @@ def test_a_refused_upgrade_never_costs_a_sign_in(scratch: Path) -> None:
     Dropping the cookie on any refusal would spend a rate-limited sign-in on a refusal
     that was never about the credential.
     """
+    # The message has to look like the one _WSClient really raises, or a regression to
+    # matching on the text (" 401" in the message) stays green. Verified: with the
+    # pre-fix `_connect` restored and a realistic message here, this test goes red.
     for status in (401, 403, 500, None):
-        error = (pl.TransportError("upgrade refused", status=status) if status
-                 else pl.TransportError("connection reset by peer"))
+        error = (pl.TransportError(
+            f"websocket upgrade refused: HTTP/1.1 {status} Something", status=status)
+            if status else pl.TransportError("connection reset by peer"))
         _, session = _connect_failure(error, scratch)
         check(f"{error} kept the cookie", session.forgotten == 0, str(session.forgotten))
 
@@ -1295,6 +1388,17 @@ def test_the_gateway_block_is_dormant_when_absent(scratch: Path) -> None:
         check("a configured block builds a gateway", isinstance(built, pl.Gateway))
         assert isinstance(built, pl.Gateway)
         check("the config username is picked up", built.username == "bts", built.username)
+
+        os.environ["DS_TEST_GATEWAY_PW"] = SECRET
+        try:
+            from_env = pl.gateway_from_config({"gateway": {
+                "url": gate.origin, "username": "bts",
+                "password_env": "DS_TEST_GATEWAY_PW"}})
+            assert isinstance(from_env, pl.Gateway)
+            check("password_env reaches the gateway",
+                  from_env.source == "$DS_TEST_GATEWAY_PW", from_env.source)
+        finally:
+            os.environ.pop("DS_TEST_GATEWAY_PW", None)
 
 
 def test_a_malformed_gateway_block_refuses_rather_than_ignoring(scratch: Path) -> None:
@@ -1331,7 +1435,7 @@ def test_the_ca_file_plumbs_through_the_flag_and_the_config(scratch: Path) -> No
             _Args(gateway_ca_file=str(cert)))
         assert isinstance(from_flag, pl.Gateway)
         check("the flag's CA is used", from_flag.ca_file == str(cert), str(from_flag.ca_file))
-        check("no secret leaks into the repr", "password" not in repr(from_flag), repr(from_flag))
+        check("the secret is not in the repr", SECRET not in repr(from_flag), repr(from_flag))
 
 
 def test_explicit_flags_win_over_the_config_block(scratch: Path) -> None:

@@ -223,6 +223,7 @@ health-check show false failures.
 
 ## What to do with ClinePass
 
-Rejected for this project. An Agent Pass is a plan for an agent, not an API plan,
-so its terms are the constraint rather than its usage API. Keep it as a manual
-option.
+It is wired in, and the sections above are the record of why: an Agent Pass is a
+plan for an agent, so the terms of use are the real constraint, but its usage API
+does report the windows this router needs, and its caps are unstated rather than
+absent. Read the sections above before deciding anything about it.

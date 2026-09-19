@@ -99,7 +99,9 @@ the blast radius is real and worth knowing before it fires.
 ## Open questions, answered since
 
 - **Is queue-then-reject observable as a status?** Yes: HTTP 429, measured at
-  ~0.15 s when a provider is over its cap, while the rest queue 40-80 s. That is
-  why the planner counts requests in flight instead of treating a cap as a wall.
+  ~0.15 s when a provider is over its cap, while the rest queue 40-80 s. The cap is
+  still a hard limit: the planner never assigns more sessions to a provider than it
+  allows, and it counts the requests that provider is already running before it
+  does, so what it refuses is filling the queue rather than the cap.
 - **Do CommandCode and OpenCode Go have comparable caps?** Only Ollama documents
   one (3 concurrent), so `config.yaml` declares a cap only where one is published.

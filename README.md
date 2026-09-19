@@ -21,6 +21,22 @@ month at their list rates. That gap is the reason to run the router: it is what
 lets you actually use all of it instead of hammering one subscription until it
 throttles you.
 
+## Before you start: add your keys
+
+ds-router reads provider API keys from `~/.hermes/.env`, the same file Hermes
+uses. It does not store credentials itself and never writes them anywhere.
+
+```sh
+# ~/.hermes/.env
+COMMANDCODE_API_KEY=...
+OPENCODE_GO_API_KEY=...
+OLLAMA_API_KEY=...
+HERMES_CUSTOM_CLINEPASS_API_KEY=...
+```
+
+Only the providers you actually have need entries. Delete the others from
+`config.yaml` and ds-router will ignore them.
+
 ## Quick start
 
 ```sh
@@ -34,8 +50,9 @@ Any clone location works — the installer rewrites the systemd units and the
 manifest to wherever you put it, so `~/ds-router` or a nested path is fine.
 
 `install.sh` checks your prerequisites, runs the test suite as a preflight,
-installs a systemd timer (Linux) or writes a launchd job (macOS), enables it, and
-verifies the result. **It does not touch your Hermes config** — installing and
+installs and enables a systemd timer (Linux), or writes a launchd job (macOS)
+and prints the two commands that load it, because loading someone's launchd job
+unasked is not the installer's call. **It does not touch your Hermes config** — installing and
 routing are separate steps.
 
 Preview what the router would choose before enabling anything:
@@ -68,22 +85,6 @@ just another entry in `config.yaml`.
 It becomes useful at two: that is when "which one still has quota" stops having an
 obvious answer.
 
-## Before you start: add your keys
-
-ds-router reads provider API keys from `~/.hermes/.env`, the same file Hermes
-uses. It does not store credentials itself and never writes them anywhere.
-
-```sh
-# ~/.hermes/.env
-COMMANDCODE_API_KEY=...
-OPENCODE_GO_API_KEY=...
-OLLAMA_API_KEY=...
-HERMES_CUSTOM_CLINEPASS_API_KEY=...
-```
-
-Only the providers you actually have need entries. Delete the others from
-`config.yaml` and ds-router will ignore them.
-
 ## Commands
 
 | command | what it does |
@@ -97,12 +98,33 @@ Only the providers you actually have need entries. Delete the others from
 | `./router.py --dry-run --health` | Also probe each provider with a real request |
 | `./router.py --dry-run --json` | Machine-readable output |
 | `./router.py --list-models` | Fetch each provider's live catalog |
-| `./placement.py` | Spread your open sessions across providers (see below) |
+| `./placement.py --plan` | Show the spread it would apply, write nothing |
+| `./placement.py --apply` | Actually move sessions (see below) |
 | `./placement.py --plan --gateway <url>` | Plan against a gated backend, signing in as a browser does |
 | `python3 run_tests.py` | Run every test suite |
+| `systemctl --user list-timers ds-router.timer` | What the timer is doing, and when it fires next |
+| `journalctl --user -u ds-router.service` | What the last tick decided, and why |
 
 Every command that changes something has a read-only counterpart. `--show`,
-`--check`, `--dry-run`, and `--plan` never write.
+`--check`, `--dry-run`, and `--plan` never write to the Hermes config. They do call
+the `hermes` CLI, which bootstraps `~/.hermes` (a skills directory, a log, an empty
+session store) the first time it runs.
+
+### Exit codes
+
+| code | meaning |
+|---|---|
+| `1` | nothing usable: `router.py` found no provider it can use, `ds-switch --check` found a problem, or no providers are declared |
+| `2` | refused before doing anything: an argument it cannot accept (a wildcard address, userinfo in the URL, a CA file with no `https` to use it on), an unreadable concurrency cap, or an unknown provider |
+| `3` | `ds-switch` could not get a decision out of the router; `placement.py --apply` found no reachable backend |
+| `4` | the router refused to choose, so the Hermes config was left untouched |
+| `5` | a file could not be written or read: the Hermes config (`ds-switch`), or the session store or provider join (`placement.py`) |
+| `6` | the Hermes config could not be read (`ds-switch`), which is not the same as it being absent |
+| `7` | `placement.py` was handed a `caps:` block it cannot read |
+
+A `--health` run that finds every provider unhealthy exits `1`, the same code as "no
+provider is usable", so read the output rather than only the status when you script a
+monitor.
 
 ## Spreading many sessions
 
@@ -236,10 +258,13 @@ process on the machine. With no `gateway:` block and no `--gateway`, nothing
 changes and discovery stays on the token path described above.
 
 Some shapes are refused up front with a message saying what to do instead, rather
-than accepted and then failing halfway: a dashboard served under a URL prefix, a
-wildcard address such as `0.0.0.0`, a URL with a username or password inside it, and
-a CA file that cannot be loaded or is given for a plaintext origin. Those need the
-second-backend recipe below.
+than accepted and then failing halfway: a wildcard address such as `0.0.0.0` (name
+the host you reach that backend on), a URL with a username or password inside it
+(pass the credential as a file or an environment variable), and a CA file that
+cannot be loaded or is given for a plaintext origin (fix the path, or drop it).
+Each of those is a bad argument, not a missing feature. A dashboard served under a
+URL prefix is the one shape that needs somewhere else to stand: it is a different
+backend's reverse proxy, which is what the loopback recipe below is for.
 
 Verified against a real gated backend: the plan listed 13 open sessions that the token
 path cannot see at all; a throwaway session created through the same ticket was moved
@@ -411,12 +436,19 @@ reason, plus a 53s median response time. See `docs/token-harbor.md`.
   than being silently trusted, and "everything is exhausted" is reported instead
   of papered over. When nothing is safely readable it degrades to the best
   available provider rather than refusing to choose — being wrong is recoverable,
-  stalling is not.
+  stalling is not. What does refuse is evidence about the provider itself: hard
+  exhaustion, or a `--health` probe that failed, with no other provider to fall back
+  to. That is not a gap in the readings, it is a reason to think the provider is
+  down, and moving onto it would not help.
 - **Health probes use a realistic token budget.** At `max_tokens: 1` at least one
   provider answers HTTP 500 where others return a truncated success, which
   reported a healthy provider as dead.
 - **No response bodies in errors.** Quota failures surface a type and message
-  only, never a body that could carry credential-bearing fields.
+  only, never a body that could carry credential-bearing fields. The one exception is
+  the gated path, which carries at most 200 characters of the server's own `detail`
+  in the message (with the password scrubbed out of it): a dashboard refusal is
+  usually explained in that field, and a bare status code would send the reader
+  looking in the wrong place.
 - **`x-opencode-session`** is forwarded upstream, or OpenCode Go rejects the
   request with `400 MissingSessionID`.
 - **A gated backend is reached the way a browser reaches it, and the credential is
@@ -468,14 +500,14 @@ Claims in this README that have been measured, rather than reasoned about:
   the read windows both named) instead of scoring as a plan with fewer limits.
 - Two independent audits of this codebase (one hunting swallowed failures, one
   hunting untested failure modes) found ten real defects, all fixed, each with the
-  test that would have caught it: an unreadable session store rewriting the whole
+  test that would have caught it. Four of them: an unreadable session store rewriting the whole
   fleet, `apply` reporting success for replies that meant nothing had happened, a
   crafted clone path executing as shell through the uninstall manifest, and a
   reading that could not be trusted scoring as the healthiest provider. Five tests
   that could not fail were rewritten, and the transport and concurrency layers, which
   had no tests at all, now have 18 between them.
 - The gated path, against real gated backends (over https and plain http) and a
-  loopback fake (`test_gateway.py`, 57 tests). Live: 13 open sessions read from a
+  loopback fake with its own suite (`test_gateway.py`). Live: 13 open sessions read from a
   backend whose token path cannot reach it, and a write verified three ways (the RPC
   reply, the live session listing, and `state.db`) on a throwaway session that was
   then deleted, including a mid-turn move that came back `deferred: true` and landed
@@ -507,8 +539,8 @@ Claims that are reasoned but **not** verified end to end are flagged inline.
 - `openssl` for the test suite only: the TLS checks generate a throwaway certificate
   per run rather than shipping a private key in the repo, and they fail loudly without
   it
-- Linux (systemd user units) or macOS (installer prints the launchd/cron
-  equivalent; the router itself is pure Python and POSIX sh)
+- Linux (systemd user units) or macOS (the installer writes a launchd plist and
+  prints the commands that load it; the router itself is pure Python and POSIX sh)
 
 ## Limits
 

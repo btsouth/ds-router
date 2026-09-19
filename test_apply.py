@@ -192,6 +192,43 @@ def test_current_value_reads_through_the_not_set_notice(tmp: pathlib.Path) -> No
     check("the message names the binary", "hermes" in (raised or ""), str(raised))
 
 
+def test_check_says_so_when_no_provider_key_is_set(tmp: pathlib.Path) -> None:
+    """`config OK` and `no key is set` are different statements, and install.sh repeats
+    this line, so one must not be printed as the other."""
+    import io
+    from contextlib import redirect_stdout
+    cfg = {"default_provider": "commandcode", "default_model": "ds"}
+    providers = {"commandcode": {"base_url": "https://x/v1",
+                                 "key_env": "DS_TEST_ABSENT_KEY"}}
+    models = {"ds": {"commandcode": "m"}}
+    os.environ.pop("DS_TEST_ABSENT_KEY", None)
+    previous_home = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = str(tmp)          # an empty .env, not the developer's
+    try:
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = A.check(cfg, providers, models, "ds")
+        check("a keyless but consistent config still exits 0", code == 0,
+              f"{code} {out.getvalue()}")
+        check("the summary says no key is set",
+              "no provider key is set" in out.getvalue(), out.getvalue())
+
+        os.environ["DS_TEST_ABSENT_KEY"] = "x"
+        try:
+            out = io.StringIO()
+            with redirect_stdout(out):
+                A.check(cfg, providers, models, "ds")
+        finally:
+            os.environ.pop("DS_TEST_ABSENT_KEY", None)
+        check("with a key present the caveat is gone",
+              "no provider key is set" not in out.getvalue(), out.getvalue())
+    finally:
+        if previous_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = previous_home
+
+
 def test_a_failed_config_read_raises_instead_of_looking_unset(tmp: pathlib.Path) -> None:
     """A read that fails must not be the same value as a key that is unset. Both
     cases used to be '', and the router then treated a healthy sticky provider as

@@ -324,12 +324,14 @@ def main() -> int:
 def check(cfg: dict, providers: dict, models: dict, alias: str) -> int:
     """Report whether the config can actually drive Hermes. Writes nothing."""
     problems, notes = [], []
+    unset_keys = 0
     for name, spec in providers.items():
         if not spec.get("base_url"):
             problems.append(f"{name}: no base_url")
         if not spec.get("key_env"):
             problems.append(f"{name}: no key_env")
         elif not _env_present(str(spec["key_env"])):
+            unset_keys += 1
             notes.append(f"{name}: key_env {spec['key_env']} is not set in this shell "
                          f"(fine if Hermes loads it from .env)")
         model_id = model_id_for(name, alias, models)
@@ -353,7 +355,16 @@ def check(cfg: dict, providers: dict, models: dict, alias: str) -> int:
         print(f"  note  {note}")
     for problem in problems:
         print(f"  ERROR {problem}")
-    print("config OK" if not problems else f"{len(problems)} problem(s)")
+    if problems:
+        print(f"{len(problems)} problem(s)")
+    elif providers and unset_keys == len(providers):
+        # Consistent, but nothing can be fetched: install.sh repeats this line, and a
+        # bare "config OK" over four "key is not set" notes reads as "ready to route".
+        from paths import env_file
+        print(f"config OK, but no provider key is set in this shell or in "
+              f"{env_file()}: routing will not work until one is")
+    else:
+        print("config OK")
     return 0 if not problems else 1
 
 

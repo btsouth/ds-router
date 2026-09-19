@@ -266,7 +266,10 @@ def main() -> int:
     print("  " + "-" * 84)
     for c in decision.ranked:
         flag = "EXHAUSTED" if c.hard else ("" if c.quota_ok else "no reading")
-        print(f"  {c.provider:<15}{c.pressure:>8.3f}{c.headroom:>10.2f}   {c.detail} {flag}")
+        # The 9.9 sentinel exists so it cannot be charted; printing it in a column
+        # headed "usage" hands the reader a number where the JSON says null.
+        usage = f"{c.headroom:.2f}" if c.quota_ok else "-"
+        print(f"  {c.provider:<15}{c.pressure:>8.3f}{usage:>10}   {c.detail} {flag}")
     if health:
         print()
         for name, row in health.items():
