@@ -28,12 +28,23 @@ Three rules carry this module, and they are the same three as `routing.py`:
 Everything RPC-shaped goes through `Transport.call(method, params)`, so the
 whole planner and applier are testable with `FakeTransport` and no backend.
 
+A backend whose dashboard is published refuses Hermes' own session token by design,
+so its sessions can only be reached the way a browser reaches them: a dashboard
+credential, then a single-use WS ticket. `--gateway <origin>`, or a `gateway:` block
+in config.yaml, reaches one that way. The credential comes from a 0600 file or an
+env var, never from argv. Nothing changes without one: the loopback/token path is the
+default. Shapes this transport cannot speak (https, a URL prefix, a wildcard address,
+userinfo in the URL) are refused up front with the alternative named; the README's
+"When it cannot find the backend" has the details.
+
 Usage:
 
     python3 placement.py --plan            # print the target assignment; writes nothing
     python3 placement.py --plan --json
     python3 placement.py --apply           # apply it (explicit flag required)
     python3 placement.py --apply --dry-run # print exactly what would be sent
+    python3 placement.py --plan --gateway http://10.0.0.5:9119 \
+        --gateway-password-file ~/.hermes/dashboard-lan-password.txt
 """
 
 from __future__ import annotations
