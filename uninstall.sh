@@ -112,6 +112,7 @@ manifest_load() {
       SYMLINK)           SYMLINK=$mval ;;
       LAUNCHD_PLIST)     LAUNCHD_PLIST=$mval ;;
       HERMES_BIN)        HERMES_BIN=$mval ;;
+      PYTHON3_BIN_DIR)   PYTHON3_BIN_DIR=$mval ;;
     esac
   done < "$1"
 }
@@ -139,9 +140,11 @@ if [ "$DRY_RUN" = 1 ]; then
   note "DRY RUN: nothing will be stopped, removed or written"
 fi
 
-TMP_UNIT=${TMPDIR:-/tmp}/ds-router-uninstall.$$.unit
-cleanup() { rm -f "$TMP_UNIT"; }
-trap cleanup EXIT INT TERM HUP
+TMP_WORK=$(mktemp -d "${TMPDIR:-/tmp}/ds-router-uninstall.XXXXXXXX") || die "cannot create private temporary directory"
+TMP_UNIT=$TMP_WORK/unit
+trap 'rm -rf "$TMP_WORK"' EXIT
+trap 'exit 1' INT TERM HUP
+incomplete=0
 
 escape_sed() { printf '%s' "$1" | sed 's/[&\\|]/\\&/g'; }
 
@@ -165,8 +168,22 @@ render_expected() {
     "$HOME"/*) router_pat="%h/${ROUTER_DIR#"$HOME"/}" ;;
     *)         router_pat=$ROUTER_DIR ;;
   esac
+  # install.sh also substitutes the directory of the python3 it verified, so this
+  # has to resolve to the SAME directory the units were written with, or every
+  # freshly installed unit would look hand-edited and be refused. The manifest
+  # records that directory (and it is authoritative even if the interpreter has
+  # since moved); older manifests have no entry, so fall back to the interpreter
+  # the shell sees, and then to /usr/bin.
+  if [ -n "${PYTHON3_BIN_DIR:-}" ]; then
+    python3_bin_dir=$PYTHON3_BIN_DIR
+  elif command -v python3 >/dev/null 2>&1; then
+    python3_bin_dir=$(dirname "$(command -v python3)")
+  else
+    python3_bin_dir=/usr/bin
+  fi
   sed -e "s|%h/Projects/ds-router|$(escape_sed "$router_pat")|g" \
       -e "s|%h/.hermes/hermes-agent/venv/bin|$(escape_sed "$hermes_bin_pat")|g" \
+      -e "s|%python3_bin_dir%|$(escape_sed "$python3_bin_dir")|g" \
       "$src"
 }
 
@@ -198,12 +215,6 @@ for unit in ds-router.timer ds-router.service; do
   template=$ROUTER_DIR/systemd/$unit
   [ -f "$installed" ] || { skip "not installed: $installed"; continue; }
 
-  if ! unit_removable "$installed" "$template"; then
-    warn "$installed does not match what install.sh writes (hand-edited?)"
-    warn "leaving it in place — remove it yourself or re-run with --force"
-    continue
-  fi
-
   if [ "$have_systemctl" = 1 ]; then
     case $unit in
       *.timer)
@@ -212,7 +223,7 @@ for unit in ds-router.timer ds-router.service; do
         else
           printf '  run   systemctl --user disable --now %s\n' "$unit"
           systemctl --user disable --now "$unit" >/dev/null 2>&1 \
-            || warn "could not disable $unit (not loaded?); removing the file anyway"
+            || { warn "could not disable $unit; routing may still be active"; incomplete=1; }
         fi
         ;;
       *)
@@ -220,12 +231,20 @@ for unit in ds-router.timer ds-router.service; do
           printf '  dry   systemctl --user stop %s  (never enabled)\n' "$unit"
         else
           printf '  run   systemctl --user stop %s  (never enabled)\n' "$unit"
-          systemctl --user stop "$unit" >/dev/null 2>&1 || true
+          systemctl --user stop "$unit" >/dev/null 2>&1 || { warn "could not stop $unit"; incomplete=1; }
         fi
         ;;
     esac
   else
-    skip "systemctl not present; skipping the systemd calls for $unit"
+    warn "systemctl not present; cannot confirm that $unit stopped"
+    incomplete=1
+  fi
+
+  if ! unit_removable "$installed" "$template"; then
+    warn "$installed does not match what install.sh writes (hand-edited?)"
+    warn "leaving it in place — remove it yourself or re-run with --force"
+    incomplete=1
+    continue
   fi
 
   if [ "$DRY_RUN" = 1 ]; then
@@ -264,7 +283,10 @@ if [ -f "$LAUNCHD_PLIST" ]; then
       printf '  run   launchctl bootout gui/%s %s  (if loaded)\n' "$(id -u)" "$LAUNCHD_PLIST"
       launchctl bootout "gui/$(id -u)" "$LAUNCHD_PLIST" >/dev/null 2>&1 \
         || launchctl unload -w "$LAUNCHD_PLIST" >/dev/null 2>&1 \
-        || true
+        || { warn "could not unload $LAUNCHD_PLIST"; incomplete=1; }
+    else
+      warn "launchctl not present; cannot confirm the job stopped"
+      incomplete=1
     fi
     rm -f "$LAUNCHD_PLIST"
     printf '  rm    %s\n' "$LAUNCHD_PLIST"
@@ -302,7 +324,9 @@ fi
 # 4. manifest
 # ---------------------------------------------------------------------------
 hdr "Records"
-if [ -f "$MANIFEST" ]; then
+if [ "$incomplete" = 1 ]; then
+  warn "uninstall incomplete; keeping the manifest for a retry"
+elif [ -f "$MANIFEST" ]; then
   if [ "$DRY_RUN" = 1 ]; then
     printf '  dry   rm -f %s\n' "$MANIFEST"
     printf '  dry   rmdir %s  (if empty)\n' "$STATE_DIR"
@@ -336,7 +360,14 @@ say "  the checkout itself : $ROUTER_DIR   (git repo, config.yaml, docs/ — del
 say "  Hermes config/keys  : ~/.hermes/ (and \$HERMES_HOME if set)"
 say "  pyyaml, if installed: python3 -m pip uninstall pyyaml"
 say ""
-say "  ds-router is now inert: nothing polls, and Hermes keeps whatever provider"
+if [ "$incomplete" = 1 ]; then
+  warn "Uninstall is incomplete. Resolve the warnings above before assuming routing stopped."
+elif [ "$DRY_RUN" = 1 ]; then
+  say "  A successful uninstall stops automatic routing."
+else
+  say "  Automatic routing is stopped."
+fi
+say "  Hermes keeps whatever provider"
 say "  it was last set to. To hand routing back to your config's default first:"
 say "      cd $ROUTER_DIR && ./ds-switch --off"
 if [ "$DRY_RUN" = 1 ]; then
@@ -344,3 +375,5 @@ if [ "$DRY_RUN" = 1 ]; then
   say "  DRY RUN — nothing above was stopped, removed or written."
 fi
 say ""
+
+exit "$incomplete"

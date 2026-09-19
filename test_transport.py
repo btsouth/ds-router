@@ -157,7 +157,7 @@ def test_a_connection_failure_is_retried_once() -> None:
     check("nothing was sent", client.sent == [], str(client.sent))
 
 
-def test_a_failed_send_is_retried_once() -> None:
+def test_a_failed_send_is_not_retried_when_delivery_is_unknown() -> None:
     client = StubClient(send_error=BrokenPipeError("broken pipe"))
     built, _ = transport_with([client])
     raised = None
@@ -166,7 +166,7 @@ def test_a_failed_send_is_retried_once() -> None:
     except pl.TransportError as exc:
         raised = exc
     check("a send failure raises", raised is not None, str(raised))
-    check("it is retried once", client.connects == 2, str(client.connects))
+    check("a failed send is not replayed", client.connects == 1, str(client.connects))
 
 
 def test_a_reply_to_another_request_is_ignored() -> None:

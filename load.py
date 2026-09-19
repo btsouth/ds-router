@@ -98,11 +98,13 @@ def provider_of(billing_provider: Any, model_config: Any) -> str:
     return ""
 
 
-def _tally(rows: Any) -> tuple[dict[str, int], str]:
+def _tally(rows: Any, exclude_session_ids=()) -> tuple[dict[str, int], str]:
     """Count rows per provider. Returns (counts, note about unreadable rows)."""
     counts: dict[str, int] = {}
     unknown = 0
     for _id, _key, billing, model_config in rows:
+        if str(_id) in exclude_session_ids or str(_key) in exclude_session_ids:
+            continue
         name = provider_of(billing, model_config)
         if not name:
             unknown += 1
@@ -125,6 +127,7 @@ def active_by_provider(
     lease_grace_seconds: float = 300.0,
     activity_window_seconds: float = 300.0,
     now: Optional[float] = None,
+    exclude_session_ids: Any = (),
 ) -> Load:
     """Count sessions doing work per provider.
 
@@ -159,6 +162,7 @@ def active_by_provider(
         failures.append(f"session_turn_leases: {exc}")
 
     counts: dict[str, int] = {}
+    matched_leases = False
     source = "none"
     if lease_rows:
         ids: list[str] = []
@@ -174,12 +178,13 @@ def active_by_provider(
             # is the runtime id. Match either so a schema shift degrades to
             # fewer matches rather than a hard error.
             try:
-                rows = con.execute(
+                rows = list(con.execute(
                     f"select id, session_key, billing_provider, model_config from sessions "
                     f"where id in ({placeholders}) or session_key in ({placeholders})",
                     tuple(ids) + tuple(ids),
-                )
-                counts, note = _tally(rows)
+                ))
+                matched_leases = bool(rows)
+                counts, note = _tally(rows, exclude_session_ids)
                 if note:
                     failures.append(note)
             except sqlite3.Error as exc:
@@ -201,7 +206,7 @@ def active_by_provider(
                 "where last_activity_at > ?",
                 (now - activity_window_seconds,),
             )
-            counts, note = _tally(rows)
+            counts, note = _tally(rows, exclude_session_ids)
             if counts:
                 source = "activity"
             if note:
@@ -209,7 +214,7 @@ def active_by_provider(
         except sqlite3.Error as exc:
             failures.append(f"sessions by activity: {exc}")
 
-    if lease_rows and not counts and source == "leases":
+    if lease_rows and not matched_leases and source == "leases":
         # Live leases that resolve to no session: something is running and this
         # reading cannot say what. Unknown, not zero, and not a substitute count.
         failures.append(f"{len(lease_rows)} live lease(s) matched no session row")

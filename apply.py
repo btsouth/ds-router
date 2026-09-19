@@ -15,9 +15,14 @@ arguments and delegates here.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
+import os
+import shutil
 import subprocess
 import sys
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -38,7 +43,11 @@ def load_config() -> dict:
     """This repo's config.yaml, validated enough to fail with a message rather than
     a traceback. A stranger editing this file is the normal case, so a typo has to
     read as a diagnosis, not a stack trace."""
-    import yaml
+    try:
+        import yaml
+    except ImportError as exc:
+        raise ConfigError("pyyaml is not installed, so config.yaml cannot be read "
+                          "(install it with: python3 -m pip install --user pyyaml)") from exc
 
     try:
         raw = CONFIG.read_text()
@@ -64,7 +73,11 @@ def load_config() -> dict:
             if block_name == "models" and not isinstance(entry, dict):
                 raise ConfigError(f"{CONFIG.name}: models.{key} must map providers to model "
                                   f"ids, found {type(entry).__name__}")
-    return cfg
+    from config_schema import validate
+    try:
+        return validate(cfg)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def _run(*args: str) -> tuple[int, str, str]:
@@ -128,7 +141,14 @@ def current_value(key: str) -> str:
 
 
 def router_decision(sticky: str | None, alias: str) -> dict:
-    """Ask router.py for a decision. Raises on failure."""
+    """Ask router.py for a decision. Raises on failure.
+
+    A refusal (nothing safely usable) arrives as exit 1 WITH a well-formed JSON
+    document -- the same contract the text output has always had. That document is
+    returned here rather than raised, so the caller reports a refusal (ds-switch
+    exit 4: "the router refused to choose") and not a router that failed (exit 3).
+    Any other nonzero exit, or an exit 1 with no parseable document, is a failure.
+    """
     args = ["./router.py", "--dry-run", "--json", "--model", alias]
     if sticky:
         # A provider whose reading failed is held rather than abandoned, so this is
@@ -137,6 +157,13 @@ def router_decision(sticky: str | None, alias: str) -> dict:
         args += ["--sticky", sticky, "--verify-sticky"]
     proc = subprocess.run(args, capture_output=True, text=True, cwd=str(HERE))
     if proc.returncode != 0:
+        if proc.returncode == 1 and proc.stdout.strip():
+            try:
+                doc = json.loads(proc.stdout)
+            except ValueError:
+                doc = None
+            if isinstance(doc, dict) and "chosen" in doc:
+                return doc
         raise RuntimeError(f"router exited {proc.returncode}: {proc.stderr.strip()[:200]}")
     return json.loads(proc.stdout)
 
@@ -157,6 +184,40 @@ def model_id_for(provider: str, alias: str, models: dict) -> str:
 _ROUTED_KEYS = ("model.provider", "model.default", "model.base_url")
 
 
+def _backup_once() -> str:
+    """Save the Hermes config before the first write ds-router ever makes to it.
+
+    One backup, written only when it is absent, so what it holds is the
+    config as it was BEFORE any routing — the state to restore by hand to undo
+    ds-router completely. A per-write backup would be overwritten every 15 minutes
+    by the timer and would preserve only the previous tick, which is not an undo.
+
+    Returns the backup path, or '' when there was nothing to save or a backup
+    already exists. A failed backup refuses the change so undo stays dependable.
+    """
+    from paths import config_file
+
+    src = config_file()
+    if not src.exists():
+        return ""
+    dst = src.with_name(src.name + ".bak-ds-router")
+    if dst.exists():
+        return ""
+    temporary = None
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=".ds-router-backup-", dir=src.parent)
+        os.close(fd)
+        shutil.copy2(src, temporary)
+        os.replace(temporary, dst)
+    except OSError as exc:
+        raise RuntimeError(f"could not back up {src}; refusing to route ({type(exc).__name__})") from exc
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
+    print(f"  note: saved your original Hermes config to {dst}", file=sys.stderr)
+    return str(dst)
+
+
 def _read_before_write(key: str) -> str:
     """The value to restore if a later key fails to write.
 
@@ -175,6 +236,36 @@ def _read_before_write(key: str) -> str:
 
 def set_provider(name: str, spec: dict, alias: str, *, dry: bool,
                  models: dict | None = None) -> tuple[str, str]:
+    # Validate before creating the lock or calling Hermes. A dry run creates no files.
+    result = _set_provider_locked(name, spec, alias, dry=True, models=models)
+    if dry:
+        return result
+    with _config_lock():
+        return _set_provider_locked(name, spec, alias, dry=False, models=models)
+
+
+@contextmanager
+def _config_lock():
+    """Serialize ds-router writers across processes and threads on Linux/macOS.
+
+    Keep the inode after unlock: unlinking it would let a waiter and a new caller
+    acquire different locks. Hermes itself does not participate in this lock.
+    """
+    from paths import config_file
+
+    path = config_file().with_name(".ds-router.lock")
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        raise RuntimeError(f"cannot open routing lock: {type(exc).__name__}") from exc
+    with os.fdopen(fd, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def _set_provider_locked(name: str, spec: dict, alias: str, *, dry: bool,
+                         models: dict | None = None) -> tuple[str, str]:
     """Write model.provider/default/base_url for one provider, as a unit.
 
     Returns (model_id, base_url). Raises when the alias is not served there,
@@ -192,13 +283,17 @@ def set_provider(name: str, spec: dict, alias: str, *, dry: bool,
             f"provider {name!r} does not serve alias {alias!r} (it serves: {offered})"
         )
     base_url = str(spec.get("base_url") or "")
+    if not base_url:
+        raise RuntimeError(f"provider {name!r} needs a base_url; refusing to retain another endpoint")
     if dry:
         return model_id, base_url
 
     previous = {key: _read_before_write(key) for key in _ROUTED_KEYS}
-    pending = [("model.provider", name), ("model.default", model_id)]
-    if base_url:
-        pending.append(("model.base_url", base_url))
+    pending = [("model.provider", name), ("model.default", model_id),
+               ("model.base_url", base_url)]
+    if all(previous[key] == value for key, value in pending):
+        return model_id, base_url
+    _backup_once()
 
     written: list[str] = []
     try:

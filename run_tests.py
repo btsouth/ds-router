@@ -7,6 +7,8 @@ them and aggregates. Exits nonzero if any suite fails.
 
 from __future__ import annotations
 
+import os
+import tempfile
 import re
 import subprocess
 import sys
@@ -30,6 +32,18 @@ def _declared_total(out: str) -> Optional[int]:
 
 
 def main() -> int:
+    # One disposable parent also catches scratch directories left by older suites.
+    with tempfile.TemporaryDirectory(prefix="ds-router-tests-") as tmp:
+        env = dict(os.environ, TMPDIR=tmp, HOME=tmp, HERMES_HOME=str(Path(tmp) / "hermes"),
+                   XDG_STATE_HOME=str(Path(tmp) / "state"),
+                   XDG_CONFIG_HOME=str(Path(tmp) / "config"), PYTHONDONTWRITEBYTECODE="1")
+        for key in ("COMMANDCODE_API_KEY", "OPENCODE_GO_API_KEY", "OLLAMA_API_KEY",
+                    "HERMES_CUSTOM_CLINEPASS_API_KEY"):
+            env.pop(key, None)
+        return run_suites(env)
+
+
+def run_suites(env) -> int:
     found = suites()
     if not found:
         print("no test suites found", file=sys.stderr)
@@ -37,7 +51,7 @@ def main() -> int:
 
     total_pass = total_fail = failed_suites = 0
     for path in found:
-        proc = subprocess.run([sys.executable, str(path)], capture_output=True, text=True, cwd=HERE)
+        proc = subprocess.run([sys.executable, str(path)], capture_output=True, text=True, cwd=HERE, env=env)
         out = proc.stdout or ""
         passes = sum(1 for line in out.splitlines() if line.startswith("  pass"))
         fails = sum(1 for line in out.splitlines() if line.startswith("  FAIL"))

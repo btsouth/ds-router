@@ -9,7 +9,15 @@ Type=oneshot
 # ds-switch and apply.py call both `hermes` and `python3`. `hermes` lives in the
 # Hermes venv, which a supervisor-started unit does not inherit, so PATH must be
 # set explicitly. Adjust if Hermes is installed somewhere other than ~/.hermes.
-Environment=PATH=%h/.hermes/hermes-agent/venv/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+#
+# %python3_bin_dir% is replaced by install.sh with the directory of the python3 it
+# verified (3.10+ with pyyaml). Without it the unit would rely on the fallbacks
+# below, so a pyenv/asdf/mise/Homebrew interpreter would be invisible to the timer
+# even though the install succeeded.
+# Quoted: systemd splits an unquoted value on whitespace, so a path containing a
+# space would be read as one assignment plus trailing junk. Same reason ExecStart
+# below is quoted.
+Environment="PATH=%python3_bin_dir%:%h/.hermes/hermes-agent/venv/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
 # Quoted: systemd splits an unquoted ExecStart on whitespace, so a clone path
 # containing a space would be read as a command plus arguments.
 ExecStart="%h/Projects/ds-router/ds-switch"

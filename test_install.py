@@ -107,6 +107,8 @@ def sandbox_env(tmp: pathlib.Path, home: pathlib.Path) -> dict[str, str]:
         "XDG_STATE_HOME": str(home / ".state"),
         "XDG_RUNTIME_DIR": str(tmp),
         "LC_ALL": "C",
+        "TMPDIR": str(tmp),
+        "PYTHONDONTWRITEBYTECODE": "1",
     }
 
 
@@ -221,6 +223,65 @@ def test_the_installer_repeats_the_check_summary_rather_than_its_own(
     check("the check ran", bool(passed), proc.stdout[-400:])
     check("the banner repeats the real summary, not a nicer one",
           "no provider key is set" in passed[0], passed[0])
+
+
+def test_the_installed_unit_puts_the_verified_python3_on_path(tmp: pathlib.Path) -> None:
+    """The unit hardcoded /usr/bin:/usr/local/bin, so a pyenv/asdf/mise/Homebrew
+    interpreter was invisible to the timer even though the install succeeded: the
+    service then failed every 15 minutes with 'python3: not found'. The rendered unit
+    must carry the directory of the python3 the installer actually verified."""
+    proc = run_install(tmp, "--skip-preflight", "--yes")
+    check("the install exits 0", proc.returncode == 0, proc.stderr[-300:])
+    home = tmp / "home"
+    unit = (home / "Library" / "LaunchAgents" / "com.ds-router.switch.plist" if DARWIN
+            else home / ".config" / "systemd" / "user" / "ds-router.service")
+    check("the unit was installed", unit.is_file(), str(unit))
+    if not unit.is_file():
+        return
+    text = unit.read_text()
+    expected = os.path.dirname(sys.executable)
+    check("no unsubstituted token is left behind", "%python3_bin_dir%" not in text, text)
+    check("the verified python3 directory is on the unit's PATH", expected in text,
+          f"{expected!r} not found in unit: {text}")
+
+
+def test_the_uninstaller_still_matches_units_when_python3_has_moved(tmp: pathlib.Path) -> None:
+    """The uninstaller re-renders the units it expects to find, and the renderer
+    has to use the SAME python3 directory the units were written with. Re-deriving
+    that directory from the current shell read a freshly installed unit as
+    hand-edited the moment the interpreter moved (a removed pyenv, an upgrade), and
+    the uninstaller then refused without --force. install.sh records the directory
+    in the manifest, and the uninstaller trusts that record."""
+    proc = run_install(tmp, "--skip-preflight", "--yes")
+    check("the install exits 0", proc.returncode == 0, proc.stderr[-300:])
+    manifest = tmp / "home" / ".state" / "ds-router" / "install-manifest"
+    check("the manifest exists", manifest.is_file(), str(manifest))
+    expected = os.path.dirname(sys.executable)
+    check("the manifest records the verified python3 directory",
+          f"PYTHON3_BIN_DIR={expected}" in manifest.read_text(), manifest.read_text())
+    if not LINUX:
+        skip_note("the systemd unit assertions in this test")
+        return
+    unit_dir = tmp / "home" / ".config" / "systemd" / "user"
+    unit = unit_dir / "ds-router.service"
+    check("the unit was installed", unit.is_file(), str(unit))
+
+    # A DIFFERENT python3 first on PATH, so `command -v python3` answers somewhere
+    # else than the interpreter the install verified.
+    altbin = tmp / "altbin"
+    altbin.mkdir(exist_ok=True)
+    alt_python = altbin / "python3"
+    alt_python.write_text("#!/bin/sh\nexit 0\n")
+    alt_python.chmod(0o755)
+    env = sandbox_env(tmp, tmp / "home")
+    env["PATH"] = os.pathsep.join([str(altbin), env["PATH"]])
+    uninstall = subprocess.run([str(HERE / "uninstall.sh"), "--yes"], capture_output=True,
+                               text=True, env=env, cwd=str(HERE), timeout=120)
+    check("the uninstall exits 0", uninstall.returncode == 0, uninstall.stderr[-300:])
+    check("the unit is gone", not unit.exists(), str(unit))
+    transcript = uninstall.stdout + uninstall.stderr
+    check("the uninstaller did not read its own unit as hand-edited",
+          "does not match" not in transcript, transcript[-400:])
 
 
 if __name__ == "__main__":

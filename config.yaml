@@ -1,7 +1,3 @@
-listen:
-  host: 127.0.0.1
-  port: 8788
-
 # The model table is the whole point of this file.
 #
 # Logical alias -> the id each provider calls it. Hermes asks for the alias
@@ -65,6 +61,14 @@ routing:
   # disqualifying it outright.
   concurrency:
     enabled: true
+    # Requests in flight, per provider, as the provider itself documents the limit.
+    # Ollama Cloud Pro allows 3.
+    #
+    # Ollama's cap is per ACCOUNT, not per host. If two routers share one account,
+    # both declaring 3 would let six sessions queue into a limit of three while each
+    # router reported itself compliant. So on a second machine declare fewer than the
+    # real limit to keep that box out of the way: with one session already on
+    # ollama-cloud, a cap of 1 makes the router prefer another provider.
     caps:
       ollama-cloud: 3
     # Pressure added per session over the cap, on the same 0..1 scale as
@@ -79,11 +83,12 @@ routing:
     # Cap the contribution so a badly overloaded provider stays reachable
     # rather than being excluded entirely.
     max_pressure: 0.4
-  # How long a conversation stays on the provider it started on. Sticky on
-  # purpose: every switch resets the upstream prompt cache, so switching to
-  # chase a slightly cheaper window costs more than it saves. Hard exhaustion
-  # bypasses this entirely.
-  stick_seconds: 1800
+  # A conversation stays on the provider it is already using, indefinitely, until
+  # that provider is hard exhausted or a health probe fails. Sticky on purpose:
+  # every switch resets the upstream prompt cache, so switching to chase a slightly
+  # cheaper window costs more than it saves. There is no timer on this — ds-switch
+  # is a one-shot that reads the current provider and passes it as --sticky — so a
+  # configured interval would be a knob nothing read.
   # Window weights. The short windows are what actually interrupt a session,
   # so they dominate; a monthly window only matters once it is nearly gone.
   window_weights:

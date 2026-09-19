@@ -375,5 +375,106 @@ def test_a_malformed_config_reports_instead_of_crashing(tmp: pathlib.Path) -> No
         A.CONFIG = real_config
 
 
+def test_the_original_hermes_config_is_backed_up_once(tmp: pathlib.Path) -> None:
+    """A stranger running ./ds-switch rewrites their live agent config, and there is
+    no undo unless ds-router saves one. It must be a single rolling copy of the config
+    as it was BEFORE any routing — a per-write backup would be overwritten every 15
+    minutes by the timer and would preserve only the previous tick, which is not an
+    undo."""
+    bin_dir = fake_hermes(tmp)
+    home = tmp / "home"
+    (home / ".hermes").mkdir(parents=True)
+    original = "model:\n  provider: clinepass\n"
+    (home / ".hermes" / "config.yaml").write_text(original)
+    previous_home = os.environ.get("HERMES_HOME")
+    old_path = os.environ["PATH"]
+    os.environ["HERMES_HOME"] = str(home / ".hermes")
+    os.environ["PATH"] = f"{bin_dir}:{old_path}"
+    backup = home / ".hermes" / "config.yaml.bak-ds-router"
+    try:
+        A.set_provider("clinepass", {"base_url": "https://x/v1"}, "ds",
+                       dry=False, models={"ds": {"clinepass": "cline-pass/ds"}})
+        check("the original config is backed up before the first write",
+              backup.is_file(), str(backup))
+        if backup.is_file():
+            check("the backup holds the ORIGINAL, not the routed value",
+                  backup.read_text() == original, backup.read_text())
+
+        # A later write must not overwrite the original with routed state, or the
+        # backup would drift forward and stop being an undo.
+        (home / ".hermes" / "config.yaml").write_text("model:\n  provider: commandcode\n")
+        A.set_provider("commandcode", {"base_url": "https://y/v1"}, "ds",
+                       dry=False, models={"ds": {"commandcode": "m"}})
+        check("a later write keeps the first backup",
+              backup.read_text() == original, backup.read_text())
+    finally:
+        os.environ["PATH"] = old_path
+        if previous_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = previous_home
+
+
+def test_a_dry_run_creates_no_backup(tmp: pathlib.Path) -> None:
+    """--show promises to write nothing, and that has to include the backup."""
+    bin_dir = fake_hermes(tmp)
+    home = tmp / "home"
+    (home / ".hermes").mkdir(parents=True)
+    (home / ".hermes" / "config.yaml").write_text("model: {}\n")
+    previous_home = os.environ.get("HERMES_HOME")
+    old_path = os.environ["PATH"]
+    os.environ["HERMES_HOME"] = str(home / ".hermes")
+    os.environ["PATH"] = f"{bin_dir}:{old_path}"
+    try:
+        A.set_provider("clinepass", {"base_url": "https://x/v1"}, "ds",
+                       dry=True, models={"ds": {"clinepass": "cline-pass/ds"}})
+    finally:
+        os.environ["PATH"] = old_path
+        if previous_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = previous_home
+    check("--show left no backup behind",
+          not (home / ".hermes" / "config.yaml.bak-ds-router").exists())
+
+
+def test_a_json_refusal_from_the_router_is_not_a_router_failure():
+    """router.py exits 1 WITH a well-formed document when it refuses to choose --
+    the same contract the text output has always had. apply.py must read the
+    refusal out of that document (ds-switch exit 4: the install is fine, nothing
+    is usable) rather than reporting the router as broken (exit 3). An exit 1
+    with no document is still a failure."""
+    import json
+    refusal = json.dumps({"chosen": "", "model_id": "",
+                          "reason": "all providers exhausted or unreadable", "candidates": []})
+    real_run = A.subprocess.run
+    A.subprocess.run = lambda *a, **k: type("P", (), {
+        "returncode": 1, "stdout": refusal, "stderr": ""})()
+    doc: dict = {}
+    try:
+        doc = A.router_decision(None, "ds")
+    finally:
+        A.subprocess.run = real_run
+    check("a refused decision is returned as a document", doc.get("chosen") == "", str(doc))
+
+    A.subprocess.run = lambda *a, **k: type("P", (), {
+        "returncode": 1, "stdout": "", "stderr": "boom"})()
+    raised: Exception | None = None
+    try:
+        A.router_decision(None, "ds")
+    except RuntimeError as exc:
+        raised = exc
+    finally:
+        A.subprocess.run = real_run
+    check("an exit 1 with no document is a failure", raised is not None, str(raised))
+
+
 if __name__ == "__main__":
+    # Point HERMES_HOME at a scratch directory for the whole suite. apply.py now
+    # backs the config up before it writes, and most tests here call set_provider
+    # directly; without this they would copy the DEVELOPER's real ~/.hermes/config.yaml
+    # (and on a machine that has one, that is a write to a file outside the repo).
+    # A bare runner has no ~/.hermes, so this only ever mattered locally — which is
+    # exactly the kind of difference this project's CI rule exists to remove.
+    os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="ds-apply-home-")
     raise SystemExit(testkit.run(globals(), scratch_prefix="ds-apply-"))

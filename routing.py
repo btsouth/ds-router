@@ -139,6 +139,8 @@ def score(quota: Quota, model_id: Optional[str], weights: dict[str, float],
     """
     if model_id is None:
         return Candidate("", "", 9.9, 9.9, False, False, "model not offered here")
+    if quota.error.startswith("no quota reader for"):
+        return Candidate(quota.provider, model_id, skip_at + 0.001, 9.9, False, True, quota.error)
     if quota.stale:
         # An unreadable quota cannot place anything, and on its own it says nothing
         # about the provider. A health probe DOES: it is a real request, so a probe
@@ -323,49 +325,16 @@ def choose(
         detail = best.detail or "unreadable"
         return Decision("", "", f"all providers exhausted or unreadable (best: {best.provider} {detail})", ranked)
 
-    # Among safe providers, prefer off-peak at the same risk level. "Same risk
-    # level" is deliberately generous: any two providers that are both safe are
-    # close enough that the cheaper rate should decide.
-    off_peak = [c for c in safe if c.provider not in on_peak]
-    chosen = off_peak[0] if off_peak else safe[0]
+    # Pricing only separates candidates with equal risk and usage.
+    best = safe[0]
+    tied = [c for c in safe if (c.pressure, c.headroom) == (best.pressure, best.headroom)]
+    off_peak = [c for c in tied if c.provider not in on_peak]
+    chosen = off_peak[0] if off_peak else best
     reason = f"lowest risk; {chosen.detail}"
-    if off_peak and on_peak & {c.provider for c in safe}:
-        reason += " (off-peak right now)"
-    elif chosen.provider in on_peak:
+    if off_peak and on_peak & {c.provider for c in tied}:
+        reason += " (off-peak tie-break)"
+    elif all(c.provider in on_peak for c in safe):
         reason += " (all options at peak; picked the safest)"
     if sticky_provider and sticky_provider != chosen.provider:
         reason += f" (moved off {sticky_provider})"
     return Decision(chosen.provider, chosen.model_id, reason, ranked)
-
-
-class StickyTable:
-    """Conversation -> (provider, chosen_at). In memory; a restart re-picks."""
-
-    def __init__(self, ttl_seconds: float) -> None:
-        self.ttl = ttl_seconds
-        self._rows: dict[str, tuple[str, float]] = {}
-
-    def get(self, conversation: str) -> Optional[str]:
-        row = self._rows.get(conversation)
-        if not row:
-            return None
-        provider, chosen_at = row
-        # `>=`, not `>`: a row is good for at most ttl seconds, and a ttl of 0
-        # must mean nothing is ever remembered. Reading the boundary strictly also
-        # made the result depend on the host clock's resolution -- macOS can return
-        # the same time.time() twice in a row, so a just-put row looked live.
-        if time.time() - chosen_at >= self.ttl:
-            self._rows.pop(conversation, None)
-            return None
-        return provider
-
-    def put(self, conversation: str, provider: str) -> None:
-        self._rows[conversation] = (provider, time.time())
-
-    def forget(self, conversation: str) -> None:
-        self._rows.pop(conversation, None)
-
-    def evict_expired(self) -> None:
-        now = time.time()
-        for key in [k for k, (_, at) in self._rows.items() if now - at >= self.ttl]:
-            self._rows.pop(key, None)

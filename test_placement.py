@@ -381,13 +381,13 @@ def test_the_cli_hands_the_concurrency_reading_to_the_planner():
     con = sqlite3.connect(store)
     con.execute("create table sessions (id text primary key, session_key text, "
                 "billing_provider text, model_config text, title text, model text, "
-                "last_activity_at real, ended_at real)")
+                "last_activity_at real, ended_at real, archived integer)")
     con.execute("create table session_turn_leases (conversation_id text, holder text, "
                 "acquired_at real, expires_at real)")
     # A session already running on ollama-cloud: not in the plan (it is archived),
     # but it holds one of the three concurrent slots.
-    con.execute("insert into sessions values (?,?,?,?,?,?,?,?)",
-                ("busy", "busy-key", "ollama-cloud", "", "busy", "ds", now, None))
+    con.execute("insert into sessions values (?,?,?,?,?,?,?,?,?)",
+                ("busy", "busy-key", "ollama-cloud", "", "busy", "ds", now, None, 1))
     con.execute("insert into session_turn_leases values (?,?,?,?)",
                 ("busy-key", "h", now, now + 600))
     con.commit()
@@ -1035,6 +1035,138 @@ def test_the_router_json_names_usage_and_says_whether_health_was_measured():
     for candidate in payload["candidates"]:
         assert "usage" in candidate and "headroom" not in candidate, candidate
         assert 0.0 <= candidate["usage"] <= 1.5, candidate
+
+
+def test_a_broken_config_is_diagnosed_rather_than_crashing():
+    """placement.py is the CLI that takes an arbitrary --config path, so a file a
+    stranger wrote has to read as a diagnosis with an exit status. It used to
+    raise a raw traceback, which router.py and apply.py had both already been
+    taught not to do with the very same file."""
+    import io
+    import tempfile
+    from contextlib import redirect_stderr
+
+    bad = Path(tempfile.mkdtemp(prefix="ds-placement-cfg-")) / "config.yaml"
+    bad.write_text("{not yaml: [")
+    stderr = io.StringIO()
+    try:
+        with redirect_stderr(stderr):
+            code = pl.main(["--plan", "--config", str(bad)])
+    except Exception as exc:
+        raise AssertionError(f"a malformed config raised instead of being diagnosed: {exc}")
+    assert code == 1, (code, stderr.getvalue())
+    assert "not valid YAML" in stderr.getvalue(), stderr.getvalue()
+
+    # A missing file is a diagnosis too.
+    gone = bad.parent / "gone.yaml"
+    stderr = io.StringIO()
+    with redirect_stderr(stderr):
+        code = pl.main(["--plan", "--config", str(gone)])
+    assert code == 1 and "cannot read" in stderr.getvalue(), (code, stderr.getvalue())
+
+
+def test_an_empty_provider_table_is_a_refusal_not_a_clean_plan():
+    """With no providers declared, every session would read as "not managed" and
+    the plan would exit 0 -- a clean-looking run that is really a broken config.
+    apply.py refuses in the same situation; placement now does too."""
+    import io
+    import tempfile
+    from contextlib import redirect_stderr
+
+    cfg = Path(tempfile.mkdtemp(prefix="ds-placement-empty-")) / "config.yaml"
+    cfg.write_text("default_model: ds\n")
+    stderr = io.StringIO()
+    with redirect_stderr(stderr):
+        code = pl.main(["--plan", "--config", str(cfg)])
+    assert code == 1, (code, stderr.getvalue())
+    assert "No providers declared" in stderr.getvalue(), stderr.getvalue()
+
+
+def test_apply_json_reports_the_result_of_every_session():
+    """--apply --json used to print the plan and nothing else: results existed
+    only in text mode, so a scripted apply learned of a failure from the exit code
+    alone. The document now carries one result per session, printed once, after
+    the write attempt."""
+    import io
+    import json
+    import tempfile
+    import types
+    from contextlib import redirect_stdout
+    import load as q_load
+
+    fleet = [pl.Session(id=f"s{i}", provider="ollama-cloud", model="ollama-cloud-m")
+             for i in range(5)]
+    cfg = Path(tempfile.mkdtemp(prefix="ds-apply-json-cfg-")) / "config.yaml"
+    cfg.write_text(
+        "default_model: " + ALIAS + "\n"
+        "routing:\n  concurrency:\n    caps:\n      ollama-cloud: 3\n"
+        "providers:\n"
+        + "".join(f"  {name}:\n    base_url: https://x/v1\n    key_env: K\n"
+                  for name in PROVIDERS)
+        + f"models:\n  {ALIAS}:\n" + "".join(f"    {name}: {name}-m\n" for name in PROVIDERS))
+
+    transport = pl.FakeTransport(fail={"s3"})
+    transport.backend = types.SimpleNamespace(describe=lambda: "test backend")
+    real = (pl.LiveTransport, pl.enumerate_sessions, pl.collect_quotas, pl.CONFIG,
+            q_load.active_by_provider)
+    q_load.active_by_provider = lambda **kwargs: q_load.Load({}, "none")
+    pl.CONFIG = cfg
+    pl.LiveTransport = lambda **kwargs: transport          # type: ignore[assignment]
+    pl.enumerate_sessions = lambda transport=None, **kwargs: fleet  # type: ignore[assignment]
+    pl.collect_quotas = lambda providers, config: healthy_quotas()   # type: ignore[assignment]
+    stdout = io.StringIO()
+    try:
+        with redirect_stdout(stdout):
+            code = pl.main(["--apply", "--json"])
+    finally:
+        (pl.LiveTransport, pl.enumerate_sessions, pl.collect_quotas, pl.CONFIG,
+         q_load.active_by_provider) = real
+    assert code == 1, (code, stdout.getvalue()[-300:])
+    payload = json.loads(stdout.getvalue())
+    results = payload["results"]
+    assert len(results) == 5, results
+    failed = [r for r in results if not r["ok"]]
+    assert len(failed) == 1 and failed[0]["session_id"] == "s3" and failed[0]["error"], failed
+    assert len([r for r in results if r["ok"]]) == 4, results
+
+
+def test_a_plan_json_carries_no_results_key():
+    """A --plan --json run wrote nothing, so a "results" key would read as if it
+    had. The key appears only when the apply/dry-run pass actually ran."""
+    import io
+    import json
+    import tempfile
+    import types
+    from contextlib import redirect_stdout
+    import load as q_load
+
+    fleet = [pl.Session(id="s1", provider="ollama-cloud", model="ollama-cloud-m")]
+    cfg = Path(tempfile.mkdtemp(prefix="ds-plan-json-cfg-")) / "config.yaml"
+    cfg.write_text("default_model: " + ALIAS + "\nproviders:\n"
+                   + "".join(f"  {name}:\n    base_url: https://x/v1\n    key_env: K\n"
+                             for name in PROVIDERS)
+                   + f"models:\n  {ALIAS}:\n"
+                   + "".join(f"    {name}: {name}-m\n" for name in PROVIDERS))
+    transport = pl.FakeTransport()
+    transport.backend = types.SimpleNamespace(describe=lambda: "test backend")
+    real = (pl.LiveTransport, pl.enumerate_sessions, pl.collect_quotas, pl.CONFIG,
+            q_load.active_by_provider)
+    q_load.active_by_provider = lambda **kwargs: q_load.Load({}, "none")
+    pl.CONFIG = cfg
+    pl.LiveTransport = lambda **kwargs: transport          # type: ignore[assignment]
+    pl.enumerate_sessions = lambda transport=None, **kwargs: fleet  # type: ignore[assignment]
+    pl.collect_quotas = lambda providers, config: healthy_quotas()   # type: ignore[assignment]
+    stdout = io.StringIO()
+    try:
+        with redirect_stdout(stdout):
+            code = pl.main(["--plan", "--json"])
+    finally:
+        (pl.LiveTransport, pl.enumerate_sessions, pl.collect_quotas, pl.CONFIG,
+         q_load.active_by_provider) = real
+    assert code == 0, (code, stdout.getvalue()[-300:])
+    payload = json.loads(stdout.getvalue())
+    assert "results" not in payload, sorted(payload)
+    assert payload["assignments"], payload
 
 
 if __name__ == "__main__":
