@@ -490,8 +490,11 @@ Claims that are reasoned but **not** verified end to end are flagged inline.
 
 ## Requirements
 
-- Python 3.10+ with `pyyaml` (the suite is green on 3.10, 3.11 and 3.12)
+- Python 3.10+ with `pyyaml` (the suite is green on 3.10, 3.12 and 3.14)
 - The `hermes` CLI on PATH
+- `openssl` for the test suite only: the TLS checks generate a throwaway certificate
+  per run rather than shipping a private key in the repo, and they fail loudly without
+  it
 - Linux (systemd user units) or macOS (installer prints the launchd/cron
   equivalent; the router itself is pure Python and POSIX sh)
 
