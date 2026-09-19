@@ -600,7 +600,28 @@ def counts(assignments: Iterable[Assignment]) -> dict[str, int]:
 
 
 class TransportError(RuntimeError):
-    """A transport could not carry a call: no backend, no socket, or a refusal."""
+    """A transport could not carry a call: no backend, no socket, or a refusal.
+
+    ``status`` carries the HTTP status when there was one, so a caller can tell an
+    authentication refusal (401/403) from another HTTP failure without matching on
+    the message text. A message is for a human; a decision reads the code.
+    """
+
+    def __init__(self, message: str, *, status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _http_status_code(line: bytes) -> Optional[int]:
+    """The 3-digit code in an HTTP status line, or None when there is not one.
+
+    ``b" 101" in status`` used to decide whether an upgrade was accepted, which is a
+    substring test on a line a proxy is free to reword. Read the code instead.
+    """
+    for token in line.decode("latin-1", "replace").split()[:3]:
+        if len(token) == 3 and token.isdigit():
+            return int(token)
+    return None
 
 
 class NotSentError(TransportError):
@@ -700,9 +721,12 @@ class _WSClient:
             name, _, value = line.decode("latin-1").partition(":")
             if name.strip().lower() == "sec-websocket-accept":
                 accept = value.strip()
-        if b" 101" not in status:
+        code = _http_status_code(status)
+        if code != 101:
             sock.close()
-            raise TransportError(f"websocket upgrade refused: {status.decode('latin-1').strip()[:80]}")
+            raise TransportError(
+                f"websocket upgrade refused: {status.decode('latin-1').strip()[:80]}",
+                status=code)
         if accept != expected:
             sock.close()
             raise TransportError("websocket handshake failed: bad Sec-WebSocket-Accept")
@@ -973,6 +997,10 @@ class GatewaySession:
 
     def mint_ticket(self) -> str:
         """A fresh single-use ticket; re-signs in at most once when the cookie is stale."""
+        if self.logins == 0:
+            # No cookie has been obtained yet, so a ticket request now is a guaranteed
+            # 401 that the backend records as a rejected upgrade. Sign in first.
+            self.login()
         status, body = self._post("/api/auth/ws-ticket")
         if status == 401:
             self.forget()
@@ -1219,9 +1247,11 @@ class LiveTransport(Transport):
             raise
         except TransportError as exc:
             # An upgrade the gate refused (401/403) means the cookie is no longer
-            # accepted, so drop it and let the next attempt sign in again. A refusal
-            # for another reason must not cost a login: logins are rate limited.
-            if self._session is not None and (" 401" in str(exc) or " 403" in str(exc)):
+            # accepted, so drop it and let the next attempt sign in again. The status
+            # is carried on the error rather than read out of the message: a refusal
+            # for another reason must not cost a login, because logins are rate
+            # limited.
+            if self._session is not None and exc.status in (401, 403):
                 self._session.forget()
             # A connection is never a mutation: safe to repeat.
             raise NotSentError(str(exc)) from exc
