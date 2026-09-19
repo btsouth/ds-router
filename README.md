@@ -216,7 +216,7 @@ dashboard credential, mint a single-use WS ticket, then present that ticket on t
 upgrade. Point the planner at the backend and give it the credential:
 
 ```sh
-./placement.py --plan --gateway https://192.168.1.88:9119 \
+./placement.py --plan --gateway https://192.0.2.10:9119 \
     --gateway-user you \
     --gateway-password-file ~/.hermes/dashboard-lan-password.txt
 ```
@@ -225,7 +225,7 @@ Or put it in `config.yaml`, so the flags are not needed:
 
 ```yaml
 gateway:
-  url: https://192.168.1.88:9119
+  url: https://192.0.2.10:9119
   username: you
   password_file: ~/.hermes/dashboard-lan-password.txt
   # ca_file: /etc/ssl/my-dashboard-ca.pem   # only for a private or self-signed certificate

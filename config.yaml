@@ -148,7 +148,7 @@ peak:
 # state.db, so a backend on another host needs its own copy of this router.
 #
 #   gateway:
-#     url: https://192.168.1.88:9119
+#     url: https://192.0.2.10:9119
 #     username: you
 #     # A file you write yourself, one per dashboard, mode 0600 (a readable one is
 #     # refused). Either "label: value" or "label value" lines; prose is ignored.

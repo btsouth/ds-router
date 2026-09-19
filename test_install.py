@@ -29,6 +29,17 @@ import testkit
 
 INSTALL = HERE / "install.sh"
 
+# install.sh installs a systemd user timer on Linux and a launchd plist on macOS, and
+# deliberately does not load the plist. CI runs both, so the platform-specific
+# assertions below are gated rather than assumed: on a platform where a check cannot
+# run, it says so instead of passing quietly.
+LINUX = sys.platform.startswith("linux")
+DARWIN = sys.platform == "darwin"
+
+
+def skip_note(what: str) -> None:
+    print(f"  note  {what} (not applicable on {sys.platform})")
+
 
 def check(label: str, ok: bool, detail: str = "") -> None:
     """A named assertion: raise, so the runner reports the test, the label and the line."""
@@ -127,6 +138,11 @@ def test_a_dry_run_writes_nothing_and_reports_the_timer_state(tmp: pathlib.Path)
     written = [p.name for p in (tmp / "home").rglob("*") if p.is_file()
                and ".hermes" not in str(p)]
     check("nothing was written", not written, str(written))
+    check("the banner carries the timer state", "timer     : " in proc.stdout,
+          proc.stdout[-400:])
+    if not LINUX:
+        skip_note("the systemd assertions in this test")
+        return
     check("the banner says the timer is not active",
           "NOT active (no reachable systemd --user session)" in proc.stdout,
           proc.stdout[-400:])
@@ -144,6 +160,9 @@ def test_a_dry_run_writes_nothing_and_reports_the_timer_state(tmp: pathlib.Path)
 
 
 def test_a_reachable_bus_reports_the_timer_active(tmp: pathlib.Path) -> None:
+    if not LINUX:
+        skip_note("this test: there is no systemd bus to reach")
+        return
     proc = run_install(tmp, "--dry-run", "--skip-preflight", "--yes", bus=True)
     check("the dry run exits 0", proc.returncode == 0, proc.stderr[-300:])
     check("the banner says the timer is active", "timer     : active" in proc.stdout,
@@ -161,10 +180,11 @@ def test_an_uninstall_leaves_no_empty_directories_behind(tmp: pathlib.Path) -> N
     """
     home = tmp / "home"
     unit_dir = home / ".config" / "systemd" / "user"
+    plist = home / "Library" / "LaunchAgents" / "com.ds-router.switch.plist"
+    installed = plist if DARWIN else unit_dir / "ds-router.timer"
     proc = run_install(tmp, "--skip-preflight", "--yes")
     check("the install exits 0", proc.returncode == 0, proc.stderr[-300:])
-    check("the units were installed",
-          (unit_dir / "ds-router.timer").is_file(), str(list(unit_dir.iterdir())))
+    check("the service file was installed", installed.is_file(), str(installed))
 
     uninstall = subprocess.run([str(HERE / "uninstall.sh"), "--yes"], capture_output=True,
                               text=True, env={**os.environ,
@@ -175,9 +195,11 @@ def test_an_uninstall_leaves_no_empty_directories_behind(tmp: pathlib.Path) -> N
                                               "PATH": f"{tmp}:/usr/local/bin:/usr/bin:/bin"},
                               cwd=str(HERE), timeout=120)
     check("the uninstall exits 0", uninstall.returncode == 0, uninstall.stderr[-300:])
-    check("the unit files are gone", not (unit_dir / "ds-router.timer").exists(),
-          str(list(unit_dir.iterdir()) if unit_dir.exists() else []))
-    check("the empty unit directory is gone too", not unit_dir.exists(), str(unit_dir))
+    check("the service file is gone", not installed.exists(), str(installed))
+    if LINUX:
+        check("the empty unit directory is gone too", not unit_dir.exists(), str(unit_dir))
+    else:
+        skip_note("the units-directory assertion in this test")
     check("the manifest is gone",
           not (home / ".state" / "ds-router" / "install-manifest").exists())
 

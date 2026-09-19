@@ -1181,7 +1181,7 @@ def resolve_gateway(url: str, *, username: Optional[str] = None,
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise GatewayAuthError(
             f"a gated gateway needs an http or https origin such as "
-            f"http://192.168.1.88:9119, got {safe!r}")
+            f"http://192.0.2.10:9119, got {safe!r}")
     if parts.path.strip("/"):
         raise GatewayAuthError(
             f"{safe!r} carries a URL prefix, and a gated gateway must be an origin: the "
@@ -2216,7 +2216,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--token", default=None, help="backend WS token (default: /proc/<pid>/environ)")
     ap.add_argument("--gateway", default=None, metavar="URL",
                     help="steer sessions on a gated (non-loopback) backend, e.g. "
-                         "http://192.168.1.88:9119 (default: config gateway.url). Needs a "
+                         "http://192.0.2.10:9119 (default: config gateway.url). Needs a "
                          "dashboard credential; without it those sessions are only visible")
     ap.add_argument("--gateway-user", default=None,
                     help="dashboard username (default: config, else the credential file's)")
