@@ -247,23 +247,43 @@ def test_resolve_gateway_reads_a_file_and_an_env_var(scratch: Path) -> None:
     finally:
         os.environ.pop("DS_TEST_GATEWAY_PW", None)
 
-    https = pl.resolve_gateway("https://10.0.0.5", password_env="DS_TEST_GATEWAY_PW") \
-        if os.environ.get("DS_TEST_GATEWAY_PW") else None
-    check("a 443 default needs no env var to be resolved", https is None or https.port == 443)
 
+def test_a_shape_the_transport_cannot_speak_is_refused_not_half_supported(scratch: Path) -> None:
+    """A URL that looks accepted and fails later is worse than a clear no.
 
-def test_resolve_gateway_refuses_what_it_cannot_use(scratch: Path) -> None:
+    The outcome would be a silent fallback to the state DB, so the plan still prints
+    while steering has quietly stopped working.
+    """
+    path = scratch / "pw.txt"
+    path.write_text(f"username: bts\npassword: {SECRET}\n")
     cases = [
-        ("no credential at all", {}, "password_file"),
-        ("a scheme it cannot speak", {"password_env": "HOME"}, "http(s)"),
-        ("no host", {"password_env": "HOME"}, "http(s)"),
+        ("https://10.0.0.5:9119", "https", "second-backend"),
+        ("http://10.0.0.5:9119/dashboard", "prefix", "origin"),
+        ("http://user:hunter2@10.0.0.5:9119", "password_file", ""),
     ]
-    for label, kwargs, expect in cases:
-        url = "http://10.0.0.5:9119" if kwargs.get("password_env") else "http://10.0.0.5:9119"
-        if label == "a scheme it cannot speak":
-            url = "ftp://10.0.0.5:9119"
-        if label == "no host":
-            url = "http://"
+    for url, needle, also in cases:
+        try:
+            pl.resolve_gateway(url, password_file=str(path))
+        except pl.GatewayAuthError as exc:
+            message = str(exc)
+            check(f"{url} is refused", needle in message, message)
+            if also:
+                check(f"{url} names the way out", also in message, message)
+            if "hunter2" in url:
+                check("the URL's password is not echoed", "hunter2" not in message, message)
+        else:
+            raise AssertionError(f"{url} was accepted")
+
+
+def test_resolve_gateway_refuses_what_it_cannot_use() -> None:
+    cases = [
+        ("no credential at all", "http://10.0.0.5:9119", {}, "password_file"),
+        ("a scheme it cannot speak", "ftp://10.0.0.5:9119", {"password_env": "PATH"}, "http(s)"),
+        ("no host", "http://", {"password_env": "PATH"}, "http(s)"),
+        ("an env var that is unset", "http://10.0.0.5:9119",
+         {"password_env": "DS_TEST_UNSET_VAR"}, "DS_TEST_UNSET_VAR"),
+    ]
+    for label, url, kwargs, expect in cases:
         try:
             pl.resolve_gateway(url, **kwargs)
         except pl.GatewayAuthError as exc:

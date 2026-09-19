@@ -209,6 +209,12 @@ gateway:
 process on the machine. With no `gateway:` block and no `--gateway`, nothing
 changes and discovery stays on the token path described above.
 
+The origin has to be plain `http` on a host and a port, which is what a tailnet or
+LAN address is: this transport speaks plaintext HTTP and WebSocket. Three shapes
+are refused up front with a message saying what to do instead, rather than accepted
+and then failing halfway: an `https` dashboard, one served under a URL prefix, and a
+URL with a password inside it. Use the second-backend recipe below for those.
+
 Verified against a real gated backend on this machine: 13 open sessions that the
 token path cannot see at all, and a plan that moved one of them off an exhausted
 provider. Set no credential and those sessions are still visible in `state.db`, but

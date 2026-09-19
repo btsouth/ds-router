@@ -856,6 +856,13 @@ class Gateway:
         return f"{self.scheme}://{self.host}:{self.port}"
 
     def ticket_url(self, ticket: str) -> str:
+        """The upgrade URL for *ticket*.
+
+        ``https`` becomes ``wss`` because that is the correct mapping, but a TLS
+        gateway is refused at the config boundary (see ``resolve_gateway``): the
+        WebSocket client below speaks plaintext HTTP, so this branch is only
+        reachable for a ``Gateway`` a caller built by hand.
+        """
         ws_scheme = "wss" if self.scheme == "https" else "ws"
         return (f"{ws_scheme}://{self.host}:{self.port}/api/ws"
                 f"?ticket={urllib.parse.quote(ticket)}")
@@ -899,13 +906,42 @@ def resolve_gateway(url: str, *, username: Optional[str] = None,
     No ``--gateway-password`` flag exists on purpose: a password in argv is readable
     by every process on the machine, and Hermes already writes a 0600 file next to
     each dashboard. A file or an env var is the whole option set.
+
+    Three shapes are refused rather than half-supported, because a URL that looks
+    accepted and then fails later is worse than a clear no:
+
+    * **https.** The WebSocket client speaks plaintext HTTP, so a ``wss://`` origin
+      would send the ticket in the clear to a TLS port and fail with a meaningless
+      error. A TLS gateway needs the second-backend recipe in the README until the
+      transport can speak TLS.
+    * **a URL prefix.** The paths are fixed (``/auth/password-login``,
+      ``/api/auth/ws-ticket``, ``/api/ws``), so a dashboard served under a subpath
+      would be signed in against the wrong URL and answer a confusing 404.
+    * **a password inside the URL.** It would be silently ignored, and it is a
+      password in shell history and in ``ps`` output, which is what the missing flag
+      exists to avoid.
     """
     parts = urllib.parse.urlsplit(str(url or ""))
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise GatewayAuthError(
             f"a gated gateway needs an http(s) origin such as "
             f"http://192.168.1.88:9119, got {url!r}")
-    port = parts.port or (443 if parts.scheme == "https" else 80)
+    if parts.scheme == "https":
+        raise GatewayAuthError(
+            f"{url!r} is https, and this transport speaks plaintext HTTP and WebSocket "
+            f"only: point it at a plain http origin (a tailnet or LAN address), or use "
+            f"the second-backend recipe in the README for a TLS dashboard")
+    if parts.path.strip("/"):
+        raise GatewayAuthError(
+            f"{url!r} carries a URL prefix, and a gated gateway must be an origin: the "
+            f"sign-in and ticket paths are fixed, so a dashboard served under a subpath "
+            f"is not supported")
+    if parts.password:
+        raise GatewayAuthError(
+            f"the gateway URL carries a password, which is ignored by design (any URL "
+            f"ends up in shell history and in ps output): use password_file or "
+            f"password_env instead")
+    port = parts.port or 80
 
     file_user = ""
     if password_file:
