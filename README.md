@@ -1,5 +1,7 @@
 # ds-router
 
+[![tests](https://github.com/btsouth/ds-router/actions/workflows/tests.yml/badge.svg)](https://github.com/btsouth/ds-router/actions/workflows/tests.yml)
+
 Keeps your Hermes agent on whichever LLM provider still has quota.
 
 You have several subscriptions that all serve the same open models. Each one has
@@ -49,11 +51,11 @@ cd ~/Projects/ds-router
 Any clone location works — the installer rewrites the systemd units and the
 manifest to wherever you put it, so `~/ds-router` or a nested path is fine.
 
-`install.sh` checks your prerequisites, runs the test suite as a preflight,
-installs and enables a systemd timer (Linux), or writes a launchd job (macOS)
-and prints the two commands that load it, because loading someone's launchd job
-unasked is not the installer's call. **It does not touch your Hermes config** — installing and
-routing are separate steps.
+`install.sh` checks your prerequisites, runs the test suite as a preflight, and
+installs and enables a systemd timer (Linux), or writes a launchd job (macOS) and
+prints the two commands that load it, because loading someone's launchd job
+unasked is not the installer's call. **It does not touch your Hermes config**:
+installing and routing are separate steps.
 
 Preview what the router would choose before enabling anything:
 
