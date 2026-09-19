@@ -86,23 +86,21 @@ def fake_hermes(tmp: pathlib.Path) -> pathlib.Path:
     return binary
 
 
-def run_install(tmp: pathlib.Path, *args: str, bus: bool = True,
-                keys: dict[str, str] | None = None,
-                timeout: int = 120) -> subprocess.CompletedProcess:
-    """Run the installer against a throwaway home, with nothing of the caller's.
+def sandbox_env(tmp: pathlib.Path, home: pathlib.Path) -> dict[str, str]:
+    """An environment with the fakes first and nothing of the caller's.
 
-    The environment is built rather than inherited: an exported HERMES_HOME or a real
-    provider key in the calling shell would make a sandbox test pass while the same
-    code fails on a stranger's machine.
+    Built rather than inherited, because an exported HERMES_HOME or a real provider key
+    in the calling shell would let a sandbox test pass while the same code fails on a
+    stranger's machine. PATH is the one exception, and it is prepended rather than
+    replaced: the fakes have to win, and everything after them has to keep working.
+    `ds-switch` execs `python3`, and on macOS there is no python3 in `/usr/bin`, so a
+    PATH built from system directories alone left the installer unable to verify its own
+    install. `sys.executable`'s directory is the interpreter running this suite, which
+    is the one python3 that is certainly present.
     """
-    fake = fake_systemctl(tmp, bus=bus)
-    fake_hermes(tmp)
-    home = tmp / "home"
-    (home / ".hermes").mkdir(parents=True, exist_ok=True)
-    env = {
-        # Only the fakes and the system tools: the caller's PATH would let the real
-        # hermes and a real systemctl leak into what is meant to be a sandbox.
-        "PATH": f"{fake.parent}:/usr/local/bin:/usr/bin:/bin",
+    return {
+        "PATH": os.pathsep.join([str(tmp), os.path.dirname(sys.executable),
+                                 os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")]),
         "HOME": str(home),
         "HERMES_HOME": str(home / ".hermes"),
         "XDG_CONFIG_HOME": str(home / ".config"),
@@ -110,6 +108,17 @@ def run_install(tmp: pathlib.Path, *args: str, bus: bool = True,
         "XDG_RUNTIME_DIR": str(tmp),
         "LC_ALL": "C",
     }
+
+
+def run_install(tmp: pathlib.Path, *args: str, bus: bool = True,
+                keys: dict[str, str] | None = None,
+                timeout: int = 120) -> subprocess.CompletedProcess:
+    """Run the installer against a throwaway home, with the fakes on PATH."""
+    fake_systemctl(tmp, bus=bus)
+    fake_hermes(tmp)
+    home = tmp / "home"
+    (home / ".hermes").mkdir(parents=True, exist_ok=True)
+    env = sandbox_env(tmp, home)
     if keys:
         env.update(keys)
     return subprocess.run([str(INSTALL), *args], capture_output=True, text=True,
@@ -187,12 +196,7 @@ def test_an_uninstall_leaves_no_empty_directories_behind(tmp: pathlib.Path) -> N
     check("the service file was installed", installed.is_file(), str(installed))
 
     uninstall = subprocess.run([str(HERE / "uninstall.sh"), "--yes"], capture_output=True,
-                              text=True, env={**os.environ,
-                                              "HOME": str(home),
-                                              "HERMES_HOME": str(home / ".hermes"),
-                                              "XDG_CONFIG_HOME": str(home / ".config"),
-                                              "XDG_STATE_HOME": str(home / ".state"),
-                                              "PATH": f"{tmp}:/usr/local/bin:/usr/bin:/bin"},
+                              text=True, env=sandbox_env(tmp, home),
                               cwd=str(HERE), timeout=120)
     check("the uninstall exits 0", uninstall.returncode == 0, uninstall.stderr[-300:])
     check("the service file is gone", not installed.exists(), str(installed))
