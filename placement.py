@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import http.cookiejar
 import json
 import os
 import socket
@@ -48,7 +49,9 @@ import sqlite3
 import struct
 import sys
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -776,6 +779,241 @@ class _WSClient:
         self._sock = self._reader = None
 
 
+# --------------------------------------------------------------------------- #
+# Gated backends: a dashboard credential, then a ticket
+# --------------------------------------------------------------------------- #
+#
+# A backend bound to a non-loopback address never carries
+# ``HERMES_DASHBOARD_SESSION_TOKEN``. Hermes engages a ticket-only auth gate for a
+# non-loopback bind — and for a non-loopback ``dashboard.public_url`` even on a
+# loopback bind — and that gate refuses the session token by design. So the
+# sessions that matter most, the ones the Desktop app and a phone create against
+# the shared backend, are exactly the ones a token-only transport cannot reach:
+# it sees them in the database and can never steer them.
+#
+# A gated backend is reached the way a browser reaches it:
+#
+#     POST /auth/password-login    {"provider":"basic","username","password"} -> cookie
+#     POST /api/auth/ws-ticket     (cookie) -> {"ticket", "ttl_seconds": 30}
+#     GET  /api/ws?ticket=...      single-use upgrade
+#
+# Two properties of that gate shape the code below rather than taste:
+#
+#   * The ticket is single-use with a 30 s TTL, so one is minted per connection and
+#     never cached: a reconnect that reused the previous ticket would be refused,
+#     and a cached ticket would expire before the next call.
+#   * Login is rate limited per client IP, so the cookie is held for the life of
+#     the process and re-obtained only when the backend rejects it. Retrying a
+#     wrong password would turn a clear refusal into a 429.
+
+
+class GatewayAuthError(TransportError):
+    """A gated backend refused the credential, so no ticket could be minted.
+
+    Deliberately not "no backend found": the address is right and the fix is
+    different (supply the right credential, not another port). Messages name the
+    credential's *source* and never its value.
+    """
+
+
+@dataclass
+class Gateway:
+    """A gated backend reached with a dashboard credential."""
+
+    host: str
+    port: int
+    username: str
+    password: str
+    scheme: str = "http"
+    source: str = "config"
+
+    @property
+    def origin(self) -> str:
+        return f"{self.scheme}://{self.host}:{self.port}"
+
+    def ticket_url(self, ticket: str) -> str:
+        ws_scheme = "wss" if self.scheme == "https" else "ws"
+        return (f"{ws_scheme}://{self.host}:{self.port}/api/ws"
+                f"?ticket={urllib.parse.quote(ticket)}")
+
+    def describe(self) -> str:
+        return f"{self.host}:{self.port} (gated, credential from {self.source})"
+
+
+def read_gateway_credential(path: Path) -> tuple[str, str]:
+    """``(username, password)`` from *path*, empty username when the file has none.
+
+    Hermes writes a key/value file (``username:`` / ``password:`` / ``origin:``), so
+    a bare "first line is the password" reader is not enough; a bare line is still
+    accepted for a hand-made secret file. Neither value is ever printed.
+    """
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise GatewayAuthError(f"cannot read the gateway credential file {path}: {exc}") from exc
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if sep and value.strip():
+            fields[key.strip().lower()] = value.strip()
+    if fields.get("password"):
+        return fields.get("username", ""), fields["password"]
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and ":" not in stripped:
+            return "", stripped
+    raise GatewayAuthError(
+        f"the gateway credential file {path} holds no password: expected a "
+        f"'password:' line or a bare secret line")
+
+
+def resolve_gateway(url: str, *, username: Optional[str] = None,
+                    password_file: Optional[str] = None,
+                    password_env: Optional[str] = None) -> Gateway:
+    """Build a :class:`Gateway` from an origin plus a credential source.
+
+    No ``--gateway-password`` flag exists on purpose: a password in argv is readable
+    by every process on the machine, and Hermes already writes a 0600 file next to
+    each dashboard. A file or an env var is the whole option set.
+    """
+    parts = urllib.parse.urlsplit(str(url or ""))
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise GatewayAuthError(
+            f"a gated gateway needs an http(s) origin such as "
+            f"http://192.168.1.88:9119, got {url!r}")
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+
+    file_user = ""
+    if password_file:
+        path = Path(str(password_file)).expanduser()
+        file_user, secret = read_gateway_credential(path)
+        source = str(path)
+    elif password_env:
+        secret = os.environ.get(str(password_env), "")
+        source = f"${password_env}"
+        if not secret:
+            raise GatewayAuthError(f"{password_env} is unset or empty")
+    else:
+        raise GatewayAuthError(
+            f"no credential for the gated gateway {url}: set gateway.password_file in "
+            f"config.yaml (Hermes writes one at ~/.hermes/dashboard-lan-password.txt), "
+            f"or pass --gateway-password-file / --gateway-password-env")
+
+    user = str(username or file_user or "").strip()
+    if not user:
+        raise GatewayAuthError(
+            f"no dashboard username for the gated gateway {url}: pass --gateway-user or "
+            f"point at a credential file that carries a 'username:' line")
+    return Gateway(host=parts.hostname, port=int(port), username=user, password=secret,
+                   scheme=parts.scheme, source=source)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Surface a redirect as its status instead of following it.
+
+    Following one cannot authenticate anything here, and a login that answered with
+    a redirect means the credential was not accepted. Hiding that behind a followed
+    3xx is how "wrong password" turns into "no ticket".
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
+
+
+class GatewaySession:
+    """One signed-in session against a gated backend: a cookie, then tickets."""
+
+    def __init__(self, gateway: Gateway, *, timeout: float = 10.0) -> None:
+        self.gateway = gateway
+        self.timeout = float(timeout)
+        self.logins = 0  # observable so a retry loop over a bad password cannot hide here
+        self._jar = http.cookiejar.CookieJar()
+        self._opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self._jar), _NoRedirect())
+
+    def forget(self) -> None:
+        """Drop the cookie so the next mint signs in again."""
+        self._jar.clear()
+
+    def _post(self, path: str, payload: Optional[dict] = None) -> tuple[int, Any]:
+        body = None if payload is None else json.dumps(payload).encode()
+        request = urllib.request.Request(self.gateway.origin + path, data=body, method="POST")
+        if body is not None:
+            request.add_header("Content-Type", "application/json")
+        try:
+            with self._opener.open(request, timeout=self.timeout) as reply:
+                return int(reply.status), _json_or_empty(reply.read(65536))
+        except urllib.error.HTTPError as exc:
+            return int(exc.code), _json_or_empty(exc.read(65536))
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise GatewayAuthError(
+                f"cannot reach the gated gateway at {self.gateway.origin}: {exc}") from exc
+
+    def login(self) -> None:
+        status, body = self._post("/auth/password-login", {
+            "provider": "basic", "username": self.gateway.username,
+            "password": self.gateway.password})
+        self.logins += 1
+        if status == 200:
+            return
+        detail = ""
+        if isinstance(body, dict):
+            detail = str(body.get("detail") or body.get("error") or "")
+        causes = {
+            401: f"the credential from {self.gateway.source} was refused",
+            404: "this backend advertises no password provider (the 'basic' provider "
+                 "is not registered); see /api/auth/providers",
+            429: "the backend rate limited the login attempts; wait a minute. "
+                 "This is not retried",
+            503: "the backend could not read its credential store",
+        }
+        raise GatewayAuthError(
+            f"sign-in to the gated gateway {self.gateway.origin} failed: "
+            f"{causes.get(status, f'HTTP {status}')}{f' ({detail})' if detail else ''}")
+
+    def mint_ticket(self) -> str:
+        """A fresh single-use ticket; re-signs in at most once when the cookie is stale."""
+        status, body = self._post("/api/auth/ws-ticket")
+        if status == 401:
+            self.forget()
+            self.login()
+            status, body = self._post("/api/auth/ws-ticket")
+        if status != 200:
+            raise GatewayAuthError(
+                f"the gated gateway {self.gateway.origin} refused a WS ticket: HTTP {status}")
+        ticket = body.get("ticket") if isinstance(body, dict) else None
+        if not isinstance(ticket, str) or not ticket:
+            raise GatewayAuthError(
+                f"the gated gateway {self.gateway.origin} returned no ticket")
+        return ticket
+
+
+def _json_or_empty(raw: Any) -> Any:
+    try:
+        return json.loads(raw or b"")
+    except (ValueError, TypeError):
+        return {}
+
+
+def gateway_from_config(config: dict, args: Any = None) -> Optional[Gateway]:
+    """The gated gateway to steer: explicit flags win, else the config ``gateway:`` block.
+
+    Absent everywhere means ``None``, which keeps every existing invocation on the
+    loopback/token path it has today.
+    """
+    block = config.get("gateway") or {}
+    if not isinstance(block, dict):
+        raise GatewayAuthError("the 'gateway' block in config.yaml must be a mapping")
+    url = (getattr(args, "gateway", None) or block.get("url") or "")
+    if not url:
+        return None
+    return resolve_gateway(
+        url,
+        username=getattr(args, "gateway_user", None) or block.get("username"),
+        password_file=getattr(args, "gateway_password_file", None) or block.get("password_file"),
+        password_env=getattr(args, "gateway_password_env", None) or block.get("password_env"))
+
+
 @dataclass
 class Backend:
     """A discovered Hermes backend process."""
@@ -784,12 +1022,15 @@ class Backend:
     port: int
     token: str
     kind: str = "serve"
+    gateway: Optional[Gateway] = None
 
     @property
     def url(self) -> str:
         return f"ws://127.0.0.1:{self.port}/api/ws?token={urllib.parse.quote(self.token)}"
 
     def describe(self) -> str:
+        if self.gateway is not None:
+            return self.gateway.describe()
         return f"pid={self.pid} port={self.port} ({self.kind})"
 
 
@@ -904,16 +1145,24 @@ class LiveTransport(Transport):
 
     def __init__(self, *, host: str = "127.0.0.1", port: Optional[int] = None,
                  token: Optional[str] = None, pid: Optional[int] = None,
+                 gateway: Optional[Gateway] = None,
                  timeout: float = 10.0) -> None:
         self.timeout = float(timeout)
-        self.backend = self._resolve(port=port, token=token, pid=pid)
+        self.gateway = gateway
+        self.backend = self._resolve(port=port, token=token, pid=pid, gateway=gateway)
         self.host = host
         self._ws: Optional[_WSClient] = None
         self._id = 0
+        self._session: Optional[GatewaySession] = None
 
     @staticmethod
     def _resolve(*, port: Optional[int], token: Optional[str],
-                 pid: Optional[int]) -> Backend:
+                 pid: Optional[int], gateway: Optional[Gateway] = None) -> Backend:
+        if gateway is not None:
+            # A gated backend is addressed explicitly: it has no token to discover
+            # and may not even be on this machine.
+            return Backend(pid=0, port=int(gateway.port), token="", kind="gated",
+                           gateway=gateway)
         if port and token:
             return Backend(pid=pid or 0, port=int(port), token=str(token), kind="explicit")
         found = discover_backends()
@@ -937,18 +1186,43 @@ class LiveTransport(Transport):
 
     # --- connection -------------------------------------------------------- #
 
-    def _connect(self) -> _WSClient:
-        if self._ws is not None:
-            return self._ws
+    def _gateway_session(self) -> GatewaySession:
+        gateway = self.backend.gateway
+        if gateway is None:
+            raise TransportError("this transport has no gated gateway configured")
+        if self._session is None:
+            self._session = GatewaySession(gateway, timeout=self.timeout)
+        return self._session
+
+    def _ws_url(self) -> str:
+        """Where to connect: a token URL for a loopback backend, a fresh ticket for a gated one.
+
+        Minted here, per connection, because the ticket is single-use with a 30 s TTL:
+        caching one would hand the retry path a credential the backend has already
+        burned, and the next call a credential that expired.
+        """
+        if self.backend.gateway is not None:
+            return self.backend.gateway.ticket_url(self._gateway_session().mint_ticket())
         url = self.backend.url
         if self.host and self.host != "127.0.0.1":
             url = url.replace("127.0.0.1", self.host, 1)
+        return url
+
+    def _connect(self) -> _WSClient:
+        if self._ws is not None:
+            return self._ws
+        url = self._ws_url()
         client = _WSClient(url, timeout=self.timeout)
         try:
             client.connect()
         except NotSentError:
             raise
         except TransportError as exc:
+            # An upgrade the gate refused (401/403) means the cookie is no longer
+            # accepted, so drop it and let the next attempt sign in again. A refusal
+            # for another reason must not cost a login: logins are rate limited.
+            if self._session is not None and (" 401" in str(exc) or " 403" in str(exc)):
+                self._session.forget()
             # A connection is never a mutation: safe to repeat.
             raise NotSentError(str(exc)) from exc
         except OSError as exc:
@@ -1440,6 +1714,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--db-path", default=None, help="state.db to read (default: ~/.hermes/state.db)")
     ap.add_argument("--port", type=int, default=None, help="backend port (default: discovered from /proc)")
     ap.add_argument("--token", default=None, help="backend WS token (default: /proc/<pid>/environ)")
+    ap.add_argument("--gateway", default=None, metavar="URL",
+                    help="steer sessions on a gated (non-loopback) backend, e.g. "
+                         "http://192.168.1.88:9119 (default: config gateway.url). Needs a "
+                         "dashboard credential; without it those sessions are only visible")
+    ap.add_argument("--gateway-user", default=None,
+                    help="dashboard username (default: config, else the credential file's)")
+    ap.add_argument("--gateway-password-file", default=None, metavar="PATH",
+                    help="file holding the dashboard password "
+                         "(default: config gateway.password_file)")
+    ap.add_argument("--gateway-password-env", default=None, metavar="VAR",
+                    help="env var holding the dashboard password "
+                         "(default: config gateway.password_env)")
     ap.add_argument("--children", action="store_true", help="include subagent/cron sessions")
     ap.add_argument("--limit", type=int, default=0, help="only print this many rows (0 = all)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
@@ -1450,6 +1736,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     config = load_config()
+    try:
+        gateway = gateway_from_config(config, args)
+    except GatewayAuthError as exc:
+        print(f"refusing to start: {exc}", file=sys.stderr)
+        return 2
     providers = build_providers(config)
     alias = args.alias or str(config.get("default_model") or "")
     routing_cfg = config.get("routing") or {}
@@ -1460,7 +1751,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     source = "state.db"
     if not args.db:
         try:
-            transport = LiveTransport(port=args.port, token=args.token)
+            transport = LiveTransport(port=args.port, token=args.token, gateway=gateway)
             source = f"live backend {transport.backend.describe()}"
         except TransportError as exc:
             print(f"  note: {exc}\n  note: falling back to the state DB.", file=sys.stderr)
@@ -1551,7 +1842,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.apply and transport is None:
         try:
-            transport = LiveTransport(port=args.port, token=args.token)
+            transport = LiveTransport(port=args.port, token=args.token, gateway=gateway)
         except TransportError as exc:
             print(f"--apply needs a backend: {exc}", file=sys.stderr)
             return 3
