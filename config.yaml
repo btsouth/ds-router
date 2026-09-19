@@ -125,3 +125,19 @@ peak:
     ollama-cloud:
       - [12, 18]
     opencode-go: []
+
+# Steering a backend whose dashboard is published. Hermes refuses its own session
+# token on any non-loopback bind, and on a non-loopback dashboard.public_url even
+# when the bind is loopback, so the sessions on such a backend can only be reached
+# the way a browser reaches them: a dashboard credential, then a single-use WS
+# ticket. Fill this in to steer them; leave it out and every invocation behaves
+# exactly as it did before.
+#
+#   gateway:
+#     url: http://192.168.1.88:9119
+#     username: you
+#     # Hermes writes one of these, mode 0600, next to each dashboard's config.
+#     password_file: ~/.hermes/dashboard-lan-password.txt
+#     # Or name an env var instead of a file. There is deliberately no way to pass
+#     # the password as an argument: argv is readable by every process on the box.
+#     # password_env: MY_DASHBOARD_PASSWORD
