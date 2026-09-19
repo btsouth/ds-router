@@ -367,6 +367,28 @@ def test_the_origin_comparison_can_never_fail_the_run() -> None:
               str(pl._same_authority(entry, authority)))
 
 
+def test_a_label_separated_by_a_colon_with_no_space_is_read(scratch: Path) -> None:
+    """`password:secret` is a hand-written file a user will produce."""
+    with FakeGate() as gate:
+        path = scratch / "tight.txt"
+        path.write_text(f"username:{gate.username}\npassword:{SECRET}\n")
+        path.chmod(0o600)
+        credential = pl.read_gateway_credential(path)
+        check("the tight form is read", credential.password == SECRET, credential.password)
+        check("and its username too", credential.username == gate.username, credential.username)
+
+
+def test_a_bare_secret_that_starts_with_a_label_is_still_a_secret(scratch: Path) -> None:
+    """An optional separator made "passwd9k2" parse as the label "passwd" with "9k2"."""
+    path = scratch / "bare.txt"
+    path.write_text("passwd9k2\n")
+    path.chmod(0o600)
+    credential = pl.read_gateway_credential(path)
+    check("the whole line is the secret", credential.password == "passwd9k2",
+          credential.password)
+    check("no username is invented", credential.username == "", credential.username)
+
+
 def test_credential_file_accepts_a_bare_secret_line(scratch: Path) -> None:
     path = scratch / "pw.txt"
     path.write_text(f"# a hand-made secret file\n{SECRET}\n")
@@ -586,13 +608,49 @@ def _run_placement(*args: str) -> subprocess.CompletedProcess:
                           capture_output=True, text=True, cwd=HERE, timeout=120)
 
 
-def test_no_credential_refuses_rather_than_planning_from_the_store() -> None:
+# A config of its own, so these runs do not read the checkout's config.yaml: a user who
+# follows the README and adds a `gateway:` block would otherwise change what the suite
+# tests, and install.sh's preflight would refuse on their machine.
+MINIMAL_CONFIG = (
+    "default_model: ds\n"
+    "providers:\n"
+    "  ollama-cloud:\n"
+    "    base_url: https://example.invalid/v1\n"
+    "    key_env: DS_TEST_KEY\n"
+    "models:\n"
+    "  ds:\n"
+    "    ollama-cloud: ds-local\n")
+
+
+def _wrote_config(scratch: Path, text: str = MINIMAL_CONFIG) -> str:
+    path = scratch / "config.yaml"
+    path.write_text(text)
+    return str(path)
+
+
+def test_no_credential_refuses_rather_than_planning_from_the_store(scratch: Path) -> None:
     """`--gateway` with no credential used to be a silently credential-less run."""
-    proc = _run_placement("--plan", "--gateway", "http://127.0.0.1:1")
+    proc = _run_placement("--plan", "--config", _wrote_config(scratch),
+                          "--gateway", "http://127.0.0.1:1")
     check("it refused", proc.returncode == 2, str(proc.returncode))
     check("the reason is a missing credential", "no credential" in proc.stderr,
           proc.stderr[-300:])
     check("no plan was printed", "alias" not in proc.stdout, proc.stdout[-300:])
+
+
+def test_the_config_path_is_honoured(scratch: Path) -> None:
+    """A gateway block in a config this run was pointed at is used; the default is not."""
+    with FakeGate() as gate:
+        path = gate.credential_file(scratch)
+        pointed_at = _wrote_config(scratch, MINIMAL_CONFIG + (
+            "gateway:\n"
+            f"  url: {gate.origin}\n"
+            "  username: bts\n"
+            f"  password_file: {path}\n"))
+        proc = _run_placement("--plan", "--config", pointed_at)
+        check("the pointed-at config was read", "gated, credential from" in proc.stdout
+              or "gated, credential from" in proc.stderr, proc.stdout + proc.stderr)
+        check("the sign-in used that config's credential", gate.logins == 1, str(gate.logins))
 
 
 def test_a_credential_failure_refuses_rather_than_planning_from_the_store(scratch: Path) -> None:
@@ -603,7 +661,8 @@ def test_a_credential_failure_refuses_rather_than_planning_from_the_store(scratc
     """
     with FakeGate() as gate:
         bad = gate.credential_file(scratch, name="bad-pw.txt", password="not-the-password")
-        proc = _run_placement("--plan", "--gateway", gate.origin, "--gateway-user", "bts",
+        proc = _run_placement("--plan", "--config", _wrote_config(scratch),
+                              "--gateway", gate.origin, "--gateway-user", "bts",
                               "--gateway-password-file", str(bad))
         check("it refused", proc.returncode == 2, str(proc.returncode))
         check("the reason is the refused credential", "refused" in proc.stderr, proc.stderr[-300:])
@@ -797,6 +856,33 @@ def test_a_gated_backend_is_addressed_explicitly() -> None:
           gateway.ticket_url("t"))
 
 
+def test_a_gateway_refuses_a_host_it_cannot_dial() -> None:
+    """The invariants belong to the dataclass, not only to the config path."""
+    cases = [
+        ("[::1]", "bare literal"),
+        ("evil.example@127.0.0.1", "not a host"),
+        ("127.0.0.1/dashboard", "not a host"),
+        ("0.0.0.0", "wildcard"),
+        ("0:0:0:0:0:0:0:0", "wildcard"),
+        ("::ffff:0.0.0.0", "wildcard"),
+    ]
+    for host, needle in cases:
+        try:
+            pl.Gateway(host=host, port=9119, username="u", password="p")
+        except pl.GatewayAuthError as exc:
+            check(f"{host} is refused", needle in str(exc), str(exc))
+        else:
+            raise AssertionError(f"{host} was accepted as a gateway host")
+
+
+def test_an_ipv6_origin_is_the_same_origin_however_it_is_written() -> None:
+    """Otherwise a credential file naming the host it is for produces a false warning."""
+    check("bracketed against bracketed", pl._same_authority("https://[::1]:9119", "[::1]:9119"))
+    check("unbracketed against bracketed", pl._same_authority("https://[::1]:9119", "[::1]:9119"))
+    check("a different port is still different",
+          not pl._same_authority("https://[::1]:9119", "[::1]:9120"))
+
+
 def test_an_ipv6_origin_keeps_its_brackets() -> None:
     """Without them the URL is unparseable, which used to fall back to the state store silently."""
     gateway = pl.Gateway(host="::1", port=9119, username="u", password="p")
@@ -854,8 +940,12 @@ def test_an_untrusted_certificate_stops_the_sign_in(scratch: Path) -> None:
         try:
             session.mint_ticket()
         except pl.GatewayAuthError as exc:
+            message = str(exc)
             check("the refusal names the certificate",
-                  "certificate" in str(exc).lower(), str(exc))
+                  "could not be verified" in message, message)
+            check("it names the way to trust it", "--gateway-ca-file" in message, message)
+            # "cannot reach the gateway" sends the reader to fix the credential.
+            check("it is not reported as unreachable", "cannot reach" not in message, message)
             check("the server never saw a sign-in", gate.logins == 0, str(gate.logins))
             return
     raise AssertionError("an untrusted certificate was accepted")
@@ -996,6 +1086,56 @@ def test_the_upgrade_status_is_read_as_a_code_not_a_substring() -> None:
     for line, expected in cases:
         check(f"{line!r} reads as {expected}", pl._http_status_code(line) == expected,
               str(pl._http_status_code(line)))
+
+
+def test_a_status_line_is_sanitised_before_it_reaches_a_message() -> None:
+    """A peer writes the status line, and the request it answers carried the ticket.
+
+    A refusal is free to reflect that ticket back, or to carry terminal escapes into
+    the operator's log and the journal.
+    """
+    port, _ = _fake_upgrade(b"HTTP/1.1 400 GET /api/ws?ticket=SECRET-TICKET HTTP/1.1\r\n")
+    client = pl._WSClient(f"ws://127.0.0.1:{port}/api/ws?ticket=SECRET-TICKET", timeout=5.0)
+    try:
+        client.connect()
+    except pl.TransportError as exc:
+        message = str(exc)
+        check("the ticket is not reflected into the message", "SECRET-TICKET" not in message,
+              message)
+        check("it is redacted rather than dropped", "ticket=***" in message, message)
+        check("the status itself is still reported", "400" in message, message)
+    else:
+        raise AssertionError("a 400 upgrade was treated as connected")
+
+    port, _ = _fake_upgrade(b"HTTP/1.1 403 \x1b]0;PWNED\x07\x1b[2Jno\r\n")
+    client = pl._WSClient(f"ws://127.0.0.1:{port}/api/ws?ticket=t", timeout=5.0)
+    try:
+        client.connect()
+    except pl.TransportError as exc:
+        message = str(exc)
+        for escape in ("\x1b", "\x07"):
+            check(f"no {escape!r} reaches the message", escape not in message, repr(message))
+    else:
+        raise AssertionError("a 403 upgrade was treated as connected")
+
+
+def test_a_status_line_that_never_arrived_says_so() -> None:
+    """It used to produce a message ending in "refused: " with nothing after the colon."""
+    check("an empty line is named", "no status line" in pl._safe_status_line(b""))
+    check("a blank line is named too", "no status line" in pl._safe_status_line(b"\r\n"))
+    check("a real line survives", pl._safe_status_line(b"HTTP/1.1 401 Unauthorized\r\n")
+          == "HTTP/1.1 401 Unauthorized")
+
+
+def test_the_host_header_brackets_an_ipv6_literal() -> None:
+    """`Host: ::1:9119` is not a valid header, so a strict server refuses the upgrade
+    that urllib performs happily on the same authority."""
+    check("an IPv6 literal is bracketed", pl._host_header("::1", 9119) == "[::1]:9119",
+          pl._host_header("::1", 9119))
+    check("a name is not bracketed", pl._host_header("devbox", 9119) == "devbox:9119",
+          pl._host_header("devbox", 9119))
+    check("an IPv4 literal is not bracketed",
+          pl._host_header("127.0.0.1", 80) == "127.0.0.1:80", pl._host_header("127.0.0.1", 80))
 
 
 def test_a_refused_upgrade_carries_its_status() -> None:

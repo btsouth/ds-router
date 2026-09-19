@@ -222,3 +222,7 @@ consecutive real Hermes turns on ClinePass all completed (13,215 / 13,201 /
 health-check show false failures.
 
 ## What to do with ClinePass
+
+Rejected for this project. An Agent Pass is a plan for an agent, not an API plan,
+so its terms are the constraint rather than its usage API. Keep it as a manual
+option.

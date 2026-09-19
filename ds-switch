@@ -9,6 +9,7 @@
 #   ds-switch --show       print the recommendation without applying it
 #   ds-switch --check      report whether the config can drive Hermes
 #   ds-switch <provider>   pin a provider explicitly, ignoring the router
+#   ds-switch --alias NAME apply for a model alias other than the default one
 #   ds-switch --off        hand routing back to the default provider
 #
 # Turning it off is running --off, or not running it at all.

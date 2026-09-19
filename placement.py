@@ -11,7 +11,9 @@ key:"model"}` with a `--provider` value, verified live against the desktop
 backend), so placement is the real lever: assign each session its own provider
 instead of letting them share one.
 
-Three rules carry this module, and they are the same three as `routing.py`:
+Three rules carry this module. The first is `routing.py`'s; the second is the
+deliberate opposite of it, because a plan that creates the queue is worse than a
+plan that merely prices it:
 
 1. **Leave sessions where they are.** A move resets the upstream prompt cache
    and drops reasoning traces, so it must be justified. A session only moves when
@@ -55,6 +57,7 @@ import argparse
 import base64
 import hashlib
 import http.cookiejar
+import ipaddress
 import json
 import os
 import re
@@ -92,7 +95,7 @@ def state_db_path(db_path: Optional[Path] = None) -> Path:
     """
     if db_path is not None:
         return Path(db_path)
-    # One resolver for the whole project (src/paths.py).
+    # One resolver for the whole project (paths.py).
     from paths import state_db
     return state_db()
 
@@ -693,6 +696,34 @@ class FakeTransport(Transport):
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 
+def _safe_status_line(line: bytes) -> str:
+    """A server's status line, made safe to put in a message.
+
+    A peer writes this text, and the request it is answering carried a single-use
+    ticket in its query string, so a status line is free to reflect that credential
+    back at us or to carry terminal escapes into the operator's log. Keep printable
+    ASCII, collapse the whitespace, redact anything ticket-shaped, and say so when
+    there was no status line at all.
+    """
+    text = line.decode("latin-1", "replace").strip()
+    if not text:
+        return "(no status line: the connection closed without a reply)"
+    safe = "".join(char if 0x20 <= ord(char) < 0x7F else " " for char in text)
+    safe = re.sub(r"\s+", " ", safe).strip()[:80]
+    return re.sub(r"(?i)ticket=\S+", "ticket=***", safe)
+
+
+def _host_header(host: str, port: int) -> str:
+    """The ``Host`` value for *host* on *port*, bracketing an IPv6 literal.
+
+    ``urlsplit`` hands back the literal without its brackets, and RFC 7230 requires
+    them back for an IPv6 host: ``Host: ::1:9119`` is not a valid header, so a strict
+    server refuses the upgrade that urllib performs happily on the same authority.
+    """
+    authority = f"[{host}]" if ":" in host else host
+    return f"{authority}:{port}"
+
+
 class _WSClient:
     """A minimal RFC6455 client — text frames, ping/pong, no dependencies.
 
@@ -728,7 +759,7 @@ class _WSClient:
         key = base64.b64encode(os.urandom(16)).decode()
         sock.sendall((
             f"GET {path} HTTP/1.1\r\n"
-            f"Host: {host}:{port}\r\n"
+            f"Host: {_host_header(host, port)}\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {key}\r\n"
@@ -750,8 +781,7 @@ class _WSClient:
         if code != 101:
             sock.close()
             raise TransportError(
-                f"websocket upgrade refused: {status.decode('latin-1').strip()[:80]}",
-                status=code)
+                f"websocket upgrade refused: {_safe_status_line(status)}", status=code)
         if accept != expected:
             sock.close()
             raise TransportError("websocket handshake failed: bad Sec-WebSocket-Accept")
@@ -914,6 +944,22 @@ class Gateway:
             raise GatewayAuthError(
                 "ca_file applies to an https gateway only, and this one is http: "
                 "remove it, or use the https origin the certificate is for")
+        # The remaining refusals live here as well as in `resolve_gateway`, because a
+        # Gateway is a public shape a caller can build by hand: an invariant that only
+        # the configuration path enforces is not an invariant. `resolve_gateway` still
+        # says more about the likely mistake.
+        if "[" in self.host or "]" in self.host:
+            raise GatewayAuthError(
+                f"a gateway host is a bare literal, not a bracketed one: pass "
+                f"{self.host.strip('[]')!r}, not {self.host!r}")
+        if "@" in self.host or "/" in self.host:
+            raise GatewayAuthError(
+                f"{self.host!r} is not a host: userinfo and paths belong in the URL "
+                f"that resolve_gateway parses, not here")
+        if _is_wildcard_host(self.host):
+            raise GatewayAuthError(
+                f"{self.host!r} is a wildcard address, which is what a server binds to, "
+                f"not what a client connects to: use the host you reach that backend on")
 
     @property
     def authority(self) -> str:
@@ -988,7 +1034,11 @@ def read_gateway_credential(path: Path) -> "Credential":
         if not stripped or stripped.startswith("#"):
             continue
         candidates.append(stripped)
-        match = re.match(r"(?i)^([a-z]+)\s*[:=]?\s+(\S.*)$", stripped)
+        # Two shapes, and the separator is required in the first: allowing an
+        # optional one made a bare secret such as "passwd9k2" parse as the label
+        # "passwd" with the value "9k2".
+        match = (re.match(r"(?i)^([a-z]+)\s*[:=]\s*(\S.*)$", stripped)
+                 or re.match(r"(?i)^([a-z]+)\s+(\S.*)$", stripped))
         if match and match.group(1).lower() in _CREDENTIAL_LABELS:
             # First win: a file that names the same label twice is ambiguous, and
             # guessing between them is how the wrong secret gets sent.
@@ -1023,6 +1073,26 @@ class Credential:
     password: str = field(repr=False)
     origins: tuple[str, ...] = ()
     source: str = ""
+
+
+def _is_certificate_failure(exc: BaseException) -> bool:
+    """True when *exc* is TLS verification failing, however urllib wrapped it.
+
+    urllib raises ``URLError(SSLCertVerificationError(...))``, so the reason has to be
+    unwrapped. Telling a user their gateway "cannot be reached" when the certificate
+    was simply not trusted sends them to fix the credential.
+    """
+    seen: list[BaseException] = [exc]
+    while seen:
+        current = seen.pop()
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return True
+        reason = getattr(current, "reason", None)
+        if isinstance(reason, BaseException):
+            seen.append(reason)
+        if "CERTIFICATE_VERIFY_FAILED" in str(current):
+            return True
+    return False
 
 
 def _redact(url: str) -> str:
@@ -1176,6 +1246,24 @@ def resolve_gateway(url: str, *, username: Optional[str] = None,
     return gateway
 
 
+def _is_wildcard_host(host: str) -> bool:
+    """True for "every interface", however the address is written.
+
+    `0.0.0.0` and `::` were the whole check, which let `[::0]`, `0:0:0:0:0:0:0:0` and
+    `::ffff:0.0.0.0` through: the same address in another spelling, and a destination
+    nobody means to connect to.
+    """
+    stripped = str(host or "").strip("[]")
+    try:
+        address = ipaddress.ip_address(stripped)
+    except ValueError:
+        return False
+    if address.is_unspecified:
+        return True
+    mapped = getattr(address, "ipv4_mapped", None)
+    return bool(mapped is not None and mapped.is_unspecified)
+
+
 def _same_authority(url: str, authority: str) -> bool:
     """True when *url* names the same host:port as *authority* (port defaulted by scheme).
 
@@ -1192,7 +1280,10 @@ def _same_authority(url: str, authority: str) -> bool:
         return False
     if port is None:
         port = 443 if parts.scheme == "https" else 80
-    return f"{parts.hostname}:{port}" == authority
+    # Re-bracket an IPv6 literal, or a credential file naming the same host produces a
+    # warning that the password is going somewhere else.
+    host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+    return f"{host}:{port}" == authority
 
 
 def _check_file_mode(path: Path) -> None:
@@ -1275,6 +1366,12 @@ class GatewaySession:
         except urllib.error.HTTPError as exc:
             return int(exc.code), _json_or_empty(exc.read(65536))
         except (urllib.error.URLError, OSError, ValueError) as exc:
+            if _is_certificate_failure(exc):
+                raise GatewayAuthError(
+                    f"the TLS certificate for {self.gateway.authority} could not be "
+                    f"verified: {exc}. If this dashboard uses a private or self-signed "
+                    f"certificate, name its CA with --gateway-ca-file (or ca_file) so it "
+                    f"can be verified properly") from exc
             raise GatewayAuthError(
                 f"cannot reach the gated gateway at {self.gateway.origin}: {exc}") from exc
 
@@ -2111,6 +2208,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="print exactly what would be sent; write nothing")
     ap.add_argument("--alias", default=None, help="model alias to place (default: config default_model)")
     ap.add_argument("--db", action="store_true", help="enumerate sessions from state.db only (no backend RPC)")
+    ap.add_argument("--config", default=None, metavar="PATH",
+                    help="config.yaml to read (default: the one next to this script)")
     ap.add_argument("--db-path", default=None, help="state.db to read (default: ~/.hermes/state.db)")
     ap.add_argument("--port", type=int, default=None, help="backend port (default: discovered from /proc)")
     ap.add_argument("--token", default=None, help="backend WS token (default: /proc/<pid>/environ)")
@@ -2140,7 +2239,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("Choose one of --plan or --apply.", file=sys.stderr)
         return 2
 
-    config = load_config()
+    config = load_config(Path(args.config).expanduser() if args.config else None)
     gateway: Optional[Gateway] = None
     if not args.db:
         # `--db` means "plan from the state store, do not touch a live backend", so the
@@ -2161,7 +2260,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     alias = args.alias or str(config.get("default_model") or "")
     routing_cfg = config.get("routing") or {}
     conc_cfg = routing_cfg.get("concurrency") or {}
-    caps = dict(conc_cfg.get("caps") or {}) if conc_cfg.get("enabled", True) else {}
+    # Read through the shared normaliser rather than `dict(...)`, which raised TypeError
+    # out of `caps: 3` — a shape the README says is diagnosed. A cap set that cannot be
+    # read is not "no caps", the same rule as a cap that cannot be read.
+    caps, cap_problems = load_mod.normalize_caps(
+        conc_cfg.get("caps") if conc_cfg.get("enabled", True) else {})
+    if cap_problems:
+        print("refusing to plan: unreadable concurrency cap(s) in config.yaml: "
+              + "; ".join(cap_problems), file=sys.stderr)
+        print("  a cap is a positive integer, and a cap that cannot be read is not "
+              "'unlimited'. Fix it or remove the entry.", file=sys.stderr)
+        return 7
 
     transport: Optional[LiveTransport] = None
     source = "state.db"
@@ -2193,8 +2302,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         # have stopped without the exit code saying so.
         print(f"refusing to plan: {exc}", file=sys.stderr)
         print("  The gated backend could not be signed in to, so no session could be "
-              "steered. Fix the credential (or drop --gateway to plan from state.db on "
-              "purpose).", file=sys.stderr)
+              "steered. Fix what the message above names (the credential, or the "
+              "certificate it could not verify), or drop --gateway to plan from the "
+              "state store on purpose.", file=sys.stderr)
         return 2
     quotas = collect_quotas(providers, config)
     # The concurrency reading has to be handed to the planner, or the rule that a

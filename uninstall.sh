@@ -8,6 +8,7 @@
 #     ./uninstall.sh --dry-run    print every action, change nothing
 #     ./uninstall.sh --keep-symlink   leave ~/.local/bin/ds-switch in place
 #     ./uninstall.sh --force      remove unit files even if modified by hand
+#     ./uninstall.sh -y|--yes     do not ask before it changes anything
 #     ./uninstall.sh --help
 #
 # Deliberately NOT removed:

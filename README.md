@@ -16,9 +16,10 @@ Works with any providers that expose a usage API. Shipped with support for four:
 | Ollama Cloud | Pro | $20/mo | $60 / month credits |
 | ClinePass | Agent/Pass | $9.99/mo | 5-hour, weekly, monthly |
 
-Total: about $40-50/month for roughly $190+ of metered model access, and the
-router is what lets you actually use all of it instead of hammering one
-subscription until it throttles you.
+Total: about $40-50/month, and the plans' own allowances add up to roughly $190 a
+month at their list rates. That gap is the reason to run the router: it is what
+lets you actually use all of it instead of hammering one subscription until it
+throttles you.
 
 ## Quick start
 
@@ -33,7 +34,7 @@ Any clone location works — the installer rewrites the systemd units and the
 manifest to wherever you put it, so `~/ds-router` or a nested path is fine.
 
 `install.sh` checks your prerequisites, runs the test suite as a preflight,
-installs a systemd timer (Linux) or prints the macOS equivalent, enables it, and
+installs a systemd timer (Linux) or writes a launchd job (macOS), enables it, and
 verifies the result. **It does not touch your Hermes config** — installing and
 routing are separate steps.
 
@@ -129,11 +130,14 @@ state, not a global config write. Real output from a 27-session fleet:
     ollama-cloud   3/3
 
   session        from           to             model                          why
-  ---------------------------------------------------------------------------
+  ------------------------------------------------------------------------------------------------------------
   02340f5c       nous           nous           -                              nous is not managed by ds-router; left alone
   036e75ea       ollama-cloud   ollama-cloud   deepseek-v4.1-flash            stays on ollama-cloud (1/3 of its cap)
   418ca809       ollama-cloud   clinepass      cline-pass/deepseek-v4.1-flash moved to clinepass: ollama-cloud is over its concurrency cap
 ```
+
+Three of the 27 rows: the planner prints one line per session, and the rule row above
+is the full width it prints.
 
 Design rules, all asserted by tests:
 
@@ -395,7 +399,9 @@ reason, plus a 53s median response time. See `docs/token-harbor.md`.
   polls them. Entirely optional and off in practice for a fresh install: with no
   such directory present, ds-router polls the endpoints directly. The shipped
   default points at `~/.local/state/omarchy/ai-usage/` (a dashboard that writes one
-  `<provider>-quota.json` per provider); set `routing.collector_state_dir` to your
+  JSON file per provider: `commandcode-quota.json`, `go-quota.json` for OpenCode Go,
+  `ollama-quota.json`, `clinepass-quota.json`, names fixed in `quota.py`); set
+  `routing.collector_state_dir` to your
   own cache, or `reuse_collector_state: false` to always poll.
 - **Failures are honest.** An unreadable quota sorts below a real reading rather
   than being silently trusted, and "everything is exhausted" is reported instead

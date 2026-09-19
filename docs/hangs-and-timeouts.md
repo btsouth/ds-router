@@ -4,6 +4,10 @@ Investigated 2026-09-18 against Hermes v0.21.3 (upstream `cdceca42`). Verified b
 reading the code and by live reproduction against a blackhole server (accepts the
 TCP connection, never replies).
 
+The `file:line` references below were taken at that commit. They move between builds
+(the installed tree here has drifted by a few lines in most of them), so match on the
+symbol names if a line does not land where this says.
+
 ## What was measured
 
 A provider that accepts a connection and never replies stalls a turn for a long
