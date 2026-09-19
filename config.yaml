@@ -133,17 +133,25 @@ peak:
 # ticket. Fill this in to steer them; leave it out and every invocation behaves
 # exactly as it did before.
 #
-# The url must be plain http, on a tailnet or LAN address: the WebSocket half speaks
-# plaintext, so an https dashboard, a URL prefix and a wildcard address are each
-# refused with a message saying so. Those need the second-backend recipe in the
-# README instead.
+# https is preferred where the dashboard has a certificate: the same TLS context
+# covers the sign-in and the WebSocket, the certificate and the hostname are always
+# checked, and there is deliberately no flag that turns verification off. A private or
+# self-signed certificate is trusted by naming its CA below. Plain http also works, on
+# a tailnet or LAN address, and means the password crosses that segment unencrypted.
+# A dashboard under a URL prefix, a wildcard address, a URL carrying userinfo, and a
+# CA file that cannot be loaded are each refused with a message saying so.
+#
+# The backend must be on this machine: its sessions' providers are read from the local
+# state.db, so a backend on another host needs its own copy of this router.
 #
 #   gateway:
-#     url: http://192.168.1.88:9119
+#     url: https://192.168.1.88:9119
 #     username: you
 #     # A file you write yourself, one per dashboard, mode 0600 (a readable one is
 #     # refused). Either "label: value" or "label value" lines; prose is ignored.
 #     password_file: ~/.hermes/dashboard-lan-password.txt
+#     # Only for a certificate the system store does not already trust:
+#     # ca_file: /etc/ssl/my-dashboard-ca.pem
 #     # Or name an env var instead of a file, never both. There is deliberately no
 #     # way to pass the password as an argument: argv is readable by every process.
 #     # password_env: MY_DASHBOARD_PASSWORD
