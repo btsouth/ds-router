@@ -241,9 +241,13 @@ wildcard address such as `0.0.0.0`, a URL with a username or password inside it,
 a CA file that cannot be loaded or is given for a plaintext origin. Those need the
 second-backend recipe below.
 
-Verified against a real gated backend, read-only: the plan listed 13 open sessions
-that the token path cannot see at all, and proposed moving one off an exhausted
-provider. Nothing was written; the write path over a ticket is not exercised here.
+Verified against a real gated backend: the plan listed 13 open sessions that the token
+path cannot see at all; a throwaway session created through the same ticket was moved
+with `config.set` and read back as moved in the live listing and in `state.db`; and a
+move sent while that session was mid-turn came back `deferred: true` and landed at the
+next turn start. Every throwaway session was deleted afterwards. What has not been
+exercised is a bulk `--apply` across a fleet through a gate, which is the same call
+with more rows.
 
 The backend has to be on the machine you run this from. Every session is a backend
 session, but its provider is read from the local `state.db`, so a backend somewhere
@@ -470,12 +474,14 @@ Claims in this README that have been measured, rather than reasoned about:
   reading that could not be trusted scoring as the healthiest provider. Five tests
   that could not fail were rewritten, and the transport and concurrency layers, which
   had no tests at all, now have 18 between them.
-- The gated path, against real gated backends (read-only, over https and plain http)
-  and a loopback fake (`test_gateway.py`, 49 tests). Live: 13 open sessions read from
-  a backend whose token path cannot reach it, and a plan proposing to move one off an
-  exhausted provider; nothing was written. Live over TLS: a tailnet dashboard with a
-  certificate from the system store, reached through the same sign-in, ticket and
-  upgrade as the plaintext case. Pinned in the suite: a wrong credential refused once
+- The gated path, against real gated backends (over https and plain http) and a
+  loopback fake (`test_gateway.py`, 57 tests). Live: 13 open sessions read from a
+  backend whose token path cannot reach it, and a write verified three ways (the RPC
+  reply, the live session listing, and `state.db`) on a throwaway session that was
+  then deleted, including a mid-turn move that came back `deferred: true` and landed
+  at the next turn start. Live over TLS too: a tailnet dashboard with a certificate
+  from the system store, reached through the same sign-in, ticket and upgrade as the
+  plaintext case. Pinned in the suite: a wrong credential refused once
   and not retried, a rate-limited login named as such, a redirect not followed, a
   ticket response carrying no ticket, a 200 login that sets no cookie, a stale cookie
   re-signed-in exactly once, a file other users can read refused, a credential whose
@@ -509,15 +515,15 @@ Claims that are reasoned but **not** verified end to end are flagged inline.
 - **Selection is per-session, not per-request.** The router chooses a provider
   for a Hermes session; it is not a proxy sitting in the request path. Hermes'
   own fallback chain handles mid-turn failures.
-- **`placement.py --plan` is verified against a live fleet of 25+ sessions. The
-  write path is verified for the create-time case, and only partly for the move
-  case.** Measured against a real backend with throwaway sessions:
+- **`placement.py --plan` is verified against a live fleet of 25+ sessions, and the
+  write path is now verified end to end**, over a gated backend and through the
+  ordinary token path, on throwaway sessions that were deleted afterwards:
 
   | case | what happens |
   |---|---|
-  | `session.create` with `{model, provider}` | **Works.** The session is created on that provider; `info.provider` reports it and the stored `model_config.provider` agrees. This is the reliable path. |
-  | `config.set` on a **idle** session | Applies immediately; the RPC confirms `scope: "session"`. |
-  | `config.set` on a session **mid-turn** | Deliberately deferred: the backend stashes the pick and applies it at the next turn start. The change is not lost, it is late. |
+  | `session.create` with `{model, provider}` | **Works.** The session runs on that provider; the stored `model_config.provider` agrees. Note the stored model is the provider's own id, never the alias. |
+  | `config.set` on an **idle** session | **Applies immediately**: the reply carries `scope: "session"` and `confirm_required: false`, and both the live session listing and `state.db` show the new provider (as does `billing_provider`, which moves from `custom` to the provider's name). |
+  | `config.set` on a session **mid-turn** | **Deliberately deferred, and now measured**: the reply says `deferred: true`, the session list and `state.db` still show the OLD provider after that turn finishes, and the new one appears at the START of the following turn. Measured over three turns: clinepass, move during turn 2, still clinepass after turn 2, commandcode after turn 3. The change is not lost, it is late. |
 
   That deferral matters here, because over-cap providers are disproportionately
   the *busy* ones — a provider is over its concurrency cap precisely because
@@ -525,6 +531,10 @@ Claims that are reasoned but **not** verified end to end are flagged inline.
   the ones that land a turn later. Nothing is lost; the spread completes as those
   turns finish. The dependable behaviour is **choosing a provider when a session
   starts**, which is the concurrency fix itself.
+
+  One read-path subtlety, measured while doing the above: a session that has never
+  run a turn reports the *process default* in the live listing and has no `state.db`
+  row yet, so its first plan can look like a session with no provider.
 
   A move can also be **refused**: Hermes asks for confirmation before abandoning a
   large cached context (>= `model.switch_context_confirm_tokens`, 100k by default)
