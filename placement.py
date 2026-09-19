@@ -44,6 +44,7 @@ import hashlib
 import http.cookiejar
 import json
 import os
+import re
 import socket
 import sqlite3
 import struct
@@ -54,7 +55,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -842,130 +843,266 @@ class GatewayAuthError(TransportError):
 
 @dataclass
 class Gateway:
-    """A gated backend reached with a dashboard credential."""
+    """A gated backend reached with a dashboard credential.
+
+    The password is excluded from ``repr`` so an accidental ``print``, a ``%r`` in a
+    log line, or an assertion dump cannot become the leak this whole class exists to
+    avoid. Every human-facing message goes through :meth:`describe`.
+    """
 
     host: str
     port: int
     username: str
-    password: str
+    password: str = field(repr=False)
     scheme: str = "http"
     source: str = "config"
 
+    def __post_init__(self) -> None:
+        # This transport speaks plaintext HTTP and WebSocket. A Gateway that claims
+        # otherwise could only be built by hand, and the ticket_url mapping for it
+        # would be a capability the transport does not have, so refuse at construction
+        # rather than carry a dead branch.
+        if self.scheme != "http":
+            raise GatewayAuthError(
+                f"a gated gateway is http only: this transport speaks plaintext HTTP "
+                f"and WebSocket, so {self.scheme!r} cannot be reached")
+
+    @property
+    def authority(self) -> str:
+        """``host:port``, with an IPv6 literal re-bracketed.
+
+        Without the brackets the URL is unparseable, which used to be swallowed into
+        a silent fall back to the state DB rather than reported.
+        """
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"{host}:{self.port}"
+
     @property
     def origin(self) -> str:
-        return f"{self.scheme}://{self.host}:{self.port}"
+        return f"{self.scheme}://{self.authority}"
 
     def ticket_url(self, ticket: str) -> str:
-        """The upgrade URL for *ticket*.
-
-        ``https`` becomes ``wss`` because that is the correct mapping, but a TLS
-        gateway is refused at the config boundary (see ``resolve_gateway``): the
-        WebSocket client below speaks plaintext HTTP, so this branch is only
-        reachable for a ``Gateway`` a caller built by hand.
-        """
-        ws_scheme = "wss" if self.scheme == "https" else "ws"
-        return (f"{ws_scheme}://{self.host}:{self.port}/api/ws"
-                f"?ticket={urllib.parse.quote(ticket)}")
+        """The upgrade URL for *ticket*, quoted (a ticket is single-use and short-lived)."""
+        return f"ws://{self.authority}/api/ws?ticket={urllib.parse.quote(ticket)}"
 
     def describe(self) -> str:
-        return f"{self.host}:{self.port} (gated, credential from {self.source})"
+        return f"{self.authority} (gated, credential from {self.source})"
 
 
-def read_gateway_credential(path: Path) -> tuple[str, str]:
-    """``(username, password)`` from *path*, empty username when the file has none.
+# The labels a credential file may carry. Matching a known set is what stops a prose
+# line, or the file's own title, from being read as the password: a real file on this
+# machine opens with a title and closes with paragraphs, and the username and password
+# lines in it are space-separated rather than ``key: value``.
+_CREDENTIAL_LABELS = ("origin", "alt", "username", "user", "password", "passwd")
 
-    Hermes writes a key/value file (``username:`` / ``password:`` / ``origin:``), so
-    a bare "first line is the password" reader is not enough; a bare line is still
-    accepted for a hand-made secret file. Neither value is ever printed.
+
+def read_gateway_credential(path: Path) -> "Credential":
+    """The credential in *path*, and any origins it names.
+
+    The formats a real file arrives in, both in use on one machine here:
+
+    * ``label: value`` (what Hermes' LAN dashboard file holds)
+    * ``label value``, indented or not, with a title line and prose paragraphs
+      around it (what a hand-written devbox file holds)
+
+    Anything else that is a single line is taken as a bare secret, which keeps a
+    hand-made ``chmod 600`` file working. Neither value is ever printed.
     """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         raise GatewayAuthError(f"cannot read the gateway credential file {path}: {exc}") from exc
+
     fields: dict[str, str] = {}
-    for line in text.splitlines():
-        key, sep, value = line.partition(":")
-        if sep and value.strip():
-            fields[key.strip().lower()] = value.strip()
-    if fields.get("password"):
-        return fields.get("username", ""), fields["password"]
+    candidates: list[str] = []
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped and not stripped.startswith("#") and ":" not in stripped:
-            return "", stripped
-    raise GatewayAuthError(
-        f"the gateway credential file {path} holds no password: expected a "
-        f"'password:' line or a bare secret line")
+        if not stripped or stripped.startswith("#"):
+            continue
+        candidates.append(stripped)
+        match = re.match(r"(?i)^([a-z]+)\s*[:=]?\s+(\S.*)$", stripped)
+        if match and match.group(1).lower() in _CREDENTIAL_LABELS:
+            # First win: a file that names the same label twice is ambiguous, and
+            # guessing between them is how the wrong secret gets sent.
+            fields.setdefault(match.group(1).lower(), match.group(2).strip())
+    password = fields.get("password") or fields.get("passwd") or ""
+    if not password and len(candidates) == 1:
+        # One line, no label: a hand-made secret file.
+        password = candidates[0]
+    if not password:
+        raise GatewayAuthError(
+            f"the gateway credential file {path} holds no password line: expected "
+            f"'password: <secret>' or 'password <secret>' (a single-line file holding "
+            f"only the secret also works)")
+    origins = tuple(value for value in (fields.get("origin"), fields.get("alt")) if value)
+    return Credential(
+        username=str(fields.get("username") or fields.get("user") or "").strip(),
+        password=password, origins=origins, source=str(path))
+
+
+@dataclass
+class Credential:
+    """One credential read from a file: the secret, and the origins the file names."""
+
+    username: str
+    password: str = field(repr=False)
+    origins: tuple[str, ...] = ()
+    source: str = ""
+
+
+def _redact(url: str) -> str:
+    """*url* with any password in it replaced, safe to put in a message.
+
+    Every refusal message goes through this, not just the one that checks for a
+    password: a URL that trips an earlier check would otherwise be echoed whole, and
+    the check order is not something a caller can see.
+    """
+    parts = urllib.parse.urlsplit(str(url or ""))
+    if not parts.password:
+        return str(url or "")
+    netloc = parts.netloc.replace(f":{parts.password}@", ":***@", 1)
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+def _checked_port(parts: object) -> int:
+    """The port to talk to, refusing one that cannot be read.
+
+    ``parts.port`` raises for a non-numeric value and returns None when absent, and
+    ``or 80`` silently turned an explicit ``:0`` into 80. Both end up as a traceback
+    or a wrong destination rather than a refusal.
+    """
+    raw = getattr(parts, "port", None)
+    if raw is None:
+        return 80
+    if raw == 0:
+        raise GatewayAuthError("port 0 is not a destination: give the port the backend serves on")
+    return int(raw)
 
 
 def resolve_gateway(url: str, *, username: Optional[str] = None,
                     password_file: Optional[str] = None,
-                    password_env: Optional[str] = None) -> Gateway:
+                    password_env: Optional[str] = None,
+                    warn: Optional[Callable[[str], None]] = None) -> Gateway:
     """Build a :class:`Gateway` from an origin plus a credential source.
 
     No ``--gateway-password`` flag exists on purpose: a password in argv is readable
-    by every process on the machine, and Hermes already writes a 0600 file next to
-    each dashboard. A file or an env var is the whole option set.
+    by every process on the machine. A credential file or an env var is the whole
+    option set, and ``password_file`` and ``password_env`` are mutually exclusive
+    rather than one silently winning.
 
-    Three shapes are refused rather than half-supported, because a URL that looks
-    accepted and then fails later is worse than a clear no:
+    Shapes are refused rather than half-supported, because a URL that looks accepted
+    and then fails later is worse than a clear no:
 
-    * **https.** The WebSocket client speaks plaintext HTTP, so a ``wss://`` origin
-      would send the ticket in the clear to a TLS port and fail with a meaningless
-      error. A TLS gateway needs the second-backend recipe in the README until the
-      transport can speak TLS.
+    * **userinfo in the URL.** It is ignored by design (a URL lands in shell history
+      and in ``ps`` output), and silently ignoring it is how a user believes they
+      configured a username they did not.
+    * **https.** This transport speaks plaintext HTTP and WebSocket, so a TLS origin
+      would send the ticket in the clear to a TLS port and fail meaninglessly. A TLS
+      dashboard needs the second-backend recipe in the README.
     * **a URL prefix.** The paths are fixed (``/auth/password-login``,
       ``/api/auth/ws-ticket``, ``/api/ws``), so a dashboard served under a subpath
-      would be signed in against the wrong URL and answer a confusing 404.
-    * **a password inside the URL.** It would be silently ignored, and it is a
-      password in shell history and in ``ps`` output, which is what the missing flag
-      exists to avoid.
+      would be signed in against the wrong URL.
+    * **a wildcard address** (``0.0.0.0``, ``::``), which almost always means the
+      user copied ``--host 0.0.0.0`` from their own ``serve`` command.
+
+    A credential file that names other origins than the one configured is a warning
+    rather than a refusal: one file legitimately covers a tailnet name and a LAN
+    address for the same backend, and refusing would break that.
     """
     parts = urllib.parse.urlsplit(str(url or ""))
+    safe = _redact(url)
+    if parts.username or parts.password:
+        raise GatewayAuthError(
+            f"the gateway URL carries userinfo, which is ignored by design (a URL ends "
+            f"up in shell history and in ps output): use --gateway-user and "
+            f"--gateway-password-file, or the username and password_file keys in "
+            f"config.yaml, instead of a URL like {safe}")
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise GatewayAuthError(
-            f"a gated gateway needs an http(s) origin such as "
-            f"http://192.168.1.88:9119, got {url!r}")
+            f"a gated gateway needs an http origin such as http://192.168.1.88:9119, "
+            f"got {safe!r}")
     if parts.scheme == "https":
         raise GatewayAuthError(
-            f"{url!r} is https, and this transport speaks plaintext HTTP and WebSocket "
-            f"only: point it at a plain http origin (a tailnet or LAN address), or use "
-            f"the second-backend recipe in the README for a TLS dashboard")
+            f"{safe!r} is https, and this transport speaks plaintext HTTP and WebSocket "
+            f"only: point it at a plain http origin on the tailnet or LAN, or use the "
+            f"second-backend recipe in the README for a TLS dashboard")
     if parts.path.strip("/"):
         raise GatewayAuthError(
-            f"{url!r} carries a URL prefix, and a gated gateway must be an origin: the "
+            f"{safe!r} carries a URL prefix, and a gated gateway must be an origin: the "
             f"sign-in and ticket paths are fixed, so a dashboard served under a subpath "
             f"is not supported")
-    if parts.password:
+    if parts.hostname in ("0.0.0.0", "::", "[::]"):
         raise GatewayAuthError(
-            f"the gateway URL carries a password, which is ignored by design (any URL "
-            f"ends up in shell history and in ps output): use password_file or "
-            f"password_env instead")
-    port = parts.port or 80
+            f"{safe!r} is a wildcard address, which is what a server binds to, not what a "
+            f"client connects to: use the host you reach that backend on (its tailnet "
+            f"name, or 127.0.0.1 if it is this machine)")
+    if password_file and password_env:
+        raise GatewayAuthError(
+            "set one of password_file and password_env, not both: which one wins would "
+            "otherwise be invisible")
+    try:
+        port = _checked_port(parts)
+    except ValueError as exc:
+        raise GatewayAuthError(
+            f"the port in {safe!r} is not a number: {exc}") from exc
 
-    file_user = ""
+    file_origins: tuple[str, ...] = ()
     if password_file:
         path = Path(str(password_file)).expanduser()
-        file_user, secret = read_gateway_credential(path)
+        credential = read_gateway_credential(path)
+        secret, file_user, file_origins = credential.password, credential.username, credential.origins
         source = str(path)
+        _check_file_mode(path)
     elif password_env:
         secret = os.environ.get(str(password_env), "")
         source = f"${password_env}"
+        file_user = ""
         if not secret:
             raise GatewayAuthError(f"{password_env} is unset or empty")
     else:
         raise GatewayAuthError(
-            f"no credential for the gated gateway {url}: set gateway.password_file in "
-            f"config.yaml (Hermes writes one at ~/.hermes/dashboard-lan-password.txt), "
-            f"or pass --gateway-password-file / --gateway-password-env")
+            f"no credential for the gated gateway {safe}: set gateway.password_file in "
+            f"config.yaml (see the commented example there), or pass "
+            f"--gateway-password-file / --gateway-password-env")
 
     user = str(username or file_user or "").strip()
     if not user:
         raise GatewayAuthError(
-            f"no dashboard username for the gated gateway {url}: pass --gateway-user or "
-            f"point at a credential file that carries a 'username:' line")
-    return Gateway(host=parts.hostname, port=int(port), username=user, password=secret,
-                   scheme=parts.scheme, source=source)
+            f"no dashboard username for the gated gateway {safe}: pass --gateway-user or "
+            f"point at a credential file that carries a 'username [...]' line")
+    gateway = Gateway(host=str(parts.hostname), port=port, username=user, password=secret,
+                      scheme=str(parts.scheme), source=source)
+    if warn is not None and file_origins:
+        named = " or ".join(file_origins)
+        if not any(_same_authority(entry, gateway.authority) for entry in file_origins):
+            warn(f"the credential file {source} names {named}, and you pointed at "
+                 f"{gateway.authority}: the password will be sent to {gateway.authority}")
+    return gateway
+
+
+def _same_authority(url: str, authority: str) -> bool:
+    """True when *url* names the same host:port as *authority* (port defaulted by scheme)."""
+    parts = urllib.parse.urlsplit(str(url or ""))
+    if not parts.hostname:
+        return False
+    port = parts.port if parts.port is not None else (443 if parts.scheme == "https" else 80)
+    return f"{parts.hostname}:{port}" == authority
+
+
+def _check_file_mode(path: Path) -> None:
+    """Refuse a credential file that other users can read.
+
+    The README tells the reader to keep this file at 0600, so reading a 0644 one
+    without a word would be the doc lying.
+    """
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        return  # the read itself already reported a missing file
+    if mode & 0o077:
+        raise GatewayAuthError(
+            f"the gateway credential file {path} is mode {mode:03o}, which other users can "
+            f"read: run chmod 600 {path}")
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -981,19 +1118,38 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class GatewaySession:
-    """One signed-in session against a gated backend: a cookie, then tickets."""
+    """One signed-in session against a gated backend: a cookie, then tickets.
+
+    Three properties of the gate shape this rather than taste:
+
+    * Login is rate limited per client IP, so the cookie is held for the life of the
+      process, and a credential that has already been refused is **latched**: the
+      refusal is re-raised without another request, because the same password cannot
+      start working mid-run and a retry loop turns a clear refusal into a 429.
+    * The ticket is single-use with a 30 s TTL, so one is minted per connection and
+      never cached.
+    * The requests are made by a purpose-built opener with proxies switched off. A
+      login is one POST to one host with a password in the body, and an environment
+      proxy would receive that password and the session cookie in full. The WebSocket
+      half is a raw socket and never used a proxy anyway, so honouring one would make
+      the transport incoherent as well as leaky.
+    """
 
     def __init__(self, gateway: Gateway, *, timeout: float = 10.0) -> None:
         self.gateway = gateway
         self.timeout = float(timeout)
-        self.logins = 0  # observable so a retry loop over a bad password cannot hide here
+        self.logins = 0  # attempts; observable so a retry loop cannot hide here
+        self._cookie_held = False
+        self._refusal: Optional[GatewayAuthError] = None
         self._jar = http.cookiejar.CookieJar()
         self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),        # never route a password via a proxy
             urllib.request.HTTPCookieProcessor(self._jar), _NoRedirect())
 
     def forget(self) -> None:
-        """Drop the cookie so the next mint signs in again."""
+        """Drop the cookie so the next mint signs in again. A latched refusal stays."""
         self._jar.clear()
+        self._cookie_held = False
 
     def _post(self, path: str, payload: Optional[dict] = None) -> tuple[int, Any]:
         body = None if payload is None else json.dumps(payload).encode()
@@ -1009,42 +1165,75 @@ class GatewaySession:
             raise GatewayAuthError(
                 f"cannot reach the gated gateway at {self.gateway.origin}: {exc}") from exc
 
+    def _detail(self, body: Any) -> str:
+        """The server's own explanation, with the password scrubbed out of it.
+
+        A message must never carry the secret, and this is the one string here that a
+        remote server writes. A backend that echoes what it was sent is exactly how a
+        password reaches a terminal, a journal or a CI log.
+        """
+        text = ""
+        if isinstance(body, dict):
+            text = str(body.get("detail") or body.get("error") or "")
+        if not text:
+            return ""
+        return text.replace(self.gateway.password, "***")[:200]
+
     def login(self) -> None:
+        if self._refusal is not None:
+            # Already refused once in this process. The credential cannot change while
+            # we run, and retrying is what would burn the per-IP login budget.
+            raise self._refusal
         status, body = self._post("/auth/password-login", {
             "provider": "basic", "username": self.gateway.username,
             "password": self.gateway.password})
         self.logins += 1
         if status == 200:
+            if not list(self._jar):
+                raised = GatewayAuthError(
+                    f"sign-in to the gated gateway {self.gateway.origin} answered 200 but "
+                    f"set no session cookie, so no ticket can be minted")
+                self._refusal = raised
+                raise raised
+            self._cookie_held = True
             return
-        detail = ""
-        if isinstance(body, dict):
-            detail = str(body.get("detail") or body.get("error") or "")
+        detail = self._detail(body)
         causes = {
             401: f"the credential from {self.gateway.source} was refused",
             404: "this backend advertises no password provider (the 'basic' provider "
                  "is not registered); see /api/auth/providers",
-            429: "the backend rate limited the login attempts; wait a minute. "
-                 "This is not retried",
+            429: "the backend rate limited the login attempts; wait a minute",
             503: "the backend could not read its credential store",
         }
-        raise GatewayAuthError(
+        raised = GatewayAuthError(
             f"sign-in to the gated gateway {self.gateway.origin} failed: "
             f"{causes.get(status, f'HTTP {status}')}{f' ({detail})' if detail else ''}")
+        self._refusal = raised
+        raise raised
 
     def mint_ticket(self) -> str:
         """A fresh single-use ticket; re-signs in at most once when the cookie is stale."""
-        if self.logins == 0:
-            # No cookie has been obtained yet, so a ticket request now is a guaranteed
-            # 401 that the backend records as a rejected upgrade. Sign in first.
+        if not self._cookie_held:
+            # No cookie yet, so a ticket request now is a guaranteed 401 that the
+            # backend records as a rejected upgrade. Sign in first.
             self.login()
         status, body = self._post("/api/auth/ws-ticket")
         if status == 401:
+            # The real "this cookie is stale" signal: the ticket endpoint is the only
+            # one that answers 401 for it.
             self.forget()
             self.login()
             status, body = self._post("/api/auth/ws-ticket")
         if status != 200:
+            detail = self._detail(body)
+            hint = ""
+            if status in (401, 404):
+                hint = ("; if this backend binds loopback and its dashboard.public_url is "
+                        "loopback too, it is not gated at all: drop --gateway and the "
+                        "token path needs no credential")
             raise GatewayAuthError(
-                f"the gated gateway {self.gateway.origin} refused a WS ticket: HTTP {status}")
+                f"the gated gateway {self.gateway.origin} refused a WS ticket: "
+                f"HTTP {status}{f' ({detail})' if detail else ''}{hint}")
         ticket = body.get("ticket") if isinstance(body, dict) else None
         if not isinstance(ticket, str) or not ticket:
             raise GatewayAuthError(
@@ -1059,7 +1248,8 @@ def _json_or_empty(raw: Any) -> Any:
         return {}
 
 
-def gateway_from_config(config: dict, args: Any = None) -> Optional[Gateway]:
+def gateway_from_config(config: dict, args: Any = None,
+                        warn: Optional[Callable[[str], None]] = None) -> Optional[Gateway]:
     """The gated gateway to steer: explicit flags win, else the config ``gateway:`` block.
 
     Absent everywhere means ``None``, which keeps every existing invocation on the
@@ -1075,7 +1265,8 @@ def gateway_from_config(config: dict, args: Any = None) -> Optional[Gateway]:
         url,
         username=getattr(args, "gateway_user", None) or block.get("username"),
         password_file=getattr(args, "gateway_password_file", None) or block.get("password_file"),
-        password_env=getattr(args, "gateway_password_env", None) or block.get("password_env"))
+        password_env=getattr(args, "gateway_password_env", None) or block.get("password_env"),
+        warn=warn)
 
 
 @dataclass
@@ -1282,15 +1473,15 @@ class LiveTransport(Transport):
         except NotSentError:
             raise
         except TransportError as exc:
-            # An upgrade the gate refused (401/403) means the cookie is no longer
-            # accepted, so drop it and let the next attempt sign in again. The status
-            # is carried on the error rather than read out of the message: a refusal
-            # for another reason must not cost a login, because logins are rate
-            # limited.
-            if self._session is not None and exc.status in (401, 403):
-                self._session.forget()
+            # An upgrade can be refused for reasons that are not about the credential:
+            # Hermes closes a WS before accept with a code the client sees only as
+            # HTTP 403 (bad credential, host mismatch, chat disabled all look alike),
+            # and the real "this cookie is stale" signal is the 401 from the ticket
+            # request, which `mint_ticket` already handles. So a refusal here must not
+            # cost a sign-in: logins are rate limited per client IP.
+            #
             # A connection is never a mutation: safe to repeat.
-            raise NotSentError(str(exc)) from exc
+            raise NotSentError(str(exc), status=exc.status) from exc
         except OSError as exc:
             raise NotSentError(f"could not reach {self.backend.describe()}: {exc}") from exc
         self._ws = client
@@ -1528,6 +1719,12 @@ def enumerate_sessions(transport: Optional[Transport] = None, *, db_path: Option
             result = transport.call("session.active_list", {})
             rows = list(result.get("sessions") or [])
             listed = True
+        except GatewayAuthError:
+            # A credential failure is not a telemetry hiccup, and it must not become a
+            # state-DB plan: the header would still say "live backend" while steering
+            # had quietly stopped working, and --apply would then send stored ids the
+            # backend refuses. It reaches the caller as itself.
+            raise
         except Exception as exc:
             # A failed list silently changes WHICH sessions are acted on, so say so.
             print(f"  note: session.active_list failed ({exc}); "
@@ -1802,11 +1999,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     config = load_config()
-    try:
-        gateway = gateway_from_config(config, args)
-    except GatewayAuthError as exc:
-        print(f"refusing to start: {exc}", file=sys.stderr)
-        return 2
+    gateway: Optional[Gateway] = None
+    if not args.db:
+        # `--db` means "plan from the state store, do not touch a live backend", so the
+        # gateway is not resolved at all: a broken gateway config must not refuse a
+        # read-only run that never wanted one.
+        try:
+            gateway = gateway_from_config(
+                config, args, warn=lambda note: print(f"  note: {note}", file=sys.stderr))
+        except GatewayAuthError as exc:
+            print(f"refusing to start: {exc}", file=sys.stderr)
+            return 2
+    if gateway is not None and (args.port or args.token):
+        # A gated backend is addressed by the gateway, so these are inert rather than
+        # overridden: say so, because silently ignoring a flag looks like it worked.
+        print("  note: --port/--token are ignored while a gateway is configured.",
+              file=sys.stderr)
     providers = build_providers(config)
     alias = args.alias or str(config.get("default_model") or "")
     routing_cfg = config.get("routing") or {}
@@ -1837,6 +2045,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("  An unreadable session store is not an empty fleet: reporting no sessions "
               "would look like a clean run.", file=sys.stderr)
         return 5
+    except GatewayAuthError as exc:
+        # The one failure that must never degrade into a plan: the sessions would come
+        # from state.db, the header would still name a live backend, and steering would
+        # have stopped without the exit code saying so.
+        print(f"refusing to plan: {exc}", file=sys.stderr)
+        print("  The gated backend could not be signed in to, so no session could be "
+              "steered. Fix the credential (or drop --gateway to plan from state.db on "
+              "purpose).", file=sys.stderr)
+        return 2
     quotas = collect_quotas(providers, config)
     # The concurrency reading has to be handed to the planner, or the rule that a
     # provider already busy from work outside this plan takes no new session holds
