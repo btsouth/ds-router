@@ -15,7 +15,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from provider_http import open_request, safe_error
+
 USER_AGENT = "ds-router/0.1"
+
+
+class QuotaPayloadError(ValueError):
+    """A fixed local diagnosis, never a server-provided message."""
+
 
 # Window label -> weight key. Providers name their windows differently; this is
 # the only place that naming is normalised.
@@ -158,7 +165,7 @@ def _http_json(url: str, key: str, timeout: float = 12.0) -> Any:
     request = urllib.request.Request(
         url, headers={"Authorization": f"Bearer {key}", "Accept": "application/json", "User-Agent": USER_AGENT}
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with open_request(request, timeout=timeout) as response:
         return json.load(response)
 
 
@@ -217,6 +224,13 @@ def _reset(value: Any) -> Optional[float]:
     """
     if not _present(value):
         return None
+    if isinstance(value, bool):
+        # float(True) is 1.0, which is January 1970: a boolean reset time would be
+        # read as "refilled half a century ago", so every rule that keys on
+        # resets_at (hard exhaustion, pace, headroom) would silently skip the
+        # window instead of saying it cannot be reasoned about. Every other
+        # numeric reader in this project rejects bools; so does this one.
+        return None
     if isinstance(value, (int, float)):
         seconds = float(value)
         # Milliseconds are the only numeric encoding any provider sends. The
@@ -256,7 +270,7 @@ def parse_commandcode(payload: dict) -> list[Window]:
     """
     windows = payload.get("windowLimits")
     if not isinstance(windows, dict):
-        raise ValueError("commandcode returned no windowLimits block")
+        raise QuotaPayloadError("commandcode returned no windowLimits block")
     out: list[Window] = []
     for name, label in (("fiveHour", "session"), ("weekly", "weekly")):
         window = windows.get(name)
@@ -274,14 +288,14 @@ def parse_commandcode(payload: dict) -> list[Window]:
             continue  # a reset we cannot read is not a window we can reason about
         out.append(Window(label, fraction, reset))
     if not out:
-        raise ValueError("commandcode returned no recognised windows")
+        raise QuotaPayloadError("commandcode returned no recognised windows")
     return out
 
 
 def parse_opencode_go(payload: dict) -> list[Window]:
     usage = payload.get("usage")
     if not isinstance(usage, dict):
-        raise ValueError("opencode-go returned no usage block")
+        raise QuotaPayloadError("opencode-go returned no usage block")
     out: list[Window] = []
     for name, label in (("rolling", "session"), ("weekly", "weekly"), ("monthly", "monthly")):
         window = usage.get(name)
@@ -296,14 +310,14 @@ def parse_opencode_go(payload: dict) -> list[Window]:
             continue  # a reset we cannot read is not a window we can reason about
         out.append(Window(label, fraction / 100.0, reset))
     if not out:
-        raise ValueError("opencode-go returned no recognised windows")
+        raise QuotaPayloadError("opencode-go returned no recognised windows")
     return out
 
 
 def parse_ollama(payload: dict) -> list[Window]:
     limits = payload.get("limits")
     if not isinstance(limits, dict):
-        raise ValueError("ollama returned no limits block")
+        raise QuotaPayloadError("ollama returned no limits block")
     out: list[Window] = []
     for name in limits:
         window = limits.get(name)
@@ -314,7 +328,7 @@ def parse_ollama(payload: dict) -> list[Window]:
             continue
         out.append(Window(str(name), fraction, None))
     if not out:
-        raise ValueError("ollama returned no recognised windows")
+        raise QuotaPayloadError("ollama returned no recognised windows")
     return out
 
 
@@ -328,7 +342,7 @@ def parse_clinepass(payload: dict) -> list[Window]:
     data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
     limits = data.get("limits")
     if not isinstance(limits, list):
-        raise ValueError("clinepass returned no limits array")
+        raise QuotaPayloadError("clinepass returned no limits array")
     out: list[Window] = []
     for row in limits:
         if not isinstance(row, dict):
@@ -345,7 +359,7 @@ def parse_clinepass(payload: dict) -> list[Window]:
             continue  # a reset we cannot read is not a window we can reason about
         out.append(Window(label, fraction / 100.0, reset))
     if not out:
-        raise ValueError("clinepass returned no recognised windows")
+        raise QuotaPayloadError("clinepass returned no recognised windows")
     return out
 
 
@@ -450,8 +464,17 @@ def fetch_quota(provider: str, spec: dict, key: str, timeout: float = 12.0) -> Q
                 spent, note = None, f"monthly window unread: {type(exc).__name__}"
             monthly = (credits.get("credits") or {}).get("monthlyCredits")
             if not note:
-                if isinstance(spent, (int, float)) and isinstance(monthly, (int, float)) and (monthly + spent) > 0:
-                    windows.append(Window("monthly", spent / (monthly + spent), None))
+                # Guarded like every other numeric reader here: a garbled spend
+                # figure (a negative number, a boolean, NaN) must not raise out of
+                # the Window constructor and take the session and weekly windows
+                # down with it. The monthly window is dropped with a note instead,
+                # which is the same treatment a bad window gets in the parsers.
+                numbers = (isinstance(spent, (int, float)) and not isinstance(spent, bool)
+                           and isinstance(monthly, (int, float)) and not isinstance(monthly, bool)
+                           and (monthly + spent) > 0)
+                fraction = _finite_percent(spent / (monthly + spent)) if numbers else None
+                if fraction is not None:
+                    windows.append(Window("monthly", fraction, None))
                 else:
                     note = ("monthly window unread: the spend summary carried no usable "
                             "credit figures")
@@ -503,9 +526,11 @@ def fetch_quota(provider: str, spec: dict, key: str, timeout: float = 12.0) -> Q
             return Quota(provider, windows, time.time(), partial_note(windows, kind), plan)
 
         return Quota(provider, [], time.time(), f"no quota reader for {kind!r}")
+    except QuotaPayloadError as exc:
+        return Quota(provider, [], time.time(), f"ValueError: {exc}")
     except Exception as exc:
         # Never surface a response body: it can carry credential-bearing fields.
-        return Quota(provider, [], time.time(), f"{type(exc).__name__}: {exc}"[:200])
+        return Quota(provider, [], time.time(), safe_error(exc))
 
 
 COLLECTOR_FILES = {

@@ -86,7 +86,7 @@ identity, so this key applies to all of them at once, not per-name. With both
 
 **2. Do not set it aggressively.** The stale timeout means "no output for N
 seconds", and reasoning models legitimately think for a while before emitting
-the first token — that is why the cloud path carries a 600 s floor for
+the first token ; that is why the cloud path carries a 600 s floor for
 `deepseek-v4.1-flash`. A value below roughly 120 s risks killing healthy slow
 reasoning and turning a working provider into a flapping one. The point of the
 workaround is to replace an unknown bound with a known one, not to make it tight.
@@ -135,8 +135,8 @@ behind it) degrades that case to a slower answer instead of a silent hang.
 
 ## What this means for ds-router
 
-The health probe is the mitigation that already exists here: it sends a real
-request to each provider before routing to it, so a provider that is *dead* gets
-excluded before you depend on it. What neither the probe nor ds-router can do is
-interrupt a provider that dies *during* a turn — only Hermes' own timeout can,
-and that is the bug above.
+An explicit `router.py --dry-run --health` probes every configured provider that
+serves the alias. The timer uses a narrower check: it probes the current provider
+only when its quota reading fails. A readable quota is not an inference health
+check. Neither path interrupts a provider that stops responding during a turn;
+that still depends on Hermes' own timeouts.

@@ -54,27 +54,3 @@ def peak_providers(peak_cfg: dict, now: float | None = None) -> set[str]:
     """Names of providers currently billing at peak rates."""
     windows = (peak_cfg or {}).get("windows") or {}
     return {name for name, spans in windows.items() if in_peak(spans, now)}
-
-
-def next_boundary(peak_cfg: dict, now: float | None = None) -> float | None:
-    """Epoch seconds when the current peak state next changes.
-
-    Used only for display, so a scheduled chain rewrite can be explained.
-    Returns None when no windows are configured.
-    """
-    now = time.time() if now is None else now
-    windows = (peak_cfg or {}).get("windows") or {}
-    if not any(windows.values()):
-        return None
-    moment = datetime.fromtimestamp(now, timezone.utc)
-    candidates: list[float] = []
-    for offset_hours in range(0, 24 * 8):
-        probe = moment.timestamp() + offset_hours * 3600
-        weekday = datetime.fromtimestamp(probe, timezone.utc).weekday()
-        if weekday > 4:
-            continue
-        before = peak_providers(peak_cfg, probe)
-        after = peak_providers(peak_cfg, probe + 3600)
-        if before != after:
-            candidates.append(probe + 3600)
-    return min(candidates) if candidates else None

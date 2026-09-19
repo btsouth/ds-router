@@ -26,6 +26,7 @@ import load as load_mod  # noqa: E402
 import peak as p  # noqa: E402
 import quota as q  # noqa: E402
 import routing as r  # noqa: E402
+from provider_http import open_request, safe_error
 
 CONFIG = HERE / "config.yaml"
 from paths import env_file as _hermes_env_file  # noqa: E402
@@ -33,10 +34,39 @@ from paths import env_file as _hermes_env_file  # noqa: E402
 HERMES_ENV = _hermes_env_file()
 
 
-def load_config() -> dict:
-    import yaml
+class ConfigError(RuntimeError):
+    """config.yaml is missing, unreadable, or not the shape it claims to be."""
 
-    return yaml.safe_load(CONFIG.read_text())
+
+def load_config() -> dict:
+    """This repo's config.yaml, validated enough to fail with a message rather than
+    a traceback.
+
+    apply.py has always done this and router.py never did, which is backwards: the
+    README points a new user at `./router.py --dry-run` as the first thing to try,
+    and a typo in the file it reads turned that into a raw stack trace.
+    """
+    try:
+        import yaml
+    except ImportError as exc:
+        raise ConfigError("pyyaml is not installed, so config.yaml cannot be read "
+                          "(install it with: python3 -m pip install --user pyyaml)") from exc
+
+    try:
+        raw = CONFIG.read_text()
+    except OSError as exc:
+        raise ConfigError(f"cannot read {CONFIG}: {exc}") from exc
+    try:
+        cfg = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"{CONFIG.name} is not valid YAML: {str(exc)[:200]}") from exc
+    if not isinstance(cfg, dict):
+        raise ConfigError(f"{CONFIG.name} must be a mapping, found {type(cfg).__name__}")
+    from config_schema import validate
+    try:
+        return validate(cfg)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def build_view(config: dict, env: dict[str, str]):
@@ -69,6 +99,10 @@ def collect(providers: dict, env: dict[str, str], timeout: float = 12.0,
     ttl = float(routing_cfg.get("quota_ttl_seconds", 300))
     out: dict[str, q.Quota] = {}
     for name, spec in providers.items():
+        if not spec.get("quota"):
+            # Disabling a reader must also disable snapshots left by that reader.
+            out[name] = q.fetch_quota(name, spec, q.load_key(spec, env), timeout)
+            continue
         if reuse and state_dir:
             cached = q.from_collector(name, Path(str(state_dir)), ttl)
             if cached is not None:
@@ -99,7 +133,7 @@ def ping(spec: dict, key: str, model_id: str, timeout: float = 40.0,
     request = urllib.request.Request(f"{base}/chat/completions", data=body, headers=headers)
     started = time.time()
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_request(request, timeout=timeout) as response:
             response.read(64)
             return True, time.time() - started, ""
     except urllib.error.HTTPError as exc:
@@ -112,7 +146,7 @@ def ping(spec: dict, key: str, model_id: str, timeout: float = 40.0,
             return True, elapsed, f"reachable (HTTP {exc.code} on probe)"
         return False, elapsed, f"HTTP {exc.code}"
     except Exception as exc:
-        return False, time.time() - started, f"{type(exc).__name__}: {exc}"[:120]
+        return False, time.time() - started, safe_error(exc)
 
 
 def main() -> int:
@@ -129,7 +163,11 @@ def main() -> int:
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     args = parser.parse_args()
 
-    config = load_config()
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        print(f"config: {exc}", file=sys.stderr)
+        return 1
     env = {**q.read_env(HERMES_ENV), **os.environ}
     providers = build_view(config, env)
     alias = args.model or config.get("default_model")
@@ -138,6 +176,7 @@ def main() -> int:
     skip_at = float(routing_cfg.get("skip_at", 0.85))
 
     if args.list_models:
+        failures = 0
         for name, spec in providers.items():
             key = q.load_key(spec, env)
             try:
@@ -147,8 +186,9 @@ def main() -> int:
                 for mid in ids:
                     print(f"    {mid}")
             except Exception as exc:
-                print(f"{name}: could not list models ({type(exc).__name__}: {exc})")
-        return 0
+                failures += 1
+                print(f"{name}: could not list models ({safe_error(exc)})")
+        return 1 if failures or not providers else 0
 
     quotas = collect(providers, env, routing_cfg=routing_cfg)
     peak_cfg = config.get("peak") or {}
@@ -238,7 +278,10 @@ def main() -> int:
                 for c in decision.ranked
             ],
         }, indent=2))
-        return 0
+        # Same contract as the text output: a refusal is exit 1 ("nothing usable"),
+        # not a clean run with an empty "chosen". The document still goes out, and
+        # apply.py reads a refusal out of it rather than mistaking it for a crash.
+        return 0 if decision.ok else 1
 
     print(f"\n  model alias : {alias}")
     print(f"  decision    : {decision.provider or 'NONE'}"
@@ -265,7 +308,7 @@ def main() -> int:
     print(f"  {'provider':<15}{'risk':>8}{'usage':>10}   detail")
     print("  " + "-" * 84)
     for c in decision.ranked:
-        flag = "EXHAUSTED" if c.hard else ("" if c.quota_ok else "no reading")
+        flag = "no reading" if not c.quota_ok else ("EXHAUSTED" if c.hard else "")
         # The 9.9 sentinel exists so it cannot be charted; printing it in a column
         # headed "usage" hands the reader a number where the JSON says null.
         usage = f"{c.headroom:.2f}" if c.quota_ok else "-"

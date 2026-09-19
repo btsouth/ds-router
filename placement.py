@@ -126,6 +126,7 @@ class Session:
     # not the same as a session that genuinely has none. Only the enumeration can
     # tell those apart, so it is the enumeration that clears this.
     provider_known: bool = True
+    stored_id: bool = False
 
 
 @dataclass
@@ -1759,7 +1760,7 @@ class LiveTransport(Transport):
         try:
             client.send_text(json.dumps(request))
         except (OSError, socket.timeout) as exc:
-            raise NotSentError(f"{method}: could not send: {exc}") from exc
+            raise TransportError(f"{method}: send failed; delivery is unknown ({type(exc).__name__})") from exc
         try:
             deadline = time.time() + self.timeout
             while time.time() < deadline:
@@ -1829,6 +1830,12 @@ class StoreUnreadable(RuntimeError):
     """The session store exists but could not be read, which is not an empty fleet."""
 
 
+class StoredSessions(list):
+    """Keep database provenance even when the fallback found zero rows."""
+
+    stored_ids = True
+
+
 def _read_db(db_path: Optional[Path]) -> dict[str, str]:
     """``{session_id: provider}`` from the state DB, read-only. {} on any failure.
 
@@ -1872,7 +1879,7 @@ def sessions_from_db(db_path: Optional[Path] = None, *,
     if not path.exists():
         print(f"  note: no session store at {path}; nothing to enumerate from it.",
               file=sys.stderr)
-        return []
+        return StoredSessions()
     try:
         con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2.0)
     except sqlite3.Error as exc:
@@ -1921,8 +1928,8 @@ def sessions_from_db(db_path: Optional[Path] = None, *,
                            provider=_provider_of(values.get("billing_provider"), config),
                            session_key=str(values.get("session_key") or ""),
                            model=str(values.get("model") or ""),
-                           title=str(values.get("title") or "")))
-    return out
+                           title=str(values.get("title") or ""), stored_id=True))
+    return StoredSessions(out)
 
 
 def enumerate_sessions(transport: Optional[Transport] = None, *, db_path: Optional[Path] = None,
@@ -1944,7 +1951,9 @@ def enumerate_sessions(transport: Optional[Transport] = None, *, db_path: Option
     if transport is not None:
         try:
             result = transport.call("session.active_list", {})
-            rows = list(result.get("sessions") or [])
+            if not isinstance(result, dict) or not isinstance(result.get("sessions"), list):
+                raise TransportError("session.active_list returned no session list")
+            rows = result["sessions"]
             listed = True
         except GatewayAuthError:
             # A credential failure is not a telemetry hiccup, and it must not become a
@@ -2139,10 +2148,40 @@ def apply(assignments: Iterable[Any], transport: Optional[Transport], *,
 # --------------------------------------------------------------------------- #
 
 
-def load_config(path: Optional[Path] = None) -> dict:
-    import yaml
+class ConfigError(RuntimeError):
+    """config.yaml is missing, unreadable, or not the shape it claims to be."""
 
-    return yaml.safe_load(Path(path or CONFIG).read_text()) or {}
+
+def load_config(path: Optional[Path] = None) -> dict:
+    """The config to plan against, diagnosed rather than raised as a traceback.
+
+    The same contract as router.py's and apply.py's loader, and for the same
+    reason: this CLI is the one that takes an arbitrary --config path, so a file
+    a stranger wrote has to read as a diagnosis with an exit status, not a stack
+    trace that looks like a bug here.
+    """
+    try:
+        import yaml
+    except ImportError as exc:
+        raise ConfigError("pyyaml is not installed, so config.yaml cannot be read "
+                          "(install it with: python3 -m pip install --user pyyaml)") from exc
+
+    source = Path(path or CONFIG)
+    try:
+        raw = source.read_text()
+    except OSError as exc:
+        raise ConfigError(f"cannot read {source}: {exc}") from exc
+    try:
+        cfg = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"{source.name} is not valid YAML: {str(exc)[:200]}") from exc
+    if not isinstance(cfg, dict):
+        raise ConfigError(f"{source.name} must be a mapping, found {type(cfg).__name__}")
+    from config_schema import validate
+    try:
+        return validate(cfg)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def build_providers(config: dict) -> dict[str, dict]:
@@ -2167,13 +2206,14 @@ def collect_quotas(providers: dict, config: dict) -> dict:
     """Read live quotas, reusing router.py's collector — one config, one poller."""
     try:
         import router as router_mod  # lazy: the CLI lives in router.py too
-    except Exception:
-        return {}
+    except ImportError as exc:
+        raise ConfigError("cannot import the quota collector") from exc
     try:
         env = {**quota_mod.read_env(hermes_home() / ".env"), **os.environ}
         return router_mod.collect(providers, env, routing_cfg=config.get("routing") or {})
-    except Exception:
-        return {}
+    except Exception as exc:
+        from provider_http import safe_error
+        raise ConfigError(f"quota collection failed ({safe_error(exc)}); refusing to place sessions") from exc
 
 
 def _render_table(sessions: list[Session], assignments: list[Assignment], caps: dict,
@@ -2239,8 +2279,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.plan and args.apply:
         print("Choose one of --plan or --apply.", file=sys.stderr)
         return 2
+    if args.apply and args.db and not args.dry_run:
+        print("refusing to apply: --db supplies stored ids, not live session ids", file=sys.stderr)
+        return 6
 
-    config = load_config(Path(args.config).expanduser() if args.config else None)
+    try:
+        config = load_config(Path(args.config).expanduser() if args.config else None)
+    except ConfigError as exc:
+        print(f"config: {exc}", file=sys.stderr)
+        return 1
     gateway: Optional[Gateway] = None
     if not args.db:
         # `--db` means "plan from the state store, do not touch a live backend", so the
@@ -2258,6 +2305,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("  note: --port/--token are ignored while a gateway is configured.",
               file=sys.stderr)
     providers = build_providers(config)
+    if not providers:
+        # The same refusal apply.py makes, for the same reason: an empty provider
+        # table plans nothing, and every session would read as "not managed" with
+        # exit 0 -- a clean-looking run that is really a broken config.
+        print("No providers declared in config.yaml; there is nowhere to place anything.",
+              file=sys.stderr)
+        return 1
     alias = args.alias or str(config.get("default_model") or "")
     routing_cfg = config.get("routing") or {}
     conc_cfg = routing_cfg.get("concurrency") or {}
@@ -2307,13 +2361,29 @@ def main(argv: Optional[list[str]] = None) -> int:
               "certificate it could not verify), or drop --gateway to plan from the "
               "state store on purpose.", file=sys.stderr)
         return 2
-    quotas = collect_quotas(providers, config)
+    from_db = from_db or getattr(sessions, "stored_ids", False) or any(s.stored_id for s in sessions)
+    if from_db:
+        if transport is not None:
+            print(f"  note: could not enumerate {source}; using state.db for the plan.",
+                  file=sys.stderr)
+        source = "state.db"
+    if args.apply and from_db and transport is not None and not args.dry_run:
+        print("refusing to apply: live enumeration fell back to stored session ids", file=sys.stderr)
+        return 6
+    try:
+        quotas = collect_quotas(providers, config)
+    except ConfigError as exc:
+        print(f"config: {exc}", file=sys.stderr)
+        return 1
     # The concurrency reading has to be handed to the planner, or the rule that a
     # provider already busy from work outside this plan takes no new session holds
     # only for callers of the library and not for the shipped CLI.
     session_db = Path(args.db_path) if args.db_path else None
     try:
-        live_load = load_mod.active_by_provider(session_db=session_db)
+        live_load = load_mod.active_by_provider(
+            session_db=session_db,
+            exclude_session_ids={key for s in sessions if s.provider_known and s.provider
+                                 for key in (s.id, s.session_key) if key})
     except Exception as exc:  # a load reading is an optimisation and must not stop a plan
         live_load = load_mod.Load({}, "unreadable", f"{type(exc).__name__}: {exc}")
     readings: dict[str, dict[str, Any]] = {name: {"quota": q} for name, q in quotas.items()}
@@ -2351,8 +2421,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     # chosen by session-id sort order rather than by importance.
     shown = assignments[: args.limit] if args.limit else assignments
 
+    plan_doc: Optional[dict[str, Any]] = None
     if args.json:
-        print(json.dumps({
+        # Built here but printed once, at the end: a plan document that printed
+        # before the apply would sit on stdout above a refusal, looking like a
+        # result for a run that wrote nothing.
+        plan_doc = {
             "alias": alias,
             "source": source,
             "caps": caps,
@@ -2364,7 +2438,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             "assignments": [{"session_id": a.session_id, "from": a.from_provider,
                              "to": a.provider, "model_id": a.model_id, "keep": a.keep,
                              "unassigned": a.unassigned, "reason": a.reason} for a in assignments],
-        }, indent=2))
+        }
     else:
         print()
         print(_render_table(sessions, shown, caps, alias, source))
@@ -2374,6 +2448,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         print()
 
     if not args.apply and not args.dry_run:
+        if plan_doc is not None:
+            print(json.dumps(plan_doc, indent=2))
         return 0
 
     if args.apply and transport is None:
@@ -2391,7 +2467,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"refusing to apply: {exc}", file=sys.stderr)
         return 6
     failed = [r for r in results if not r.ok]
-    if not args.json:
+    if plan_doc is not None:
+        # The apply step ran, so the document carries what each session got. Without
+        # this a scripted --apply --json saw only the plan and an exit code.
+        plan_doc["results"] = [{
+            "session_id": r.session_id, "from": r.from_provider, "to": r.provider,
+            "ok": r.ok, "skipped": r.skipped, "dry_run": r.dry_run,
+            "method": r.method, "params": r.params, "error": r.error, "reason": r.reason,
+        } for r in results]
+        print(json.dumps(plan_doc, indent=2))
+    else:
         for r in results:
             if r.skipped:
                 continue

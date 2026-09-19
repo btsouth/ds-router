@@ -448,7 +448,7 @@ def test_a_failing_quota_endpoint_produces_a_reading_and_never_a_crash():
     import socket
     import urllib.error
 
-    real = q.urllib.request.urlopen
+    real = q.open_request
 
     class Response:
         def __init__(self, body: bytes) -> None:
@@ -477,11 +477,11 @@ def test_a_failing_quota_endpoint_produces_a_reading_and_never_a_crash():
                 raise _exc
             return Response(b"<html>not json</html>" if _label == "html"
                             else (b"" if _label == "empty" else b"null"))
-        q.urllib.request.urlopen = fake_urlopen
+        q.open_request = fake_urlopen
         try:
             quota = q.fetch_quota("p", {"quota": "opencode_go"}, "k")
         finally:
-            q.urllib.request.urlopen = real
+            q.open_request = real
         assert quota.stale, (label, quota.error)
         assert expected in quota.error, (label, quota.error)
         assert quota.windows == [], (label, quota.windows)
@@ -492,11 +492,11 @@ def test_a_failing_quota_endpoint_produces_a_reading_and_never_a_crash():
     assert quota.stale and "no quota reader" in quota.error, quota.error
 
     # A 200 carrying nothing usable is a reading failure, not an empty plan.
-    q.urllib.request.urlopen = lambda request, timeout=None: Response(jsonlib.dumps({"usage": {}}).encode())
+    q.open_request = lambda request, timeout=None: Response(jsonlib.dumps({"usage": {}}).encode())
     try:
         quota = q.fetch_quota("p", {"quota": "opencode_go"}, "k")
     finally:
-        q.urllib.request.urlopen = real
+        q.open_request = real
     assert quota.stale and "no recognised windows" in quota.error, quota.error
 
 
@@ -710,16 +710,11 @@ def test_peak_windows_are_read_from_the_clock():
                             at("2026-09-19T02:00:00+00:00")) == set()
 
 
-def test_off_peak_provider_wins_between_two_safe_options():
-    now = time.time()
-    live = {
-        "commandcode": q.Quota("commandcode", [win("session", 0.30, resets_in=4 * HOUR, now=now)]),
-        "opencode-go": q.Quota("opencode-go", [win("weekly", 0.30, resets_in=5 * DAY, now=now)]),
-        "ollama-cloud": q.Quota("ollama-cloud", [win("monthly", 0.30)]),
-    }
-    d = r.choose("ds", PROVIDERS, live, WEIGHTS, SKIP, now=now,
-                 peak_providers={"opencode-go"})
-    assert d.provider != "opencode-go", d.reason
+def test_off_peak_provider_wins_between_equally_safe_options():
+    live = {name: q.Quota(name, [win("monthly", 0.30)]) for name in PROVIDERS}
+    d = r.choose("ds", PROVIDERS, live, WEIGHTS, SKIP,
+                 peak_providers={"commandcode"})
+    assert d.provider != "commandcode", d.reason
     assert "off-peak" in d.reason
 
 
@@ -986,12 +981,6 @@ def test_the_chosen_name_comes_from_the_provider_mapping_not_the_quota():
     assert d.provider in providers, d.provider
 
 
-def test_sticky_expires():
-    table = r.StickyTable(ttl_seconds=0)
-    table.put("c1", "commandcode")
-    assert table.get("c1") is None
-
-
 def test_adding_a_model_is_config_only():
     """The extensibility claim, asserted: a new alias needs no code change."""
     providers = {
@@ -1003,6 +992,103 @@ def test_adding_a_model_is_config_only():
     decision = r.choose("deepseek-v4.2-flash", providers, live, WEIGHTS, SKIP)
     assert decision.provider == "commandcode"
     assert decision.model_id == "deepseek/deepseek-v4.2-flash"
+
+
+def test_a_malformed_config_is_diagnosed_rather_than_crashing():
+    """The README points a new user at `./router.py --dry-run` as the first thing to
+    try, and a typo in the file it reads used to print a raw stack trace while
+    apply.py diagnosed the very same file."""
+    import io
+    import tempfile
+    from contextlib import redirect_stderr
+    from pathlib import Path as P
+    import router as R
+    real_config = R.CONFIG
+    old_argv = sys.argv
+    sys.argv = ["router.py", "--dry-run"]
+    try:
+        for text, fragment in (("{not yaml: [", "not valid YAML"),
+                               ("just a scalar", "must be a mapping")):
+            cfg = P(tempfile.mkdtemp(prefix="ds-router-config-")) / "config.yaml"
+            cfg.write_text(text)
+            R.CONFIG = cfg
+            err = io.StringIO()
+            with redirect_stderr(err):
+                code = R.main()
+            assert code == 1, (text, code)
+            assert fragment in err.getvalue(), (text, err.getvalue())
+        # A missing file is a diagnosis too, not a traceback.
+        R.CONFIG = P(tempfile.mkdtemp(prefix="ds-router-config-")) / "gone.yaml"
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = R.main()
+        assert code == 1 and "cannot read" in err.getvalue(), (code, err.getvalue())
+    finally:
+        R.CONFIG = real_config
+        sys.argv = old_argv
+
+
+def test_a_boolean_reset_time_is_unreadable_not_1970():
+    """float(True) is 1.0, which is January 1970: a boolean reset time used to read
+    as "refilled half a century ago", so hard exhaustion, pace and headroom all
+    silently skipped the window instead of saying it could not be reasoned about.
+    Every other numeric reader in this project rejects bools; a reset that is
+    present but unreadable is dropped, per the window rules."""
+    assert q._reset(True) is None
+    assert q._reset(False) is None
+    # The parser drops the window rather than building one that cannot be
+    # reasoned about; the rest of the reading survives.
+    windows = q.parse_opencode_go({"usage": {
+        "rolling": {"percent": 4, "resetsAt": "2026-09-18T05:24:13Z"},
+        "weekly": {"percent": 88, "resetsAt": True}}})
+    assert [w.label for w in windows] == ["session"], windows
+
+
+def test_a_garbled_spend_figure_does_not_destroy_the_whole_reading():
+    """CommandCode's monthly window is built from a second endpoint's totalCredits.
+    A negative, boolean, NaN or non-numeric spend used to raise out of the Window
+    constructor and take the session and weekly windows down with it, turning a
+    provider that read fine into an error reading. The monthly window is dropped
+    with a note instead, which is how a bad window is treated everywhere else."""
+    credits = {"credits": {"monthlyCredits": 58.43},
+               "windowLimits": {"fiveHour": {"used": 1, "cap": 14, "resetAt": 1789698497290},
+                                "weekly": {"used": 11, "cap": 35, "resetAt": 1790253387497}}}
+    for bad in (-3.0, True, float("nan"), "12.5"):
+        quota = _live_quota(**{"billing/credits": credits,
+                               "usage/summary": {"totalCredits": bad},
+                               "subscriptions": {"data": {"planId": "goat"}}})
+        labels = [w.label for w in quota.windows]
+        assert labels == ["session", "weekly"], (bad, labels, quota.error)
+        assert quota.stale and "monthly window unread" in quota.error, (bad, quota.error)
+
+
+def test_a_json_refusal_exits_1_like_the_text_output():
+    """The exit table says 1 is "router.py found no provider it can use", and
+    --json has to keep that contract: a scripted consumer reading the exit status
+    alone used to see 0 on a refusal, with an empty "chosen" as the only clue.
+    apply.py reads the refusal out of this document rather than treating it as a
+    router failure."""
+    import io
+    import json
+    from contextlib import redirect_stdout
+    import load as load_mod
+    import router as R
+    real_collect, real_load = R.collect, load_mod.active_by_provider
+    R.collect = lambda providers, env, routing_cfg=None, timeout=12.0: {}
+    load_mod.active_by_provider = lambda *a, **k: load_mod.Load({}, "disabled")
+    old_argv = sys.argv
+    sys.argv = ["router.py", "--dry-run", "--json", "--model", "no-such-alias"]
+    stdout = io.StringIO()
+    try:
+        with redirect_stdout(stdout):
+            code = R.main()
+    finally:
+        R.collect, load_mod.active_by_provider = real_collect, real_load
+        sys.argv = old_argv
+    assert code == 1, code
+    payload = json.loads(stdout.getvalue())
+    assert payload["chosen"] == "", payload
+    assert "no provider serves" in payload["reason"], payload["reason"]
 
 
 if __name__ == "__main__":

@@ -16,9 +16,8 @@
 # never fails just because something is already installed. Nothing outside the
 # user's own directories is touched. No sudo, ever.
 #
-# --dry-run writes nothing at all, but it does still run the read-only checks
-# (the test suites and `ds-switch --check`) so you can see whether the tree is
-# healthy before committing to anything.
+# --dry-run leaves installation and Hermes files unchanged. It runs the test
+# suites and `ds-switch --check` in private temporary storage removed on exit.
 #
 # POSIX sh only — no bash arrays, no GNU-only flags — because this has to run
 # under macOS's /bin/sh (bash 3.2) as well as Linux's dash.
@@ -109,12 +108,17 @@ MANIFEST=$STATE_DIR/install-manifest
 BIN_DIR=$HOME/.local/bin
 SYMLINK=$BIN_DIR/ds-switch
 
-TMPDIR_D=${TMPDIR:-/tmp}
-TMP_FILE=$TMPDIR_D/ds-router-install.$$.tmp
-TMP_UNIT=$TMPDIR_D/ds-router-install.$$.unit
-TMP_MANIFEST=$TMPDIR_D/ds-router-install.$$.manifest
-cleanup() { rm -f "$TMP_FILE" "$TMP_UNIT" "$TMP_MANIFEST"; }
-trap cleanup EXIT INT TERM HUP
+# Private scratch storage prevents symlink clobbering in shared temp directories.
+TMP_WORK=$(mktemp -d "${TMPDIR:-/tmp}/ds-router-install.XXXXXXXX") || die "cannot create private temporary directory"
+TMP_FILE=$TMP_WORK/output
+TMP_UNIT=$TMP_WORK/unit
+TMP_MANIFEST=$TMP_WORK/manifest
+trap 'rm -rf "$TMP_WORK"' EXIT
+trap 'exit 1' INT TERM HUP
+# Preflight suites may allocate their own scratch trees. Remove all of them on exit.
+TMPDIR=$TMP_WORK
+PYTHONDONTWRITEBYTECODE=1
+export TMPDIR PYTHONDONTWRITEBYTECODE
 
 # ---------------------------------------------------------------------------
 # action wrappers — dry-run short-circuits every mutating operation
@@ -169,6 +173,8 @@ escape_sed() { printf '%s' "$1" | sed 's/[&\\|]/\\&/g'; }
 # ---------------------------------------------------------------------------
 HERMES_BIN=""
 PY=python3
+PY_BIN=""
+PY_BIN_DIR=""
 PY_VERSION=""
 
 check_python() {
@@ -178,6 +184,13 @@ check_python() {
     Fedora        : sudo dnf install python3 python3-pyyaml
     Arch          : sudo pacman -S python python-yaml
     macOS         : brew install python   (or: python3 -m pip install --user pyyaml)"
+
+  PY_BIN=$(command -v python3)
+  # The interpreter's own directory, so a rendered unit can put the SAME python3 on
+  # PATH that the preflight below verifies. A pyenv/asdf/mise/Homebrew interpreter
+  # lives outside the unit's hardcoded fallbacks, so without this the timer would
+  # fail every 15 minutes on a machine where the install itself succeeded.
+  PY_BIN_DIR=$(dirname "$PY_BIN")
 
   PY_VERSION=$("$PY" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "")
   [ -n "$PY_VERSION" ] || die "python3 exists but could not be run: $PY"
@@ -190,7 +203,7 @@ check_python() {
     Fedora        : sudo dnf install python3.12
     macOS         : brew install python@3.12"
   fi
-  ok "python3 $PY_VERSION ($(command -v python3))"
+  ok "python3 $PY_VERSION ($PY_BIN)"
 }
 
 check_hermes() {
@@ -314,33 +327,17 @@ fi
 # 3. preflight: the test suites must pass before anything is installed
 # ---------------------------------------------------------------------------
 hdr "Preflight: test suites"
-tests_run=0
 if [ "$SKIP_PREFLIGHT" = 1 ]; then
-  # For test_install.py, which cannot run this installer's preflight without running
-  # itself, and for a re-run right after you ran the suites yourself. Not advertised
-  # as a way past a failing tree: it skips the check, it does not pass it.
   skip "--skip-preflight: not running the suites here"
-fi
-for t in "$ROUTER_DIR"/test_*.py; do
-  [ "$SKIP_PREFLIGHT" = 1 ] && break
-  [ -f "$t" ] || continue
-  tests_run=$((tests_run + 1))
-  name=$(basename "$t")
-  if out=$(cd "$ROUTER_DIR" && "$PY" "$t" 2>&1); then
-    last=$(printf '%s\n' "$out" | tail -n 1)
-    ok "$name passed ($last)"
-  else
-    printf '%s\n' "$out" | tail -n 20 | sed 's/^/        /' >&2
-    die "$name FAILED — refusing to install a broken tree.
-    Fix the failure above (or run: cd $ROUTER_DIR && python3 $name), then re-run."
-  fi
-done
-if [ "$SKIP_PREFLIGHT" = 1 ]; then
-  :
-elif [ "$tests_run" = 0 ]; then
-  warn "no test_*.py files found in $ROUTER_DIR — preflight skipped"
 else
-  ok "$tests_run test suite(s) passed"
+  if out=$(cd "$ROUTER_DIR" && "$PY" "$ROUTER_DIR/run_tests.py" 2>&1); then
+    printf '%s\n' "$out" | sed 's/^/        /'
+  else
+    printf '%s\n' "$out" | tail -n 30 | sed 's/^/        /' >&2
+    die "test suite FAILED: refusing to install a broken tree.
+    Run python3 run_tests.py to see the failures. TLS tests require openssl.
+    --skip-preflight skips this check; use it only after a successful test run."
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -363,6 +360,7 @@ render_unit() {
   esac
   sed -e "s|%h/Projects/ds-router|$(escape_sed "$router_pat")|g" \
       -e "s|%h/.hermes/hermes-agent/venv/bin|$(escape_sed "$hermes_bin_pat")|g" \
+      -e "s|%python3_bin_dir%|$(escape_sed "$PY_BIN_DIR")|g" \
       "$1"
 }
 
@@ -447,7 +445,7 @@ install_launchd_darwin() {
   do_mkdir "$plist_dir"
 
   hermes_bin_dir=$(dirname "$HERMES_BIN")
-  run_path="$hermes_bin_dir:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+  run_path="$PY_BIN_DIR:$hermes_bin_dir:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
   if [ "$DRY_RUN" = 1 ]; then
     printf '  dry   write %s\n' "$dst"
@@ -599,6 +597,11 @@ else
     printf 'SYSTEMD_USER_DIR=%s\n' "$SYSTEMD_USER_DIR"
     printf 'LAUNCHD_PLIST=%s\n' "$(launchd_plist_dst)"
     printf 'HERMES_BIN=%s\n' "$HERMES_BIN"
+    # The directory of the python3 that was verified here. uninstall.sh re-renders
+    # the units it expects to find, and it has to use the same directory the units
+    # were written with -- re-deriving it from the current shell would read a
+    # freshly installed unit as hand-edited the moment this interpreter moved.
+    printf 'PYTHON3_BIN_DIR=%s\n' "$PY_BIN_DIR"
   } >"$TMP_MANIFEST"
   # Rewriting an identical manifest would be a no-op write; keep re-runs clean.
   if [ -f "$MANIFEST" ] && cmp -s "$TMP_MANIFEST" "$MANIFEST"; then
@@ -622,6 +625,6 @@ say "  timer     : $TIMER_STATE"
 say "  uninstall : $ROUTER_DIR/uninstall.sh --dry-run       # then without --dry-run"
 if [ "$DRY_RUN" = 1 ]; then
   say ""
-  say "  DRY RUN — nothing above was written or changed."
+  say "  DRY RUN: no installation or Hermes files were changed; temporary checks were cleaned up."
 fi
 say ""

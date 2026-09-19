@@ -2,8 +2,10 @@
 
 ds-router runs on the machine it is installed on, reads your Hermes config, and for a
 gated dashboard it stores a credential you write yourself. It writes nothing outside your
-own user directories, and the only network requests it makes are to the provider usage
-APIs and the dashboard you point it at.
+own user directories, and its network requests go to provider usage APIs, model catalogs, explicit health
+probes, and the dashboard you configure. Authenticated provider requests refuse
+redirects and ignore environment proxy settings. HTTPS verifies certificates.
+Plain HTTP dashboards send credentials without TLS, as documented in the README.
 
 ## Reporting a problem
 

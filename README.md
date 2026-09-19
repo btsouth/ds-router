@@ -23,10 +23,57 @@ month at their list rates. That gap is the reason to run the router: it is what
 lets you actually use all of it instead of hammering one subscription until it
 throttles you.
 
-## Before you start: add your keys
+## What it is
+
+Four moving parts, none of them a proxy:
+
+- **`router.py`** polls each provider's usage API and scores the readings by *burn
+  rate*; how fast a window is draining against how much of it remains; rather
+  than by raw percent, which is what makes a 5-hour window and a monthly window
+  comparable.
+- **`ds-switch`** applies that decision by rewriting three keys in Hermes' own
+  config (`model.provider`, `model.default`, `model.base_url`). The first time it
+  writes, it saves a one-time backup of your original config for undo.
+- **A timer** (a systemd user unit on Linux, a launchd agent on macOS) re-runs
+  `ds-switch` every 15 minutes, so the choice tracks quota as it drains. Every
+  tick logs what it decided and why.
+- **`placement.py`** is for many sessions at once: it gives each open session its
+  own provider, so a fleet does not pile onto one provider's concurrency cap.
+
+What it is **not**: there is no HTTP server, no proxy, and no per-request routing
+anywhere in this tool. Nothing sits in the request path; Hermes keeps sending
+requests to the provider it was pointed at, and mid-turn failover is Hermes' own
+fallback chain, not this. The choice is made when a session starts (or on the
+timer's rewrite), never inside a request.
+
+**Runs on** Linux (systemd user units, exercised end to end) or macOS (launchd;
+see Limits; supported by construction, never loaded on a Mac). Needs Python
+3.10+ with PyYAML and the `hermes` CLI. Providers without a usage API work as
+plain Hermes fallback entries but are never routed to.
+
+## Before you start
+
+Two things have to be in place, then your keys.
+
+**1. The `hermes` CLI, on your PATH.** ds-router steers Hermes; without it there is
+nothing to steer. Install it from
+<https://hermes-agent.nousresearch.com/install.sh> (docs:
+<https://hermes-agent.nousresearch.com/docs/>). Its launcher usually lands in
+`~/.local/bin`, which is not always on the PATH of a non-login shell; the installer
+says so rather than failing silently if it cannot find it.
+
+**2. `openssl`.** `install.sh` runs the whole test suite as a preflight before it
+installs anything, and the TLS checks generate a throwaway self-signed certificate
+per run rather than shipping a private key in the repo (`apt install openssl`,
+`brew install openssl`). Without it the installer stops with "refusing to install a broken tree"; which is the suite failing to run, not your tree being broken. If you
+have already run `python3 run_tests.py` yourself, `./install.sh --skip-preflight`
+skips the check; it does not pass it.
+
+### Then add your keys
 
 ds-router reads provider API keys from `~/.hermes/.env`, the same file Hermes
-uses. It does not store credentials itself and never writes them anywhere.
+uses. It never writes those API keys. The one-time Hermes configuration backup may
+contain secrets already present in that configuration, and retains its file mode.
 
 ```sh
 # ~/.hermes/.env
@@ -44,30 +91,38 @@ Only the providers you actually have need entries. Delete the others from
 ```sh
 git clone https://github.com/btsouth/ds-router ~/Projects/ds-router
 cd ~/Projects/ds-router
-./install.sh --dry-run    # see exactly what it would do, change nothing
-./install.sh              # do it
+./install.sh --dry-run    # check and preview the installation
+./ds-switch --show        # preview before enabling the timer
+./install.sh              # install and enable the Linux timer
 ```
 
-Any clone location works — the installer rewrites the systemd units and the
-manifest to wherever you put it, so `~/ds-router` or a nested path is fine.
+The checkout does not have to live at `~/Projects/ds-router`. The installer
+rewrites the systemd units and manifest for the actual checkout directory.
 
 `install.sh` checks your prerequisites, runs the test suite as a preflight, and
 installs and enables a systemd timer (Linux), or writes a launchd job (macOS) and
 prints the two commands that load it, because loading someone's launchd job
-unasked is not the installer's call. **It does not touch your Hermes config**:
-installing and routing are separate steps.
+unasked is not the installer's call. The installer does not rewrite the Hermes config
+itself, but the Linux timer is enabled immediately and can route without a
+manual `ds-switch` call. Use `--no-service` if you want to install only the command.
 
-Preview what the router would choose before enabling anything:
+For a preview before enabling the timer, run this before `./install.sh`:
 
 ```sh
 ./ds-switch --show        # writes nothing
 ```
 
-Then turn routing on:
+To apply a decision immediately:
 
 ```sh
 ./ds-switch               # apply the router's recommendation now
 ```
+
+The first time `ds-switch` (or the timer) actually rewrites your Hermes config, it
+saves a copy of the original to `~/.hermes/config.yaml.bak-ds-router`; one
+backup, written once, holding the config as it was *before* any routing. To undo
+ds-router by hand later, stop the timer with `./uninstall.sh`, then copy it back. It is not overwritten on later runs, so it
+stays a true before-picture rather than drifting forward.
 
 From then on the timer re-checks every 15 minutes. To stop it:
 
@@ -79,13 +134,9 @@ From then on the timer re-checks every 15 minutes. To stop it:
 
 ### Do you need all four providers?
 
-No. Start with the one you have. On a single-provider setup ds-router correctly
-concludes there is nowhere better to move anything and leaves every session exactly
-where it is — so it is inert until you add a second provider, and adding one is
-just another entry in `config.yaml`.
-
-It becomes useful at two: that is when "which one still has quota" stops having an
-obvious answer.
+No. One provider is enough to set Hermes' default, but there is nowhere else to
+move when it runs out. An already matching configuration is left unchanged. Adding
+a second provider gives the router an alternative when quota is exhausted.
 
 ## Commands
 
@@ -95,7 +146,7 @@ obvious answer.
 | `./ds-switch --show` | Print the decision, write nothing |
 | `./ds-switch --check` | Verify the config can actually drive Hermes |
 | `./ds-switch <provider>` | Pin one provider, ignoring the router |
-| `./ds-switch --off` | Hand Hermes back to `default_provider` |
+| `./ds-switch --off` | Set `default_provider` once; does not stop the timer |
 | `./router.py --dry-run` | Read live quotas, print the decision table |
 | `./router.py --dry-run --health` | Also probe each provider with a real request |
 | `./router.py --dry-run --json` | Machine-readable output |
@@ -108,30 +159,37 @@ obvious answer.
 | `journalctl --user -u ds-router.service` | What the last tick decided, and why |
 
 Every command that changes something has a read-only counterpart. `--show`,
-`--check`, `--dry-run`, and `--plan` never write to the Hermes config. They do call
-the `hermes` CLI, which bootstraps `~/.hermes` (a skills directory, a log, an empty
+`--check`, `--dry-run`, and `--plan` never write to the Hermes config. Automatic `ds-switch --show`
+reads through the `hermes` CLI, which can bootstrap `~/.hermes` (a skills directory, a log, an empty
 session store) the first time it runs.
 
 ### Exit codes
 
 | code | meaning |
 |---|---|
-| `1` | nothing usable: `router.py` found no provider it can use, `ds-switch --check` found a problem, or no providers are declared |
-| `2` | refused before doing anything: an argument it cannot accept (a wildcard address, userinfo in the URL, a CA file with no `https` to use it on), an unreadable concurrency cap, or an unknown provider |
+| `1` | install/uninstall did not complete, catalog lookup failed, a placement mutation failed, or nothing usable: `router.py` found no provider it can use (text or `--json`), `ds-switch --check` found a problem, no providers are declared, or `config.yaml` is unreadable or malformed |
+| `2` | refused before doing anything: an argument it cannot accept (a wildcard address, userinfo in the URL, a CA file with no `https` to use it on), an unreadable router concurrency cap, or an unknown provider |
 | `3` | `ds-switch` could not get a decision out of the router; `placement.py --apply` found no reachable backend |
 | `4` | the router refused to choose, so the Hermes config was left untouched |
-| `5` | a file could not be written or read: the Hermes config (`ds-switch`), or the session store or provider join (`placement.py`) |
-| `6` | the Hermes config could not be read (`ds-switch`), which is not the same as it being absent |
+| `5` | a requested provider/model could not be applied, or a file could not be written: the Hermes config or its backup (`ds-switch`), or the session store or provider join (`placement.py`) |
+| `6` | the Hermes config could not be read (`ds-switch`), which is not the same as it being absent; placement refuses stored IDs, including `--apply --db` and a failed live listing that fell back to SQLite |
 | `7` | `placement.py` was handed a `caps:` block it cannot read |
+
+The `--apply --db` refusal happens before backend discovery. With `--dry-run`,
+stored IDs can still be inspected without a mutation.
 
 A `--health` run that finds every provider unhealthy exits `1`, the same code as "no
 provider is usable", so read the output rather than only the status when you script a
 monitor.
 
+If something goes wrong; the installer stops, the timer never fires, nothing moves;
+`docs/install.md` has the failure messages and what each one means, plus a reference
+for every key in `config.yaml`.
+
 ## Spreading many sessions
 
 `ds-switch` sets one provider for Hermes, so every session you open inherits it.
-If you run several agents at once, they all land on the same provider — and
+If you run several agents at once, they all land on the same provider; and
 providers cap concurrency. Ollama Cloud Pro allows 3 simultaneous requests, so a
 4th session queues and a full queue is rejected.
 
@@ -165,9 +223,9 @@ is the full width it prints.
 
 Design rules, all asserted by tests:
 
-- **Never assign more sessions to a provider than its cap allows**, counting the
+- **Only choose destinations with room under their declared caps**, counting the
   sessions already active on it that are not part of the plan (read from Hermes'
-  own turn leases, so work started outside ds-router still holds a slot). If that
+  own turn leases, matching session IDs and keys so planned sessions count once). If that
   reading is unavailable the planner says so and charges nobody for it, rather
   than pretending the provider is idle.
 - **A cap that cannot be read is not "no cap".** `caps: {ollama-cloud: three}`, or
@@ -192,7 +250,7 @@ Design rules, all asserted by tests:
   placed, because refusing would strand the sessions.
 - **Never send a session to a provider that does not serve your model.**
 - **A provider ds-router does not manage is never touched.**
-- **Deterministic** — the same fleet always produces the same plan.
+- **Deterministic**; the same fleet always produces the same plan.
 
 It reads sessions from the running Hermes backend when one is available, and
 falls back to reading `state.db` read-only when not.
@@ -318,12 +376,12 @@ deliberate change to how you reach it, not a side effect to accept.
 
 Four inputs, in order of authority:
 
-**1. Hard exhaustion — leave immediately.** A window that has actually run out,
+**1. Hard exhaustion; leave immediately.** A window that has actually run out,
 or a health probe that fails. No argument, no waiting to see if it recovers.
 
 A quota that *cannot be read* is deliberately not in this list. A failed reading
 says the telemetry endpoint did not answer, not that the provider is down, so a
-session already there stays where it is — moving it would pay a prompt-cache reset
+session already there stays where it is; moving it would pay a prompt-cache reset
 to avoid an outage that may not exist. What it does block is choosing that provider
 for anything new, until it reads again. The same rule applies to the global choice:
 a provider whose reading failed is not abandoned, because that would reset the
@@ -354,31 +412,32 @@ window that just reset cannot project its first burst into a fake emergency.
 
 **3. Concurrency caps.** A cap applies to requests *in flight*, not to sessions
 that merely exist, so this is measured from Hermes' own session store. Ollama
-Cloud Pro allows 3 concurrent requests — measured, exceeding it gets you HTTP
+Cloud Pro allows 3 concurrent requests; measured, exceeding it gets you HTTP
 429 in about 0.15s while the rest queue for 40-80 seconds. Being over a cap
 raises a provider's cost without disqualifying it, because queueing still works.
 
 **4. Stay put unless there is a reason.** Switching providers resets the
 upstream prompt cache and drops the model's reasoning traces. Your conversation
-is preserved — the router is stateless and Hermes replays the full history — but
+is preserved; the router is stateless and Hermes replays the full history; but
 those two costs are real, so a conversation keeps its provider until that
 provider is exhausted or failing.
 
-Peak pricing is applied as a tie-break only. Both providers charge double during
+Peak pricing breaks ties between providers with equal scored risk and usage. It
+never overrides a lower-risk candidate. Both providers charge double during
 their own peak windows, and the windows barely overlap:
 
 - **CommandCode**: 01:00-04:00 and 06:00-10:00 UTC, Mon-Fri (note the 04:00-06:00
-  gap — it is off-peak there)
+  gap; it is off-peak there)
 - **Ollama Cloud**: 12:00-18:00 UTC, Mon-Fri
 
 So between 12:00 and 18:00 UTC Ollama pays double and CommandCode does not, and
-from 01:00 to 10:00 the reverse. Preferring the off-peak provider is free: no
+during 01:00-04:00 and 06:00-10:00 the reverse. Preferring the off-peak provider is free: no
 cache reset, no quality change, no context loss.
 
 These hours are read from each provider's published pricing and hardcoded in
 `config.yaml` under `peak:`. If a provider changes its schedule the router
-silently optimises against the old one — harmless when wrong (it just picks by
-headroom instead) but worth re-checking occasionally.
+uses the old schedule until you update it. That can choose the more expensive
+provider in a tie; re-check the schedule occasionally.
 
 ## Changing models
 
@@ -397,7 +456,7 @@ models:
 ```
 
 Adding a new model is one entry in that table. A model only some providers serve
-is fine — the router picks among those that list it, and a provider that does not
+is fine; the router picks among those that list it, and a provider that does not
 serve your chosen alias is skipped rather than sent a request it will reject.
 
 Use `./router.py --list-models` to get real IDs before adding one.
@@ -412,7 +471,7 @@ Use `./router.py --list-models` to get real IDs before adding one.
 
 It can be added, but it cannot be scored, so ds-router will not route *to* it. The
 router's whole subject is remaining quota, and a provider that will not report its
-remaining quota has nothing to contribute to that decision — inventing a number for
+remaining quota has nothing to contribute to that decision; inventing a number for
 it would be worse than leaving it out, because the answer would look authoritative.
 
 That does not make it useless. It works fine as a plain Hermes provider, and as a
@@ -437,7 +496,7 @@ reason, plus a 53s median response time. See `docs/token-harbor.md`.
 - **Failures are honest.** An unreadable quota sorts below a real reading rather
   than being silently trusted, and "everything is exhausted" is reported instead
   of papered over. When nothing is safely readable it degrades to the best
-  available provider rather than refusing to choose — being wrong is recoverable,
+  available provider rather than refusing to choose; being wrong is recoverable,
   stalling is not. What does refuse is evidence about the provider itself: hard
   exhaustion, or a `--health` probe that failed, with no other provider to fall back
   to. That is not a gap in the readings, it is a reason to think the provider is
@@ -445,14 +504,18 @@ reason, plus a 53s median response time. See `docs/token-harbor.md`.
 - **Health probes use a realistic token budget.** At `max_tokens: 1` at least one
   provider answers HTTP 500 where others return a truncated success, which
   reported a healthy provider as dead.
-- **No response bodies in errors.** Quota failures surface a type and message
-  only, never a body that could carry credential-bearing fields. The one exception is
+- **No response bodies in errors.** Quota failures surface only an exception type and, for HTTP failures, the
+  numeric status. Server reason phrases and bodies are omitted. The one exception is
   the gated path, which carries at most 200 characters of the server's own `detail`
   in the message (with the password scrubbed out of it): a dashboard refusal is
   usually explained in that field, and a bare status code would send the reader
   looking in the wrong place.
-- **`x-opencode-session`** is forwarded upstream, or OpenCode Go rejects the
-  request with `400 MissingSessionID`.
+- **Provider HTTP requests refuse redirects and ignore environment proxies.**
+  A quota, catalog, or health request cannot forward its bearer key through a
+  redirect or an implicitly configured proxy. HTTPS uses certificate verification.
+- **`x-opencode-session`** is sent on ds-router health probes. Normal inference
+  requests are sent by Hermes, whose provider configuration must supply any
+  required headers.
 - **A gated backend is reached the way a browser reaches it, and the credential is
   treated as one.** It comes from a 0600 file or an env var, never from argv; a file
   others can read is refused with the `chmod` to run; a login redirect is not
@@ -474,7 +537,10 @@ reason, plus a 53s median response time. See `docs/token-harbor.md`.
 
 ## What is verified
 
-Claims in this README that have been measured, rather than reasoned about:
+The live observations below were recorded during development on September 17-19,
+2026. They are historical measurements, not a claim that every current provider
+plan or Hermes build has been re-tested for this release. Release validation is
+recorded in [docs/release-validation.md](docs/release-validation.md).
 
 - All four providers' quota endpoints, read live; each returns the windows
   documented above.
@@ -486,12 +552,12 @@ Claims in this README that have been measured, rather than reasoned about:
 - `placement.py --plan` against a live desktop backend, and the concurrency
   reading it now uses: `load.py` counted the sessions active on each provider and
   the plan printed them as holding slots.
-- Every HTTP failure shape for a quota endpoint (401, 403, 429, 500, a hang,
+- The tested HTTP failure shapes for a quota endpoint (401, 403, 429, 500, a hang,
   HTML, an empty body, a null body) against the real fetch path: each produces a
   stale reading that names the failure and carries no response body.
 - The transport contract: a reply with no result is unconfirmed rather than a
-  completed move, a JSON-RPC error is never retried, and a fault from before the
-  request went out is retried exactly once.
+  completed move, a JSON-RPC error is never retried, and a connection fault before a send is retried exactly once. A send failure is
+  not retried because delivery may already have started.
 - First use against the real CLI: with an unset `model.provider/default/base_url`
   in a throwaway `HERMES_HOME`, all three of `apply.py <provider>`, `apply.py` and
   `apply.py --off` write and exit 0. The real CLI answers an unset key with the
@@ -529,20 +595,23 @@ Claims in this README that have been measured, rather than reasoned about:
   look like "no provider yet" and move the whole fleet. That is now a refusal that
   says so, on the same rule as an unreadable store. Verified live: a plan against a
   backend on another machine refuses with exit 5 instead of proposing four moves.
-- `install.sh` / `uninstall.sh` in an isolated sandbox, including that
-  `--dry-run` writes nothing and a re-run is a no-op.
+- `install.sh` / `uninstall.sh` in an isolated sandbox. Dry-run leaves installation
+  and Hermes files unchanged and cleans up temporary checks. Re-running the installer
+  preserves identical installed files and their modification times.
 
 Claims that are reasoned but **not** verified end to end are flagged inline.
 
 ## Requirements
 
-- Python 3.10+ with `pyyaml` (the suite is green on 3.10, 3.12 and 3.14)
-- The `hermes` CLI on PATH
-- `openssl` for the test suite only: the TLS checks generate a throwaway certificate
-  per run rather than shipping a private key in the repo, and they fail loudly without
-  it
+- Python 3.10+ with `pyyaml`. CI runs the suite on 3.10 and 3.12; it also passes on
+  3.14 locally, but that leg is not in CI
+- The `hermes` CLI on PATH (see "Before you start")
+- `openssl`: the TLS checks generate a throwaway certificate per run rather than
+  shipping a private key in the repo, and they fail loudly without it. `install.sh`
+  runs the suite as a preflight, so this is needed to *install*, not only to develop
 - Linux (systemd user units) or macOS (the installer writes a launchd plist and
-  prints the commands that load it; the router itself is pure Python and POSIX sh)
+  prints the commands that load it; the router itself is pure Python and POSIX sh).
+  The macOS path is supported by construction rather than by test; see Limits
 
 ## Limits
 
@@ -560,11 +629,11 @@ Claims that are reasoned but **not** verified end to end are flagged inline.
   | `config.set` on a session **mid-turn** | **Deliberately deferred, and now measured**: the reply says `deferred: true`, the session list and `state.db` still show the OLD provider after that turn finishes, and the new one appears at the START of the following turn. Measured over three turns: clinepass, move during turn 2, still clinepass after turn 2, commandcode after turn 3. The change is not lost, it is late. |
 
   That deferral matters here, because over-cap providers are disproportionately
-  the *busy* ones — a provider is over its concurrency cap precisely because
-  sessions are running on it — so some of the moves the planner wants are exactly
-  the ones that land a turn later. Nothing is lost; the spread completes as those
-  turns finish. The dependable behaviour is **choosing a provider when a session
-  starts**, which is the concurrency fix itself.
+  the *busy* ones; a provider is over its concurrency cap precisely because
+  sessions are running on it; so some of the moves the planner wants are exactly
+  the ones that land a turn later. The target spread is a plan, not a guarantee about
+  simultaneous requests while those moves are pending. Session creation with a
+  chosen provider is supported by Hermes; ds-router does not install a creation hook.
 
   One read-path subtlety, measured while doing the above: a session that has never
   run a turn reports the *process default* in the live listing and has no `state.db`
@@ -577,9 +646,11 @@ Claims that are reasoned but **not** verified end to end are flagged inline.
   `deepseek-v4.1-flash`. `placement.py` is non-interactive and its intent is
   unambiguous, so it retries once with the backend's confirmation flag rather than
   reporting a move that did not happen.
-- **A hang is not bounded by ds-router.** Health probing catches a *dead*
-  provider before you are routed to it, but nothing here can interrupt one that
-  dies mid-turn — only Hermes' own timeout can. There is a Hermes bug in that
+- **A hang is not bounded by ds-router.** An explicit `--health` run probes
+  providers. The timer only probes its current
+  provider when that provider's quota reading fails. Neither proves a new
+  destination can complete a real turn, but nothing here can interrupt one that
+  dies mid-turn; only Hermes' own timeout can. There is a Hermes bug in that
   area worth knowing about: per-provider timeout config is silently ignored for
   named custom providers, so the effective bound is 600 s rather than your
   setting. See `docs/hangs-and-timeouts.md` for the measurement, the cause, and
@@ -588,8 +659,20 @@ Claims that are reasoned but **not** verified end to end are flagged inline.
   indistinguishable from work in progress. Keep a last-resort fallback entry that
   is not metered, so an exhausted fleet degrades to a slower answer instead of a
   silence.
-- **Stickiness does not survive a restart.** ds-router re-picks after a reboot,
-  which is correct but means the first turn of the first session may move.
+- **Stickiness uses the persisted Hermes configuration.** Each invocation reads
+  `model.provider`, so restarting ds-router does not erase it.
+- **Config writes use three Hermes CLI calls.** A file lock serializes ds-router
+  writers and failed writes trigger rollback. Hermes and other editors do not
+  share this lock, and a process killed during a write cannot roll back. Avoid
+  editing the same configuration concurrently.
+- **Placement does not create sessions or reserve provider capacity.** Run it
+  explicitly to rebalance an existing fleet. Moves can be deferred or refused,
+  unknown load cannot be counted, and other clients can consume slots after the
+  snapshot. It is not a concurrency limiter in the request path.
+- **macOS is untested in practice.** The installer renders and writes a launchd plist
+  and its own suite covers that rendering, but no plist written here has ever been
+  loaded and run on a Mac. On Linux the systemd timer is exercised for real end to
+  end; treat the macOS path as unverified until someone does the same there.
 
 ## Licence
 
