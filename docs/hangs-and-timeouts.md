@@ -117,8 +117,9 @@ is not the request shape or the model: it is whether anything in the chain can
 answer at all.
 
 This is not a network stall. The exhausted provider refuses in ~0.15 s (a 429 with
-`Weekly usage limit reached`), so the 240 s went into the retry path, consistent
-with the bounded-but-long timeouts in the table above.
+`Weekly usage limit reached`), so the 240 s went somewhere in the retry path rather
+than waiting on a socket. That last step is an inference from the timings, not a
+measurement: the retry count was not instrumented.
 
 Why it matters here: a hang is indistinguishable from work in progress, to a human
 watching a terminal and to a cron job, so an exhausted fleet can look busy for

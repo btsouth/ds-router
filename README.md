@@ -201,24 +201,43 @@ Or put it in `config.yaml`, so the flags are not needed:
 gateway:
   url: http://192.168.1.88:9119
   username: you
-  password_file: ~/.hermes/dashboard-lan-password.txt   # a 0600 file, Hermes writes one per dashboard
+  password_file: ~/.hermes/dashboard-lan-password.txt
 ```
 
-`--gateway-password-env SOME_VAR` is the other credential source. There is no
+That file is yours to write, one per dashboard, mode 0600. The reader accepts either
+`label: value` or `label value` lines (Hermes' own LAN file uses colons, a
+hand-written one often uses spaces), ignores prose and blank lines, and requires a
+username as well. If the file names an `origin` that is not the host you pointed at,
+the run says so rather than quietly sending the password somewhere else.
+
+`--gateway-password-env SOME_VAR` is the other credential source, and setting both a
+file and an env var is refused rather than one silently winning. There is no
 `--gateway-password` flag on purpose: a password in argv is readable by every
 process on the machine. With no `gateway:` block and no `--gateway`, nothing
 changes and discovery stays on the token path described above.
 
-The origin has to be plain `http` on a host and a port, which is what a tailnet or
-LAN address is: this transport speaks plaintext HTTP and WebSocket. Three shapes
-are refused up front with a message saying what to do instead, rather than accepted
-and then failing halfway: an `https` dashboard, one served under a URL prefix, and a
-URL with a password inside it. Use the second-backend recipe below for those.
+The origin has to be plain `http` on a host and, optionally, a port, which is what a
+tailnet or LAN address is: this transport speaks plaintext HTTP and WebSocket.
+Several shapes are refused up front with a message saying what to do instead, rather
+than accepted and then failing halfway: an `https` dashboard, one served under a URL
+prefix, a wildcard address such as `0.0.0.0`, and a URL with a username or password
+inside it. All of those need the second-backend recipe below.
 
-Verified against a real gated backend on this machine: 13 open sessions that the
-token path cannot see at all, and a plan that moved one of them off an exhausted
-provider. Set no credential and those sessions are still visible in `state.db`, but
-they cannot be steered.
+Plain http is a real trade-off, stated rather than hidden: the dashboard password,
+the session cookie and the ticket cross that segment unencrypted, so use a tailnet
+name where you can rather than a shared LAN address. The sign-in also ignores any
+`http_proxy` in the environment: a login is one POST with the password in the body,
+and a proxy would receive it whole.
+
+Verified against a real gated backend on this machine, read-only: the plan listed 13
+open sessions that the token path cannot see at all, and proposed moving one off an
+exhausted provider. Nothing was written; the write path over a ticket is not
+exercised here.
+
+With no `gateway:` block at all, those sessions are still visible in `state.db`, and
+they cannot be steered. With `--gateway` but no usable credential the run refuses
+instead of quietly planning from the state store, because a plan that prints while
+steering has stopped is worse than no plan.
 
 If you would rather not store a credential at all, the alternative is a second
 backend, loopback-bound, alongside whatever serves your dashboard. This is the
@@ -378,14 +397,19 @@ reason, plus a 53s median response time. See `docs/token-harbor.md`.
 - **`x-opencode-session`** is forwarded upstream, or OpenCode Go rejects the
   request with `400 MissingSessionID`.
 - **A gated backend is reached the way a browser reaches it, and the credential is
-  treated as one.** It comes from a 0600 file or an env var, never from argv; a
-  login redirect is not followed, because following one cannot authenticate
-  anything and could put the password on another host; errors name the credential's
-  *source* and never its value; the cookie is held for the life of the process
-  because login is rate limited per client IP; a ticket is minted per connection
-  because it is single-use with a 30 second TTL; and an upgrade refusal carries its
-  HTTP status as data rather than putting it in a message for a caller to
-  string-match, because only a 401 or a 403 may cost a sign-in.
+  treated as one.** It comes from a 0600 file or an env var, never from argv; a file
+  others can read is refused with the `chmod` to run; a login redirect is not
+  followed, because following one cannot authenticate anything and could put the
+  password on another host; errors name the credential's *source*, and the password
+  is scrubbed out of a server's own error text before it can reach a terminal;
+  requests ignore any `http_proxy` in the environment; the cookie is held for the
+  life of the process because login is rate limited per client IP, and a credential
+  already refused is not retried; a ticket is minted per connection because it is
+  single-use with a 30 second TTL. An upgrade refusal carries its HTTP status as
+  data rather than putting it in a message for a caller to string-match, and it is
+  never read as a stale cookie: Hermes closes a WebSocket before accept for several
+  reasons that all look like HTTP 403, and the only reliable "your cookie is stale"
+  signal is the 401 from the ticket request itself.
 
 ## What is verified
 
@@ -421,15 +445,18 @@ Claims in this README that have been measured, rather than reasoned about:
   fleet, `apply` reporting success for replies that meant nothing had happened, a
   crafted clone path executing as shell through the uninstall manifest, and a
   reading that could not be trusted scoring as the healthiest provider. Five tests
-  that could not fail were rewritten, and the two layers that had no test at all,
-  the concurrency reading and the transport, now carry 60 checks between them.
-- The gated path, end to end against a real gated backend: 13 open sessions read
-  from a backend whose token path cannot reach it at all, and a plan that moved one
-  off an exhausted provider. Every refusal shape is pinned in the suite against a
-  loopback fake (`test_gateway.py`): a wrong password tried once and not retried, a
-  rate-limited login reported as such, a redirect not followed, a ticket response
-  carrying no ticket, a stale cookie re-signed-in exactly once, and a password that
-  never reaches a message.
+  that could not fail were rewritten, and the transport and concurrency layers, which
+  had no tests at all, now have 18 between them.
+- The gated path, against a real gated backend (read-only) and a loopback fake
+  (`test_gateway.py`, 41 tests). Live: 13 open sessions read from a backend whose
+  token path cannot reach it, and a plan proposing to move one off an exhausted
+  provider; nothing was written. Pinned in the suite: a wrong credential refused
+  once and not retried, a rate-limited login named as such, a redirect not followed,
+  a ticket response carrying no ticket, a 200 login that sets no cookie, a stale
+  cookie re-signed-in exactly once, a file other users can read refused, a
+  credential whose file names another origin reported, a password in a URL refused
+  without being echoed by the refusal, and a password never reaching a message,
+  including through a server's own error detail.
 - `install.sh` / `uninstall.sh` in an isolated sandbox, including that
   `--dry-run` writes nothing and a re-run is a no-op.
 
