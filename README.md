@@ -1,5 +1,7 @@
 # ds-router
 
+[![tests](https://github.com/btsouth/ds-router/actions/workflows/tests.yml/badge.svg)](https://github.com/btsouth/ds-router/actions/workflows/tests.yml)
+
 Keeps your Hermes agent on whichever LLM provider still has quota.
 
 You have several subscriptions that all serve the same open models. Each one has
@@ -16,9 +18,26 @@ Works with any providers that expose a usage API. Shipped with support for four:
 | Ollama Cloud | Pro | $20/mo | $60 / month credits |
 | ClinePass | Agent/Pass | $9.99/mo | 5-hour, weekly, monthly |
 
-Total: about $40-50/month for roughly $190+ of metered model access, and the
-router is what lets you actually use all of it instead of hammering one
-subscription until it throttles you.
+Total: about $40-50/month, and the plans' own allowances add up to roughly $190 a
+month at their list rates. That gap is the reason to run the router: it is what
+lets you actually use all of it instead of hammering one subscription until it
+throttles you.
+
+## Before you start: add your keys
+
+ds-router reads provider API keys from `~/.hermes/.env`, the same file Hermes
+uses. It does not store credentials itself and never writes them anywhere.
+
+```sh
+# ~/.hermes/.env
+COMMANDCODE_API_KEY=...
+OPENCODE_GO_API_KEY=...
+OLLAMA_API_KEY=...
+HERMES_CUSTOM_CLINEPASS_API_KEY=...
+```
+
+Only the providers you actually have need entries. Delete the others from
+`config.yaml` and ds-router will ignore them.
 
 ## Quick start
 
@@ -32,10 +51,11 @@ cd ~/Projects/ds-router
 Any clone location works — the installer rewrites the systemd units and the
 manifest to wherever you put it, so `~/ds-router` or a nested path is fine.
 
-`install.sh` checks your prerequisites, runs the test suite as a preflight,
-installs a systemd timer (Linux) or prints the macOS equivalent, enables it, and
-verifies the result. **It does not touch your Hermes config** — installing and
-routing are separate steps.
+`install.sh` checks your prerequisites, runs the test suite as a preflight, and
+installs and enables a systemd timer (Linux), or writes a launchd job (macOS) and
+prints the two commands that load it, because loading someone's launchd job
+unasked is not the installer's call. **It does not touch your Hermes config**:
+installing and routing are separate steps.
 
 Preview what the router would choose before enabling anything:
 
@@ -67,22 +87,6 @@ just another entry in `config.yaml`.
 It becomes useful at two: that is when "which one still has quota" stops having an
 obvious answer.
 
-## Before you start: add your keys
-
-ds-router reads provider API keys from `~/.hermes/.env`, the same file Hermes
-uses. It does not store credentials itself and never writes them anywhere.
-
-```sh
-# ~/.hermes/.env
-COMMANDCODE_API_KEY=...
-OPENCODE_GO_API_KEY=...
-OLLAMA_API_KEY=...
-HERMES_CUSTOM_CLINEPASS_API_KEY=...
-```
-
-Only the providers you actually have need entries. Delete the others from
-`config.yaml` and ds-router will ignore them.
-
 ## Commands
 
 | command | what it does |
@@ -96,11 +100,33 @@ Only the providers you actually have need entries. Delete the others from
 | `./router.py --dry-run --health` | Also probe each provider with a real request |
 | `./router.py --dry-run --json` | Machine-readable output |
 | `./router.py --list-models` | Fetch each provider's live catalog |
-| `./placement.py` | Spread your open sessions across providers (see below) |
+| `./placement.py --plan` | Show the spread it would apply, write nothing |
+| `./placement.py --apply` | Actually move sessions (see below) |
+| `./placement.py --plan --gateway <url>` | Plan against a gated backend, signing in as a browser does |
 | `python3 run_tests.py` | Run every test suite |
+| `systemctl --user list-timers ds-router.timer` | What the timer is doing, and when it fires next |
+| `journalctl --user -u ds-router.service` | What the last tick decided, and why |
 
 Every command that changes something has a read-only counterpart. `--show`,
-`--check`, `--dry-run`, and `--plan` never write.
+`--check`, `--dry-run`, and `--plan` never write to the Hermes config. They do call
+the `hermes` CLI, which bootstraps `~/.hermes` (a skills directory, a log, an empty
+session store) the first time it runs.
+
+### Exit codes
+
+| code | meaning |
+|---|---|
+| `1` | nothing usable: `router.py` found no provider it can use, `ds-switch --check` found a problem, or no providers are declared |
+| `2` | refused before doing anything: an argument it cannot accept (a wildcard address, userinfo in the URL, a CA file with no `https` to use it on), an unreadable concurrency cap, or an unknown provider |
+| `3` | `ds-switch` could not get a decision out of the router; `placement.py --apply` found no reachable backend |
+| `4` | the router refused to choose, so the Hermes config was left untouched |
+| `5` | a file could not be written or read: the Hermes config (`ds-switch`), or the session store or provider join (`placement.py`) |
+| `6` | the Hermes config could not be read (`ds-switch`), which is not the same as it being absent |
+| `7` | `placement.py` was handed a `caps:` block it cannot read |
+
+A `--health` run that finds every provider unhealthy exits `1`, the same code as "no
+provider is usable", so read the output rather than only the status when you script a
+monitor.
 
 ## Spreading many sessions
 
@@ -128,11 +154,14 @@ state, not a global config write. Real output from a 27-session fleet:
     ollama-cloud   3/3
 
   session        from           to             model                          why
-  ---------------------------------------------------------------------------
+  ------------------------------------------------------------------------------------------------------------
   02340f5c       nous           nous           -                              nous is not managed by ds-router; left alone
   036e75ea       ollama-cloud   ollama-cloud   deepseek-v4.1-flash            stays on ollama-cloud (1/3 of its cap)
   418ca809       ollama-cloud   clinepass      cline-pass/deepseek-v4.1-flash moved to clinepass: ollama-cloud is over its concurrency cap
 ```
+
+Three of the 27 rows: the planner prints one line per session, and the rule row above
+is the full width it prints.
 
 Design rules, all asserted by tests:
 
@@ -184,9 +213,84 @@ design. A non-loopback `dashboard.public_url` engages the same gate even for a
 loopback bind, which is the trap on a headless box whose dashboard is published
 over Tailscale or a reverse proxy.
 
-The fix is a second backend, loopback-bound, alongside whatever serves your
-dashboard. This is the arrangement the Desktop app creates for itself, and the
-tailnet/LAN backend stays exactly as it was:
+A backend gated that way is reached the way a browser reaches it: sign in with a
+dashboard credential, mint a single-use WS ticket, then present that ticket on the
+upgrade. Point the planner at the backend and give it the credential:
+
+```sh
+./placement.py --plan --gateway https://192.0.2.10:9119 \
+    --gateway-user you \
+    --gateway-password-file ~/.hermes/dashboard-lan-password.txt
+```
+
+Or put it in `config.yaml`, so the flags are not needed:
+
+```yaml
+gateway:
+  url: https://192.0.2.10:9119
+  username: you
+  password_file: ~/.hermes/dashboard-lan-password.txt
+  # ca_file: /etc/ssl/my-dashboard-ca.pem   # only for a private or self-signed certificate
+```
+
+That file is yours to write, one per dashboard, mode 0600. The reader accepts either
+`label: value` or `label value` lines (Hermes' own LAN file uses colons, a
+hand-written one often uses spaces), ignores prose and blank lines, and requires a
+username as well. If the file names an `origin` that is not the host you pointed at,
+the run says so rather than quietly sending the password somewhere else. A file other
+users can read is refused with the `chmod` to run.
+
+`https` is preferred where the dashboard has a certificate. The same TLS context
+covers the sign-in and the WebSocket, the certificate and the hostname are always
+checked, and there is no flag that turns verification off: a private or self-signed
+certificate is trusted by naming its CA with `--gateway-ca-file` (or `ca_file`),
+which keeps verification on. A `wss://` upgrade to a certificate that does not
+validate stops at the handshake rather than sending the ticket to whatever answered.
+
+Plain `http` still works, for a tailnet or LAN address where TLS is not set up. It is
+a real trade-off rather than a hidden one: the dashboard password, the session cookie
+and the ticket cross that segment unencrypted, so prefer a tailnet name over a shared
+LAN address. The sign-in also ignores any `http_proxy` in the environment, because a
+login is one POST with the password in the body and a proxy would receive it whole.
+
+`--gateway-password-env SOME_VAR` is the other credential source, and setting both a
+file and an env var is refused rather than one silently winning. There is no
+`--gateway-password` flag on purpose: a password in argv is readable by every
+process on the machine. With no `gateway:` block and no `--gateway`, nothing
+changes and discovery stays on the token path described above.
+
+Some shapes are refused up front with a message saying what to do instead, rather
+than accepted and then failing halfway: a wildcard address such as `0.0.0.0` (name
+the host you reach that backend on), a URL with a username or password inside it
+(pass the credential as a file or an environment variable), and a CA file that
+cannot be loaded or is given for a plaintext origin (fix the path, or drop it).
+Each of those is a bad argument, not a missing feature. A dashboard served under a
+URL prefix is the one shape that needs somewhere else to stand: it is a different
+backend's reverse proxy, which is what the loopback recipe below is for.
+
+Verified against a real gated backend: the plan listed 13 open sessions that the token
+path cannot see at all; a throwaway session created through the same ticket was moved
+with `config.set` and read back as moved in the live listing and in `state.db`; and a
+move sent while that session was mid-turn came back `deferred: true` and landed at the
+next turn start. Every throwaway session was deleted afterwards. What has not been
+exercised is a bulk `--apply` across a fleet through a gate, which is the same call
+with more rows.
+
+The backend has to be on the machine you run this from. Every session is a backend
+session, but its provider is read from the local `state.db`, so a backend somewhere
+else cannot be described by that store: pointed at another host, the run refuses
+rather than treating its sessions as provider-less and moving them. A backend on the
+dev box needs a copy of the router on the dev box, the same rule as the token path.
+
+With no `gateway:` block at all, those sessions are still visible in `state.db`, and
+they cannot be steered. With `--gateway` but no usable credential the run refuses
+instead of quietly planning from the state store, because a plan that prints while
+steering has stopped is worse than no plan.
+
+If you would rather not store a credential at all, the alternative is a second
+backend, loopback-bound, alongside whatever serves your dashboard. This is the
+arrangement the Desktop app creates for itself, and the tailnet/LAN backend stays
+exactly as it was:
 
 ```ini
 [Service]
@@ -326,20 +430,47 @@ reason, plus a 53s median response time. See `docs/token-harbor.md`.
   polls them. Entirely optional and off in practice for a fresh install: with no
   such directory present, ds-router polls the endpoints directly. The shipped
   default points at `~/.local/state/omarchy/ai-usage/` (a dashboard that writes one
-  `<provider>-quota.json` per provider); set `routing.collector_state_dir` to your
+  JSON file per provider: `commandcode-quota.json`, `go-quota.json` for OpenCode Go,
+  `ollama-quota.json`, `clinepass-quota.json`, names fixed in `quota.py`); set
+  `routing.collector_state_dir` to your
   own cache, or `reuse_collector_state: false` to always poll.
 - **Failures are honest.** An unreadable quota sorts below a real reading rather
   than being silently trusted, and "everything is exhausted" is reported instead
   of papered over. When nothing is safely readable it degrades to the best
   available provider rather than refusing to choose — being wrong is recoverable,
-  stalling is not.
+  stalling is not. What does refuse is evidence about the provider itself: hard
+  exhaustion, or a `--health` probe that failed, with no other provider to fall back
+  to. That is not a gap in the readings, it is a reason to think the provider is
+  down, and moving onto it would not help.
 - **Health probes use a realistic token budget.** At `max_tokens: 1` at least one
   provider answers HTTP 500 where others return a truncated success, which
   reported a healthy provider as dead.
 - **No response bodies in errors.** Quota failures surface a type and message
-  only, never a body that could carry credential-bearing fields.
+  only, never a body that could carry credential-bearing fields. The one exception is
+  the gated path, which carries at most 200 characters of the server's own `detail`
+  in the message (with the password scrubbed out of it): a dashboard refusal is
+  usually explained in that field, and a bare status code would send the reader
+  looking in the wrong place.
 - **`x-opencode-session`** is forwarded upstream, or OpenCode Go rejects the
   request with `400 MissingSessionID`.
+- **A gated backend is reached the way a browser reaches it, and the credential is
+  treated as one.** It comes from a 0600 file or an env var, never from argv; a file
+  others can read is refused with the `chmod` to run; a login redirect is not
+  followed, because following one cannot authenticate anything and could put the
+  password on another host; errors name the credential's *source*, and the password
+  is scrubbed out of a server's own error text before it can reach a terminal;
+  requests ignore any `http_proxy` in the environment; the cookie is held for the
+  life of the process because login is rate limited per client IP, and a credential
+  already refused is not retried; a ticket is minted per connection because it is
+  single-use with a 30 second TTL. An upgrade refusal carries its HTTP status as
+  data rather than putting it in a message for a caller to string-match, and it is
+  never read as a stale cookie: Hermes closes a WebSocket before accept for several
+  reasons that all look like HTTP 403, and the only reliable "your cookie is stale"
+  signal is the 401 from the ticket request itself. TLS is never optional: an `https`
+  gateway verifies the certificate and the hostname on both halves through one shared
+  context, a private CA is named by file rather than by a flag that disables checking,
+  and a certificate that does not validate stops the upgrade before the ticket goes
+  anywhere.
 
 ## What is verified
 
@@ -369,12 +500,35 @@ Claims in this README that have been measured, rather than reasoned about:
 - A partial reading: for each provider, the windows it is expected to report are
   asserted, and a payload missing one is marked incomplete (with the missing and
   the read windows both named) instead of scoring as a plan with fewer limits.
-- Four critical failures found by an independent audit of this codebase and
-  fixed, each with the test that would have caught it: an unreadable session
-  store rewriting the whole fleet, `apply` reporting success for replies that mean
-  nothing happened, a crafted clone path executing as shell through the uninstall
-  manifest, and a reading that could not be trusted scoring as the healthiest
-  provider.
+- Two independent audits of this codebase (one hunting swallowed failures, one
+  hunting untested failure modes) found ten real defects, all fixed, each with the
+  test that would have caught it. Four of them: an unreadable session store rewriting the whole
+  fleet, `apply` reporting success for replies that meant nothing had happened, a
+  crafted clone path executing as shell through the uninstall manifest, and a
+  reading that could not be trusted scoring as the healthiest provider. Five tests
+  that could not fail were rewritten, and the transport and concurrency layers, which
+  had no tests at all, now have 18 between them.
+- The gated path, against real gated backends (over https and plain http) and a
+  loopback fake with its own suite (`test_gateway.py`). Live: 13 open sessions read from a
+  backend whose token path cannot reach it, and a write verified three ways (the RPC
+  reply, the live session listing, and `state.db`) on a throwaway session that was
+  then deleted, including a mid-turn move that came back `deferred: true` and landed
+  at the next turn start. Live over TLS too: a tailnet dashboard with a certificate
+  from the system store, reached through the same sign-in, ticket and upgrade as the
+  plaintext case. Pinned in the suite: a wrong credential refused once
+  and not retried, a rate-limited login named as such, a redirect not followed, a
+  ticket response carrying no ticket, a 200 login that sets no cookie, a stale cookie
+  re-signed-in exactly once, a file other users can read refused, a credential whose
+  file names another origin reported, a password in a URL refused without being echoed
+  by the refusal, and a password never reaching a message, including through a
+  server's own error detail. The TLS checks generate a throwaway self-signed
+  certificate per run and cover the handshake succeeding with its CA named, failing
+  without it, and the refusal naming the fix.
+- **A backend is steered from the machine that owns it.** Pointed at another host's
+  backend, the provider join finds no provider for any of its sessions, which would
+  look like "no provider yet" and move the whole fleet. That is now a refusal that
+  says so, on the same rule as an unreadable store. Verified live: a plan against a
+  backend on another machine refuses with exit 5 instead of proposing four moves.
 - `install.sh` / `uninstall.sh` in an isolated sandbox, including that
   `--dry-run` writes nothing and a re-run is a no-op.
 
@@ -382,25 +536,28 @@ Claims that are reasoned but **not** verified end to end are flagged inline.
 
 ## Requirements
 
-- Python 3.10+ with `pyyaml` (the suite is green on 3.10, 3.11 and 3.12)
+- Python 3.10+ with `pyyaml` (the suite is green on 3.10, 3.12 and 3.14)
 - The `hermes` CLI on PATH
-- Linux (systemd user units) or macOS (installer prints the launchd/cron
-  equivalent; the router itself is pure Python and POSIX sh)
+- `openssl` for the test suite only: the TLS checks generate a throwaway certificate
+  per run rather than shipping a private key in the repo, and they fail loudly without
+  it
+- Linux (systemd user units) or macOS (the installer writes a launchd plist and
+  prints the commands that load it; the router itself is pure Python and POSIX sh)
 
 ## Limits
 
 - **Selection is per-session, not per-request.** The router chooses a provider
   for a Hermes session; it is not a proxy sitting in the request path. Hermes'
   own fallback chain handles mid-turn failures.
-- **`placement.py --plan` is verified against a live fleet of 25+ sessions. The
-  write path is verified for the create-time case, and only partly for the move
-  case.** Measured against a real backend with throwaway sessions:
+- **`placement.py --plan` is verified against a live fleet of 25+ sessions, and the
+  write path is now verified end to end**, over a gated backend and through the
+  ordinary token path, on throwaway sessions that were deleted afterwards:
 
   | case | what happens |
   |---|---|
-  | `session.create` with `{model, provider}` | **Works.** The session is created on that provider; `info.provider` reports it and the stored `model_config.provider` agrees. This is the reliable path. |
-  | `config.set` on a **idle** session | Applies immediately; the RPC confirms `scope: "session"`. |
-  | `config.set` on a session **mid-turn** | Deliberately deferred: the backend stashes the pick and applies it at the next turn start. The change is not lost, it is late. |
+  | `session.create` with `{model, provider}` | **Works.** The session runs on that provider; the stored `model_config.provider` agrees. Note the stored model is the provider's own id, never the alias. |
+  | `config.set` on an **idle** session | **Applies immediately**: the reply carries `scope: "session"` and `confirm_required: false`, and both the live session listing and `state.db` show the new provider (as does `billing_provider`, which moves from `custom` to the provider's name). |
+  | `config.set` on a session **mid-turn** | **Deliberately deferred, and now measured**: the reply says `deferred: true`, the session list and `state.db` still show the OLD provider after that turn finishes, and the new one appears at the START of the following turn. Measured over three turns: clinepass, move during turn 2, still clinepass after turn 2, commandcode after turn 3. The change is not lost, it is late. |
 
   That deferral matters here, because over-cap providers are disproportionately
   the *busy* ones — a provider is over its concurrency cap precisely because
@@ -408,6 +565,10 @@ Claims that are reasoned but **not** verified end to end are flagged inline.
   the ones that land a turn later. Nothing is lost; the spread completes as those
   turns finish. The dependable behaviour is **choosing a provider when a session
   starts**, which is the concurrency fix itself.
+
+  One read-path subtlety, measured while doing the above: a session that has never
+  run a turn reports the *process default* in the live listing and has no `state.db`
+  row yet, so its first plan can look like a session with no provider.
 
   A move can also be **refused**: Hermes asks for confirmation before abandoning a
   large cached context (>= `model.switch_context_confirm_tokens`, 100k by default)
@@ -422,7 +583,11 @@ Claims that are reasoned but **not** verified end to end are flagged inline.
   area worth knowing about: per-provider timeout config is silently ignored for
   named custom providers, so the effective bound is 600 s rather than your
   setting. See `docs/hangs-and-timeouts.md` for the measurement, the cause, and
-  a workaround.
+  a workaround. A second shape is measured there too: when every provider in
+  Hermes' chain is spent, a turn hangs rather than failing fast, which is
+  indistinguishable from work in progress. Keep a last-resort fallback entry that
+  is not metered, so an exhausted fleet degrades to a slower answer instead of a
+  silence.
 - **Stickiness does not survive a restart.** ds-router re-picks after a reboot,
   which is correct but means the first turn of the first session may move.
 

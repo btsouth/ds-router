@@ -96,8 +96,12 @@ the blast radius is real and worth knowing before it fires.
 3. **Keep ds-router for the primary only.** Use it to pick what *new* sessions
    default to, and accept that it cannot shape N existing sessions.
 
-## Open questions (being verified)
+## Open questions, answered since
 
-- Whether the queue-then-reject behavior is observable as a specific HTTP status
-  (which would let the router treat it as a fallback trigger).
-- Whether CommandCode and OpenCode Go have comparable concurrency caps.
+- **Is queue-then-reject observable as a status?** Yes: HTTP 429, measured at
+  ~0.15 s when a provider is over its cap, while the rest queue 40-80 s. The cap is
+  still a hard limit: the planner never assigns more sessions to a provider than it
+  allows, and it counts the requests that provider is already running before it
+  does, so what it refuses is filling the queue rather than the cap.
+- **Do CommandCode and OpenCode Go have comparable caps?** Only Ollama documents
+  one (3 concurrent), so `config.yaml` declares a cap only where one is published.

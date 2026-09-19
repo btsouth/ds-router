@@ -96,9 +96,11 @@ routing:
   # endpoints a second time.
   #
   # Any tool that already polls these usage APIs and drops the result as one JSON
-  # file per provider (`<provider>-quota.json`) can be used as the cache. If you
-  # have no such tool, this does nothing: the directory is absent, so ds-router
-  # polls directly. Nothing else in the project depends on it.
+  # file per provider can be used as the cache. The names are fixed, and one of
+  # them is not the provider's: commandcode-quota.json, go-quota.json (OpenCode
+  # Go), ollama-quota.json, clinepass-quota.json. If you have no such tool, this
+  # does nothing: the directory is absent, so ds-router polls directly. Nothing
+  # else in the project depends on it.
   #
   # Point this at wherever your cache lives, or set reuse_collector_state: false
   # to always poll.
@@ -109,7 +111,7 @@ routing:
 # windows, and the windows barely overlap, which makes time-of-day a real
 # routing dimension rather than a curiosity.
 #
-#   commandcode: peak 01-04 and 06-10 UTC, Mon-Fri  (6h/day at 2x)
+#   commandcode: peak 01-04 and 06-10 UTC, Mon-Fri  (7h/day at 2x)
 #   ollama:      peak 12-18 UTC, Mon-Fri             (6h/day at 2x)
 #
 # Between 12:00 and 18:00 UTC, Ollama pays double and CommandCode does not.
@@ -125,3 +127,34 @@ peak:
     ollama-cloud:
       - [12, 18]
     opencode-go: []
+
+# Steering a backend whose dashboard is published. Hermes refuses its own session
+# token on any non-loopback bind, and on a non-loopback dashboard.public_url even
+# when the bind is loopback, so the sessions on such a backend can only be reached
+# the way a browser reaches them: a dashboard credential, then a single-use WS
+# ticket. Fill this in to steer them; leave it out and every invocation behaves
+# exactly as it did before.
+#
+# https is preferred where the dashboard has a certificate: the same TLS context
+# covers the sign-in and the WebSocket, the certificate and the hostname are always
+# checked, and there is deliberately no flag that turns verification off. A private or
+# self-signed certificate is trusted by naming its CA below. Plain http also works, on
+# a tailnet or LAN address, and means the password crosses that segment unencrypted.
+# A dashboard under a URL prefix, a wildcard address, a URL carrying userinfo, a CA
+# file that cannot be loaded, and a CA file given for a plaintext origin are each
+# refused with a message naming the argument to fix.
+#
+# The backend must be on this machine: its sessions' providers are read from the local
+# state.db, so a backend on another host needs its own copy of this router.
+#
+#   gateway:
+#     url: https://192.0.2.10:9119
+#     username: you
+#     # A file you write yourself, one per dashboard, mode 0600 (a readable one is
+#     # refused). Either "label: value" or "label value" lines; prose is ignored.
+#     password_file: ~/.hermes/dashboard-lan-password.txt
+#     # Only for a certificate the system store does not already trust:
+#     # ca_file: /etc/ssl/my-dashboard-ca.pem
+#     # Or name an env var instead of a file, never both. There is deliberately no
+#     # way to pass the password as an argument: argv is readable by every process.
+#     # password_env: MY_DASHBOARD_PASSWORD

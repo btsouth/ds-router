@@ -222,3 +222,8 @@ consecutive real Hermes turns on ClinePass all completed (13,215 / 13,201 /
 health-check show false failures.
 
 ## What to do with ClinePass
+
+It is wired in, and the sections above are the record of why: an Agent Pass is a
+plan for an agent, so the terms of use are the real constraint, but its usage API
+does report the windows this router needs, and its caps are unstated rather than
+absent. Read the sections above before deciding anything about it.

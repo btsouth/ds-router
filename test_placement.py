@@ -179,6 +179,33 @@ def test_a_malformed_cap_stops_the_cli_with_a_message():
     assert "ollama-cloud" in stderr.getvalue(), stderr.getvalue()
 
 
+def test_a_scalar_caps_block_is_diagnosed_instead_of_crashing():
+    """The README says `caps: 3` is diagnosed. It raised TypeError out of `dict(3)`."""
+    import io
+
+    from contextlib import redirect_stderr
+
+    cfg = Path(tempfile.mkdtemp(prefix="ds-scalar-cap-")) / "config.yaml"
+    cfg.write_text(
+        "default_model: ds\n"
+        "routing:\n"
+        "  concurrency:\n"
+        "    caps: 3\n"
+        "providers:\n"
+        "  ollama-cloud:\n"
+        "    base_url: https://x/v1\n"
+        "    key_env: K\n"
+        "models:\n"
+        "  ds:\n"
+        "    ollama-cloud: ollama-cloud-ds\n")
+    stderr = io.StringIO()
+    with redirect_stderr(stderr):
+        code = pl.main(["--plan", "--db", "--config", str(cfg)])
+    assert code == 7, (code, stderr.getvalue())
+    assert "unreadable concurrency cap" in stderr.getvalue(), stderr.getvalue()
+    assert "must map a provider to a limit" in stderr.getvalue(), stderr.getvalue()
+
+
 def test_a_partial_provider_join_does_not_move_what_it_could_not_read():
     """The all-or-nothing guard has a narrower hole. When SOME sessions resolve and
     others do not, the unresolved ones look exactly like sessions that never had a
@@ -597,6 +624,25 @@ def test_an_unreadable_provider_join_refuses_instead_of_moving_the_fleet():
     sessions_out = pl.enumerate_sessions(T(), db_path=store)
     assert len(sessions_out) == 2
     assert {s.provider for s in sessions_out} == {"commandcode", "opencode-go"}, sessions_out
+
+    # A store that reads fine but describes OTHER sessions. It is non-empty, so a guard
+    # keyed on "did the store hold anything" let every one of these through as
+    # provider-less and moved them: that is what a backend on another machine looks like
+    # from here, and it is the same whole-fleet rewrite from the other direction.
+    foreign = tmp_path("foreign.db")
+    con = sqlite3.connect(str(foreign))
+    con.executescript(
+        "create table sessions (id text, session_key text, billing_provider text, model_config text);"
+    )
+    con.execute("insert into sessions values ('z','kz','clinepass',null)")
+    con.commit()
+    con.close()
+    try:
+        pl.enumerate_sessions(T(), db_path=foreign)
+        raise AssertionError("a store that cannot answer for these sessions must refuse")
+    except pl.ProviderJoinError as exc:
+        assert "no provider could be read" in str(exc), exc
+        assert "another machine" in str(exc), exc
 
 
 def test_apply_reports_a_reply_that_means_nothing_happened():

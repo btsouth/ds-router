@@ -251,7 +251,8 @@ def choose(
     """Pick a provider for *model_alias*.
 
     Precedence: an explicit pin, then the conversation's current provider if it
-    is usable, then the provider with the most headroom.
+    is usable, then the provider with the lowest risk, breaking ties on headroom.
+    The reason it prints says which of those decided it.
 
     Peak pricing is a TIE-BREAK, never a reason to abandon a healthy sticky
     provider. Doubling the per-token rate is not worth a cache reset, but it is
@@ -327,7 +328,7 @@ def choose(
     # close enough that the cheaper rate should decide.
     off_peak = [c for c in safe if c.provider not in on_peak]
     chosen = off_peak[0] if off_peak else safe[0]
-    reason = f"most headroom; {chosen.detail}"
+    reason = f"lowest risk; {chosen.detail}"
     if off_peak and on_peak & {c.provider for c in safe}:
         reason += " (off-peak right now)"
     elif chosen.provider in on_peak:

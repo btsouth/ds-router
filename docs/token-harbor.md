@@ -68,8 +68,6 @@ any other client).
 
 Same tiny prompt (`"Say hi"`, `max_tokens: 5`), eight samples:
 
-Eight samples of the same trivial prompt (`"Say hi"`, `max_tokens: 5`):
-
 ```
 0.88s  27.24s  44.94s  50.72s  53.32s  53.35s  71.49s  73.17s
 min 0.88s   median 53.32s   max 73.17s   ratio 83x

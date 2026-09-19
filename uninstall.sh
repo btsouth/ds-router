@@ -8,6 +8,8 @@
 #     ./uninstall.sh --dry-run    print every action, change nothing
 #     ./uninstall.sh --keep-symlink   leave ~/.local/bin/ds-switch in place
 #     ./uninstall.sh --force      remove unit files even if modified by hand
+#     ./uninstall.sh -y|--yes     accepted for symmetry with install.sh; uninstall
+#                                 has nothing to prompt for, so it changes nothing
 #     ./uninstall.sh --help
 #
 # Deliberately NOT removed:
@@ -304,6 +306,7 @@ if [ -f "$MANIFEST" ]; then
   if [ "$DRY_RUN" = 1 ]; then
     printf '  dry   rm -f %s\n' "$MANIFEST"
     printf '  dry   rmdir %s  (if empty)\n' "$STATE_DIR"
+    printf '  dry   rmdir %s  (if empty)\n' "$SYSTEMD_USER_DIR"
   else
     rm -f "$MANIFEST"
     printf '  rm    %s\n' "$MANIFEST"
@@ -313,6 +316,11 @@ if [ -f "$MANIFEST" ]; then
       printf '  rmdir %s\n' "$STATE_DIR"
     else
       note "$STATE_DIR kept (not empty — logs or other state remain)"
+    fi
+    # The units' own directory too. rmdir only succeeds when it is empty, so this
+    # cannot take anyone else's unit with it.
+    if rmdir "$SYSTEMD_USER_DIR" 2>/dev/null; then
+      printf '  rmdir %s\n' "$SYSTEMD_USER_DIR"
     fi
   fi
 else
