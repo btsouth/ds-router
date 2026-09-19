@@ -59,15 +59,17 @@ class FakeGate:
 
     def __init__(self, *, password: str = SECRET, username: str = "bts",
                  require_username: bool = True, login_status: int | None = None,
-                 login_detail: str = "", redirect_to: str = "",
-                 ticket_body: dict | None = None, stale_once: bool = False) -> None:
+                 login_detail: str = "", login_cookie: bool = True,
+                 redirect_to: str = "", ticket_body: dict | None = None,
+                 stale_once: bool = False) -> None:
         self.password, self.username = password, username
         self.require_username = require_username
         self.login_status, self.login_detail = login_status, login_detail
+        self.login_cookie = login_cookie
         self.redirect_to = redirect_to
         self.ticket_body = ticket_body
         self.stale_once = stale_once
-        self.logins = 0            # successful or attempted sign-ins
+        self.logins = 0            # sign-in attempts
         self.tickets = 0           # tickets handed out
         self.paths: list[str] = []  # every path requested, in order
         self._server = None
@@ -94,15 +96,33 @@ class FakeGate:
         return f"http://127.0.0.1:{self._server.server_address[1]}"
 
     def credential_file(self, directory: Path, name: str = "dashboard-pw.txt",
-                        password: str | None = None) -> Path:
-        """A key/value credential file shaped like the one Hermes writes.
+                        password: str | None = None, mode: int = 0o600,
+                        shape: str = "colon", origin: str | None = None) -> Path:
+        """A credential file in one of the shapes real ones arrive in.
 
-        *password* overrides what the file holds, so a test can point the transport at
-        a credential the gate does not accept.
+        * ``colon``: ``label: value``, which is what Hermes' LAN dashboard file holds.
+        * ``space``: a title, indented ``label value`` pairs, then prose, which is what
+          a hand-written file on this machine holds. Reading the title as the password
+          is a real defect this shape pins.
+        * ``bare``: one line that is only the secret.
         """
+        secret = password or self.password
+        where = origin or self.origin
+        if shape == "colon":
+            text = f"username: {self.username}\npassword: {secret}\norigin:   {where}\n"
+        elif shape == "space":
+            text = ("Hermes gateway on the audit box\n\n"
+                    f"  origin   {where}\n"
+                    f"username {self.username}\n"
+                    f"password {secret}\n\n"
+                    "Type notes here: prose that must never be mistaken for a secret.\n")
+        elif shape == "bare":
+            text = f"{secret}\n"
+        else:
+            raise AssertionError(f"unknown credential shape {shape!r}")
         path = directory / name
-        path.write_text(f"username: {self.username}\npassword: {password or self.password}\n"
-                        f"origin:   {self.origin}\n")
+        path.write_text(text)
+        path.chmod(mode)
         return path
 
     # --- the two endpoints ------------------------------------------------- #
@@ -155,8 +175,9 @@ class FakeGate:
                         accepted = accepted and body.get("username") == gate.username
                     if not accepted:
                         return self._send(401, {"detail": "Invalid credentials"})
-                    return self._send(200, {"ok": True, "next": "/"},
-                                      cookie="hermes_session=ok; Path=/; HttpOnly")
+                    cookie = ("hermes_session=ok; Path=/; HttpOnly"
+                              if gate.login_cookie else "")
+                    return self._send(200, {"ok": True, "next": "/"}, cookie=cookie)
                 if self.path == "/api/auth/ws-ticket":
                     cookie = self.headers.get("Cookie") or ""
                     if gate.stale_once:
@@ -179,33 +200,98 @@ class FakeGate:
 
     # --- the transport, pointed at this gate ------------------------------- #
 
-    def gateway(self, directory: Path, *, scheme: str = "") -> pl.Gateway:
-        url = self.origin if not scheme else self.origin.replace("http://", f"{scheme}://", 1)
-        return pl.resolve_gateway(url, password_file=str(self.credential_file(directory)))
+    def gateway(self, directory: Path, **kwargs: object) -> pl.Gateway:
+        return pl.resolve_gateway(self.origin, password_file=str(self.credential_file(
+            directory, **kwargs)))  # type: ignore[arg-type]
 
     def transport(self, directory: Path) -> pl.LiveTransport:
         return pl.LiveTransport(gateway=self.gateway(directory))
 
 
+class _ProxyRecorder:
+    """A local proxy: it records what it was asked for and answers nothing useful."""
+
+    def __init__(self) -> None:
+        self.requests: list[str] = []
+        recorder = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+                pass
+
+            def _record(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length).decode("utf-8", "replace") if length else ""
+                recorder.requests.append(f"{self.command} {self.path} {body}".strip())
+
+            def do_POST(self) -> None:
+                self._record()
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def do_GET(self) -> None:
+                self._record()
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    @property
+    def origin(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=5)
+
+
 # --------------------------------------------------------------------------- #
-# The credential
+# The credential file
 # --------------------------------------------------------------------------- #
 
 
 def test_credential_file_reads_the_keyvalue_shape(scratch: Path) -> None:
     path = scratch / "pw.txt"
     path.write_text(f"username: bts\npassword: {SECRET}\norigin:   http://x:9119\n")
-    user, secret = pl.read_gateway_credential(path)
-    check("username comes from the file", user == "bts", user)
-    check("password comes from the file", secret == SECRET)
+    path.chmod(0o600)
+    credential = pl.read_gateway_credential(path)
+    check("username comes from the file", credential.username == "bts", credential.username)
+    check("password comes from the file", credential.password == SECRET)
+    check("the origin it names is returned", credential.origins == ("http://x:9119",),
+          str(credential.origins))
+
+
+def test_credential_file_reads_the_space_separated_shape(scratch: Path) -> None:
+    """A real file on this machine is a title, indented `label value` pairs, then prose.
+
+    Reading the title line as the password is what the first version did, and it fails
+    as "the credential was refused" with prose in the password field.
+    """
+    with FakeGate() as gate:
+        path = gate.credential_file(scratch, shape="space")
+        credential = pl.read_gateway_credential(path)
+        check("the username line is read", credential.username == "bts", credential.username)
+        check("the password line is read, not the title", credential.password == SECRET,
+              credential.password)
+        check("the prose is not the password", "Hermes gateway" not in credential.password)
+        check("the origin it names is returned", credential.origins == (gate.origin,),
+              str(credential.origins))
 
 
 def test_credential_file_accepts_a_bare_secret_line(scratch: Path) -> None:
     path = scratch / "pw.txt"
     path.write_text(f"# a hand-made secret file\n{SECRET}\n")
-    user, secret = pl.read_gateway_credential(path)
-    check("a bare line has no username", user == "", user)
-    check("a bare line is the password", secret == SECRET)
+    path.chmod(0o600)
+    credential = pl.read_gateway_credential(path)
+    check("a bare line has no username", credential.username == "", credential.username)
+    check("a bare line is the password", credential.password == SECRET)
 
 
 def test_credential_file_without_a_password_names_the_file(scratch: Path) -> None:
@@ -215,8 +301,20 @@ def test_credential_file_without_a_password_names_the_file(scratch: Path) -> Non
         pl.read_gateway_credential(path)
     except pl.GatewayAuthError as exc:
         check("the refusal names the file", str(path) in str(exc), str(exc))
+        check("it says what a password line looks like", "password" in str(exc), str(exc))
         return
     raise AssertionError("a credential file with no password was accepted")
+
+
+def test_a_multi_line_file_that_is_not_a_credential_is_refused(scratch: Path) -> None:
+    """Only a SINGLE unlabelled line counts as a bare secret, or prose becomes a password."""
+    path = scratch / "notes.txt"
+    path.write_text("Some notes about the dashboard\nand a second line of prose\n")
+    try:
+        pl.read_gateway_credential(path)
+    except pl.GatewayAuthError:
+        return
+    raise AssertionError("a prose file was read as a credential")
 
 
 def test_unreadable_credential_file_is_named_not_swallowed(scratch: Path) -> None:
@@ -229,21 +327,59 @@ def test_unreadable_credential_file_is_named_not_swallowed(scratch: Path) -> Non
     raise AssertionError("an unreadable credential file was accepted")
 
 
+def test_a_credential_file_others_can_read_is_refused(scratch: Path) -> None:
+    """The README says keep it at 0600, so reading a 0644 one without a word is the doc lying."""
+    with FakeGate() as gate:
+        path = gate.credential_file(scratch, mode=0o644)
+        try:
+            pl.resolve_gateway(gate.origin, password_file=str(path))
+        except pl.GatewayAuthError as exc:
+            check("the refusal names the mode", "644" in str(exc), str(exc))
+            check("it says what to run", "chmod 600" in str(exc), str(exc))
+            return
+    raise AssertionError("a world-readable credential file was accepted")
+
+
+def test_a_credential_for_another_origin_is_a_warning_not_a_refusal(scratch: Path) -> None:
+    """One file legitimately covers a tailnet name and a LAN address for one backend."""
+    with FakeGate() as gate:
+        elsewhere = gate.credential_file(scratch, name="elsewhere-pw.txt",
+                                         origin="http://10.9.9.9:9119")
+        warned: list[str] = []
+        gateway = pl.resolve_gateway(gate.origin, password_file=str(elsewhere), warn=warned.append)
+        check("the gateway is still built", gateway.host == "127.0.0.1", gateway.host)
+        check("the mismatch is reported", len(warned) == 1, str(warned))
+        check("the warning names where the password goes", "127.0.0.1" in warned[0], warned[0])
+        check("the warning never carries the password", SECRET not in warned[0], warned[0])
+        here = gate.credential_file(scratch, name="here-pw.txt")
+        matching: list[str] = []
+        pl.resolve_gateway(gate.origin, password_file=str(here), warn=matching.append)
+        check("a file naming this origin is silent", matching == [], str(matching))
+
+
+# --------------------------------------------------------------------------- #
+# Resolving the origin
+# --------------------------------------------------------------------------- #
+
+
 def test_resolve_gateway_reads_a_file_and_an_env_var(scratch: Path) -> None:
-    path = scratch / "pw.txt"
-    path.write_text(f"username: bts\npassword: {SECRET}\n")
-    from_file = pl.resolve_gateway("http://10.0.0.5:9119", password_file=str(path))
-    check("the file's username is used", from_file.username == "bts")
-    check("the file is named as the source", from_file.source == str(path), from_file.source)
-    check("the port is read", from_file.port == 9119, str(from_file.port))
+    with FakeGate() as gate:
+        path = gate.credential_file(scratch)
+        from_file = pl.resolve_gateway(gate.origin, password_file=str(path))
+        check("the file's username is used", from_file.username == "bts")
+        check("the file is named as the source", from_file.source == str(path), from_file.source)
+        check("the port the gate listens on is read", from_file.port > 1024, str(from_file.port))
 
     os.environ["DS_TEST_GATEWAY_PW"] = SECRET
     try:
-        from_env = pl.resolve_gateway("http://10.0.0.5", password_env="DS_TEST_GATEWAY_PW",
+        from_env = pl.resolve_gateway("http://10.0.0.5:9119", password_env="DS_TEST_GATEWAY_PW",
                                       username="someone")
         check("the env var is named as the source", from_env.source == "$DS_TEST_GATEWAY_PW",
               from_env.source)
-        check("an http URL defaults to port 80", from_env.port == 80, str(from_env.port))
+        check("the port is read", from_env.port == 9119, str(from_env.port))
+        defaulted = pl.resolve_gateway("http://10.0.0.5", password_env="DS_TEST_GATEWAY_PW",
+                                       username="someone")
+        check("an http URL defaults to port 80", defaulted.port == 80, str(defaulted.port))
     finally:
         os.environ.pop("DS_TEST_GATEWAY_PW", None)
 
@@ -251,35 +387,42 @@ def test_resolve_gateway_reads_a_file_and_an_env_var(scratch: Path) -> None:
 def test_a_shape_the_transport_cannot_speak_is_refused_not_half_supported(scratch: Path) -> None:
     """A URL that looks accepted and fails later is worse than a clear no.
 
-    The outcome would be a silent fallback to the state DB, so the plan still prints
-    while steering has quietly stopped working.
+    The userinfo cases matter most: every one of these messages used to interpolate the
+    URL as given, so the credential was printed by the very check that rejected it.
     """
-    path = scratch / "pw.txt"
-    path.write_text(f"username: bts\npassword: {SECRET}\n")
-    cases = [
-        ("https://10.0.0.5:9119", "https", "second-backend"),
-        ("http://10.0.0.5:9119/dashboard", "prefix", "origin"),
-        ("http://user:hunter2@10.0.0.5:9119", "password_file", ""),
-    ]
-    for url, needle, also in cases:
-        try:
-            pl.resolve_gateway(url, password_file=str(path))
-        except pl.GatewayAuthError as exc:
-            message = str(exc)
-            check(f"{url} is refused", needle in message, message)
-            if also:
-                check(f"{url} names the way out", also in message, message)
-            if "hunter2" in url:
-                check("the URL's password is not echoed", "hunter2" not in message, message)
-        else:
-            raise AssertionError(f"{url} was accepted")
+    with FakeGate() as gate:
+        path = gate.credential_file(scratch)
+        cases = [
+            ("https://10.0.0.5:9119", "https", "second-backend"),
+            ("http://10.0.0.5:9119/dashboard", "prefix", "origin"),
+            ("http://user@10.0.0.5:9119", "userinfo", "gateway-user"),
+            ("http://user:LEAKME@10.0.0.5:9119", "userinfo", "gateway-user"),
+            ("https://user:LEAKME@10.0.0.5:9119", "userinfo", "gateway-user"),
+            ("http://user:LEAKME@10.0.0.5:9119/dashboard", "userinfo", "gateway-user"),
+            ("ftp://user:LEAKME@10.0.0.5:9119", "userinfo", "gateway-user"),
+            ("http://0.0.0.0:9119", "wildcard", "127.0.0.1"),
+            ("http://[::]:9119", "wildcard", "127.0.0.1"),
+            ("http://10.0.0.5:notaport", "not a number", ""),
+            ("http://10.0.0.5:0", "port 0", ""),
+        ]
+        for url, needle, also in cases:
+            try:
+                pl.resolve_gateway(url, password_file=str(path))
+            except pl.GatewayAuthError as exc:
+                message = str(exc)
+                check(f"{url} is refused", needle in message, message)
+                if also:
+                    check(f"{url} names the way out", also in message, message)
+                check(f"{url} does not echo a password", "LEAKME" not in message, message)
+            else:
+                raise AssertionError(f"{url} was accepted")
 
 
 def test_resolve_gateway_refuses_what_it_cannot_use() -> None:
     cases = [
         ("no credential at all", "http://10.0.0.5:9119", {}, "password_file"),
-        ("a scheme it cannot speak", "ftp://10.0.0.5:9119", {"password_env": "PATH"}, "http(s)"),
-        ("no host", "http://", {"password_env": "PATH"}, "http(s)"),
+        ("a scheme it cannot speak", "ftp://10.0.0.5:9119", {"password_env": "PATH"}, "http"),
+        ("no host", "http://", {"password_env": "PATH"}, "http"),
         ("an env var that is unset", "http://10.0.0.5:9119",
          {"password_env": "DS_TEST_UNSET_VAR"}, "DS_TEST_UNSET_VAR"),
     ]
@@ -295,12 +438,29 @@ def test_resolve_gateway_refuses_what_it_cannot_use() -> None:
 def test_resolve_gateway_requires_a_username(scratch: Path) -> None:
     path = scratch / "pw.txt"
     path.write_text(f"{SECRET}\n")  # a bare secret carries no username
+    path.chmod(0o600)
     try:
         pl.resolve_gateway("http://10.0.0.5:9119", password_file=str(path))
     except pl.GatewayAuthError as exc:
         check("the refusal asks for a username", "username" in str(exc), str(exc))
         return
     raise AssertionError("a gateway without a username was accepted")
+
+
+def test_two_credential_sources_are_refused_rather_than_one_winning(scratch: Path) -> None:
+    with FakeGate() as gate:
+        path = gate.credential_file(scratch)
+        os.environ["DS_TEST_GATEWAY_PW"] = SECRET
+        try:
+            pl.resolve_gateway(gate.origin, password_file=str(path),
+                               password_env="DS_TEST_GATEWAY_PW")
+        except pl.GatewayAuthError as exc:
+            check("the refusal names both keys",
+                  "password_file" in str(exc) and "password_env" in str(exc), str(exc))
+            return
+        finally:
+            os.environ.pop("DS_TEST_GATEWAY_PW", None)
+    raise AssertionError("two credential sources were accepted with one silently winning")
 
 
 def test_there_is_no_password_flag() -> None:
@@ -314,6 +474,38 @@ def test_there_is_no_password_flag() -> None:
     check("a bare --gateway-password is not offered", "--gateway-password" not in tokens)
 
 
+def _run_placement(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(HERE / "placement.py"), *args],
+                          capture_output=True, text=True, cwd=HERE, timeout=120)
+
+
+def test_no_credential_refuses_rather_than_planning_from_the_store() -> None:
+    """`--gateway` with no credential used to be a silently credential-less run."""
+    proc = _run_placement("--plan", "--gateway", "http://127.0.0.1:1")
+    check("it refused", proc.returncode == 2, str(proc.returncode))
+    check("the reason is a missing credential", "no credential" in proc.stderr,
+          proc.stderr[-300:])
+    check("no plan was printed", "alias" not in proc.stdout, proc.stdout[-300:])
+
+
+def test_a_credential_failure_refuses_rather_than_planning_from_the_store(scratch: Path) -> None:
+    """The failure that must never degrade into a plan.
+
+    A state-DB plan would print with the header still saying "live backend", so the
+    user would see a healthy run while steering had quietly stopped working.
+    """
+    with FakeGate() as gate:
+        bad = gate.credential_file(scratch, name="bad-pw.txt", password="not-the-password")
+        proc = _run_placement("--plan", "--gateway", gate.origin, "--gateway-user", "bts",
+                              "--gateway-password-file", str(bad))
+        check("it refused", proc.returncode == 2, str(proc.returncode))
+        check("the reason is the refused credential", "refused" in proc.stderr, proc.stderr[-300:])
+        check("it says steering stopped", "could not be signed in to" in proc.stderr,
+              proc.stderr[-400:])
+        check("no plan was printed", "alias" not in proc.stdout, proc.stdout[-300:])
+        check("no ticket was minted", gate.tickets == 0, str(gate.tickets))
+
+
 # --------------------------------------------------------------------------- #
 # The sign-in and the ticket
 # --------------------------------------------------------------------------- #
@@ -325,7 +517,9 @@ def test_one_sign_in_then_a_fresh_ticket_per_call(scratch: Path) -> None:
         session = pl.GatewaySession(gate.gateway(scratch))
         first, second = session.mint_ticket(), session.mint_ticket()
         check("two calls mint two tickets", first != second, f"{first} vs {second}")
-        check("both are tickets", first.startswith("ticket-") and second.startswith("ticket-"))
+        check("both tickets came from the gate", (first, second) == ("ticket-1", "ticket-2"),
+              f"{first} / {second}")
+        check("the gate handed out two", gate.tickets == 2, str(gate.tickets))
         check("the cookie is reused, not re-obtained", gate.logins == 1, str(gate.logins))
         check("the sign-in happened before the ticket",
               gate.paths == ["/auth/password-login", "/api/auth/ws-ticket",
@@ -339,19 +533,21 @@ def test_a_wrong_credential_is_refused_and_never_retried(scratch: Path) -> None:
             gate.origin, username="bts",
             password_file=str(gate.credential_file(scratch, password="not-the-password")))
         session = pl.GatewaySession(wrong)
-        try:
-            session.mint_ticket()
-        except pl.GatewayAuthError as exc:
-            message = str(exc)
-            check("the refusal says the credential was refused", "refused" in message, message)
-            check("it names the credential's source", "dashboard-pw.txt" in message, message)
-            check("it never carries the password", "not-the-password" not in message, message)
-            # Login is rate limited per client IP, so a retry loop would turn a clear
-            # refusal into a lockout.
-            check("it was tried exactly once", gate.logins == 1, str(gate.logins))
-            check("no ticket was minted", gate.tickets == 0, str(gate.tickets))
-            return
-    raise AssertionError("a wrong dashboard password was accepted")
+        for attempt in (1, 2):
+            try:
+                session.mint_ticket()
+            except pl.GatewayAuthError as exc:
+                message = str(exc)
+                check("the refusal says the credential was refused", "refused" in message, message)
+                check("it names the credential's source", "dashboard-pw.txt" in message, message)
+                check("it never carries the password", "not-the-password" not in message, message)
+            else:
+                raise AssertionError(f"attempt {attempt}: a wrong dashboard password was accepted")
+        # Login is rate limited per client IP, so a second attempt would burn the budget
+        # and turn a clear refusal into a lockout.
+        check("it was tried exactly once across both attempts", gate.logins == 1,
+              str(gate.logins))
+        check("no ticket was minted", gate.tickets == 0, str(gate.tickets))
 
 
 def test_each_login_refusal_shape_says_what_it_is(scratch: Path) -> None:
@@ -384,6 +580,32 @@ def test_a_login_redirect_is_not_followed(scratch: Path) -> None:
             check("no ticket came out of a redirect", gate.tickets == 0)
             return
     raise AssertionError("a login that answered with a redirect was treated as signed in")
+
+
+def test_a_200_login_with_no_cookie_is_refused(scratch: Path) -> None:
+    """Otherwise the failure surfaces later as a ticket 401 and the real cause is never said."""
+    with FakeGate(login_cookie=False) as gate:
+        session = pl.GatewaySession(gate.gateway(scratch))
+        try:
+            session.mint_ticket()
+        except pl.GatewayAuthError as exc:
+            check("the refusal says no cookie was set", "no session cookie" in str(exc), str(exc))
+            check("nothing was ticketed", gate.tickets == 0, str(gate.tickets))
+            return
+    raise AssertionError("a login that set no cookie was treated as signed in")
+
+
+def test_a_password_echoed_by_the_server_is_scrubbed(scratch: Path) -> None:
+    """The one string in a message that a remote server writes, so it must be cleaned."""
+    with FakeGate(login_status=401, login_detail=f"bad password: {SECRET}") as gate:
+        session = pl.GatewaySession(gate.gateway(scratch))
+        try:
+            session.mint_ticket()
+        except pl.GatewayAuthError as exc:
+            check("the server's detail is kept", "bad password" in str(exc), str(exc))
+            check("the password inside it is not", SECRET not in str(exc), str(exc))
+            return
+    raise AssertionError("a 401 login was accepted")
 
 
 def test_a_stale_cookie_signs_in_again_exactly_once(scratch: Path) -> None:
@@ -421,23 +643,38 @@ def test_an_unreachable_gateway_names_the_origin(scratch: Path) -> None:
     raise AssertionError("a gateway that cannot be reached minted a ticket")
 
 
+def test_the_credential_never_goes_through_an_environment_proxy(scratch: Path) -> None:
+    """A login is one POST with a password in the body; an env proxy would receive it whole."""
+    with FakeGate() as gate:
+        proxy = _ProxyRecorder()
+        names = ("http_proxy", "https_proxy", "all_proxy", "no_proxy")
+        previous = {name: os.environ.get(name) for name in names}
+        os.environ["http_proxy"] = proxy.origin
+        os.environ["https_proxy"] = proxy.origin
+        os.environ["no_proxy"] = ""
+        try:
+            session = pl.GatewaySession(gate.gateway(scratch))
+            ticket = session.mint_ticket()
+        finally:
+            for name, value in previous.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            proxy.close()
+        check("the proxy was never asked for anything", proxy.requests == [],
+              str(proxy.requests))
+        check("the gate was reached directly", ticket == "ticket-1", ticket)
+
+
 # --------------------------------------------------------------------------- #
 # How the transport uses it
 # --------------------------------------------------------------------------- #
 
 
-def test_ticket_urls_are_wss_under_https() -> None:
-    secure = pl.Gateway(host="devbox", port=9119, username="u", password="p", scheme="https")
-    check("https becomes wss", secure.ticket_url("a b").startswith("wss://devbox:9119/api/ws?"),
-          secure.ticket_url("a b"))
-    check("the ticket is quoted", "ticket=a%20b" in secure.ticket_url("a b"))
-    plain = pl.Gateway(host="devbox", port=9119, username="u", password="p")
-    check("http stays ws", plain.ticket_url("t").startswith("ws://devbox:9119/api/ws?ticket=t"))
-
-
 def test_a_gated_backend_is_addressed_explicitly() -> None:
     """It has no token to discover and may not even be on this machine."""
-    gateway = pl.Gateway(host="10.0.0.5", port=9119, username="u", password="p")
+    gateway = pl.Gateway(host="10.0.0.5", port=9119, username="u", password="hunter2")
     transport = pl.LiveTransport(gateway=gateway)
     check("the backend is gated", transport.backend.kind == "gated", transport.backend.kind)
     check("no token is invented", transport.backend.token == "", transport.backend.token)
@@ -445,7 +682,34 @@ def test_a_gated_backend_is_addressed_explicitly() -> None:
     check("the description names the credential's source",
           transport.backend.describe() == "10.0.0.5:9119 (gated, credential from config)",
           transport.backend.describe())
-    check("the description never carries the password", "p" != transport.backend.describe())
+    check("the description never carries the password",
+          "hunter2" not in transport.backend.describe(), transport.backend.describe())
+    check("nor does the repr of the gateway", "hunter2" not in repr(gateway), repr(gateway))
+    check("the ticket url is a plain ws url with the ticket",
+          gateway.ticket_url("t") == "ws://10.0.0.5:9119/api/ws?ticket=t",
+          gateway.ticket_url("t"))
+
+
+def test_an_ipv6_origin_keeps_its_brackets() -> None:
+    """Without them the URL is unparseable, which used to fall back to the state store silently."""
+    gateway = pl.Gateway(host="::1", port=9119, username="u", password="p")
+    check("the origin brackets the literal", gateway.origin == "http://[::1]:9119",
+          gateway.origin)
+    check("so does the ticket url",
+          gateway.ticket_url("t").startswith("ws://[::1]:9119/api/ws?ticket=t"),
+          gateway.ticket_url("t"))
+    check("the description brackets it too", gateway.describe().startswith("[::1]:9119"),
+          gateway.describe())
+
+
+def test_a_tls_gateway_cannot_even_be_constructed() -> None:
+    """The transport speaks plaintext only, so no object may claim otherwise."""
+    try:
+        pl.Gateway(host="h", port=443, username="u", password="p", scheme="https")
+    except pl.GatewayAuthError as exc:
+        check("the refusal says http only", "http only" in str(exc), str(exc))
+        return
+    raise AssertionError("a Gateway claiming https was constructed")
 
 
 def test_the_ws_url_mints_a_ticket_per_connection(scratch: Path) -> None:
@@ -453,8 +717,10 @@ def test_the_ws_url_mints_a_ticket_per_connection(scratch: Path) -> None:
         transport = gate.transport(scratch)
         first, second = transport._ws_url(), transport._ws_url()
         check("each connection gets its own ticket", first != second, f"{first} vs {second}")
-        check("both point at the gate's ws endpoint", first.startswith("ws://127.0.0.1:") and
-              first.endswith("/api/ws?ticket=ticket-1"), first)
+        check("each url carries the ticket the gate issued",
+              first.endswith("/api/ws?ticket=ticket-1")
+              and second.endswith("/api/ws?ticket=ticket-2"), f"{first} {second}")
+        check("the gate handed out two", gate.tickets == 2, str(gate.tickets))
 
 
 def test_a_token_backend_is_unchanged_without_a_gateway() -> None:
@@ -465,10 +731,26 @@ def test_a_token_backend_is_unchanged_without_a_gateway() -> None:
     check("the url is the token url", "token=tok" in transport._ws_url(), transport._ws_url())
 
 
+def test_a_transport_without_a_gateway_cannot_mint() -> None:
+    transport = pl.LiveTransport(port=9118, token="tok", pid=4242)
+    try:
+        transport._gateway_session()
+    except pl.TransportError as exc:
+        check("the refusal says no gateway is configured", "no gated gateway" in str(exc), str(exc))
+        return
+    raise AssertionError("a token transport produced a gateway session")
+
+
+def test_a_body_that_is_not_json_reads_as_empty() -> None:
+    check("an HTML error page reads as empty", pl._json_or_empty(b"<html>nope</html>") == {})
+    check("an empty body reads as empty", pl._json_or_empty(b"") == {})
+    check("a JSON scalar is returned as itself", pl._json_or_empty(b"7") == 7)
+
+
 class _RefusingClient:
     """A _WSClient whose upgrade fails, without a socket in sight."""
 
-    error: Exception = pl.TransportError("websocket upgrade refused", status=401)
+    error: Exception = pl.TransportError("websocket upgrade refused", status=403)
 
     def __init__(self, url: str, timeout: float = 10.0) -> None:
         self.url = url
@@ -477,17 +759,19 @@ class _RefusingClient:
         raise type(self).error
 
 
-def _fake_upgrade(status_line: bytes, *, accept: bool = False) -> tuple[int, "socket.socket"]:
+def _fake_upgrade(status_line: bytes, *, accept: bool = False) -> tuple[int, dict]:
     """One TCP connection that answers a WS handshake with *status_line*.
 
     A real upgrade refusal, on loopback, so the test exercises the parser rather than
-    a stub's idea of what a status line looks like.
+    a stub's idea of what a status line looks like. The request line is recorded so a
+    test can assert what was actually asked for.
     """
+    seen: dict = {"request": b"", "port": 0}
     server = socket.socket()
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("127.0.0.1", 0))
     server.listen(1)
-    port = int(server.getsockname()[1])
+    seen["port"] = int(server.getsockname()[1])
 
     def serve() -> None:
         try:
@@ -501,6 +785,7 @@ def _fake_upgrade(status_line: bytes, *, accept: bool = False) -> tuple[int, "so
                 if not chunk:
                     break
                 request += chunk
+            seen["request"] = request
             key = ""
             for line in request.decode("latin-1").split("\r\n"):
                 if line.lower().startswith("sec-websocket-key:"):
@@ -517,7 +802,7 @@ def _fake_upgrade(status_line: bytes, *, accept: bool = False) -> tuple[int, "so
             server.close()
 
     threading.Thread(target=serve, daemon=True).start()
-    return port, server
+    return seen["port"], seen
 
 
 def test_the_upgrade_status_is_read_as_a_code_not_a_substring() -> None:
@@ -537,29 +822,26 @@ def test_a_refused_upgrade_carries_its_status() -> None:
     for status_line, expected in ((b"HTTP/1.1 401 Unauthorized\r\n", 401),
                                   (b"HTTP/1.1 403 Forbidden\r\n", 403),
                                   (b"HTTP/1.1 500 Server Error\r\n", 500)):
-        port, server = _fake_upgrade(status_line)
-        try:
-            client = pl._WSClient(f"ws://127.0.0.1:{port}/api/ws?ticket=t", timeout=5.0)
-            try:
-                client.connect()
-            except pl.TransportError as exc:
-                check(f"{expected} is carried on the error", exc.status == expected, str(exc.status))
-            else:
-                raise AssertionError(f"a {expected} upgrade was treated as connected")
-        finally:
-            server.close()
-
-
-def test_an_accepted_upgrade_still_connects() -> None:
-    """The code check must not reject a real 101, which is the path everything else uses."""
-    port, server = _fake_upgrade(b"HTTP/1.1 101 Switching Protocols\r\n", accept=True)
-    try:
+        port, _ = _fake_upgrade(status_line)
         client = pl._WSClient(f"ws://127.0.0.1:{port}/api/ws?ticket=t", timeout=5.0)
-        client.connect()
-        check("a real 101 handshake is accepted", client._sock is not None)
-        client.close()
-    finally:
-        server.close()
+        try:
+            client.connect()
+        except pl.TransportError as exc:
+            check(f"{expected} is carried on the error", exc.status == expected, str(exc.status))
+        else:
+            raise AssertionError(f"a {expected} upgrade was treated as connected")
+
+
+def test_an_accepted_upgrade_carries_the_ticket_and_connects() -> None:
+    """The code check must not reject a real 101, and the ticket must be on the request line."""
+    port, seen = _fake_upgrade(b"HTTP/1.1 101 Switching Protocols\r\n", accept=True)
+    client = pl._WSClient(f"ws://127.0.0.1:{port}/api/ws?ticket=ticket-abc", timeout=5.0)
+    client.connect()
+    check("a real 101 handshake is accepted", client._sock is not None)
+    check("the ticket was on the request line",
+          b"GET /api/ws?ticket=ticket-abc" in seen["request"],
+          seen["request"][:120].decode("latin-1"))
+    client.close()
 
 
 class _FakeSession:
@@ -575,7 +857,7 @@ class _FakeSession:
         return f"t{self.minted}"
 
 
-def _connect_failure(error: Exception, scratch: Path) -> tuple[object, _FakeSession]:
+def _connect_failure(error: Exception, scratch: Path) -> tuple[Exception, _FakeSession]:
     with FakeGate() as gate:
         transport = gate.transport(scratch)
         session = _FakeSession()
@@ -586,33 +868,32 @@ def _connect_failure(error: Exception, scratch: Path) -> tuple[object, _FakeSess
         try:
             try:
                 transport._connect()
-            except pl.NotSentError:
-                pass
-            else:
-                raise AssertionError(f"a refused upgrade ({error}) was treated as connected")
+            except pl.NotSentError as exc:
+                return exc, session
+            raise AssertionError(f"a refused upgrade ({error}) was treated as connected")
         finally:
             pl._WSClient = original
-    return transport, session
+    raise AssertionError("unreachable")
 
 
-def test_a_refused_upgrade_drops_the_cookie_for_the_next_attempt(scratch: Path) -> None:
-    """A 401/403 on the upgrade means the cookie is stale, so the next attempt must sign in."""
-    _, session = _connect_failure(pl.TransportError("upgrade refused", status=401), scratch)
-    check("the cookie was dropped after a refusal", session.forgotten == 1, str(session.forgotten))
+def test_a_refused_upgrade_never_costs_a_sign_in(scratch: Path) -> None:
+    """A gate refusal is not evidence about the cookie: 4401, 4403 and 4404 all look like HTTP 403.
+
+    Hermes closes a WS before accept, so the close code never reaches an HTTP client.
+    Dropping the cookie on any refusal would spend a rate-limited sign-in on a refusal
+    that was never about the credential.
+    """
+    for status in (401, 403, 500, None):
+        error = (pl.TransportError("upgrade refused", status=status) if status
+                 else pl.TransportError("connection reset by peer"))
+        _, session = _connect_failure(error, scratch)
+        check(f"{error} kept the cookie", session.forgotten == 0, str(session.forgotten))
 
 
-def test_a_refused_upgrade_for_another_reason_does_not_cost_a_login(scratch: Path) -> None:
-    """Sign-ins are rate limited per client IP, so only an auth refusal may spend one."""
-    for other in (pl.TransportError("connection reset by peer"),
-                  pl.TransportError("HTTP/1.1 500 Server Error", status=500)):
-        _, session = _connect_failure(other, scratch)
-        check(f"{other} kept the cookie", session.forgotten == 0, str(session.forgotten))
-
-
-def test_a_forbidden_upgrade_also_drops_the_cookie(scratch: Path) -> None:
-    """A connect fault happened before anything was sent, so it is safe to repeat."""
-    _, session = _connect_failure(pl.TransportError("upgrade refused", status=403), scratch)
-    check("a 403 also drops the cookie", session.forgotten == 1, str(session.forgotten))
+def test_the_upgrade_status_travels_with_the_failure(scratch: Path) -> None:
+    exc, _ = _connect_failure(pl.TransportError("upgrade refused", status=403), scratch)
+    check("the status survives the not-sent wrapper", getattr(exc, "status", None) == 403,
+          str(getattr(exc, "status", None)))
 
 
 # --------------------------------------------------------------------------- #
@@ -625,13 +906,13 @@ def test_the_gateway_block_is_dormant_when_absent(scratch: Path) -> None:
     check("a null block means no gateway", pl.gateway_from_config({"gateway": None}) is None)
     check("an empty block means no gateway", pl.gateway_from_config({"gateway": {}}) is None)
 
-    path = scratch / "pw.txt"
-    path.write_text(f"username: bts\npassword: {SECRET}\n")
-    built = pl.gateway_from_config({"gateway": {"url": "http://10.0.0.5:9119",
-                                                "password_file": str(path)}})
-    check("a configured block builds a gateway", isinstance(built, pl.Gateway))
-    assert isinstance(built, pl.Gateway)
-    check("the config username is picked up", built.username == "bts", built.username)
+    with FakeGate() as gate:
+        path = gate.credential_file(scratch)
+        built = pl.gateway_from_config({"gateway": {"url": gate.origin,
+                                                    "password_file": str(path)}})
+        check("a configured block builds a gateway", isinstance(built, pl.Gateway))
+        assert isinstance(built, pl.Gateway)
+        check("the config username is picked up", built.username == "bts", built.username)
 
 
 def test_a_malformed_gateway_block_refuses_rather_than_ignoring(scratch: Path) -> None:
@@ -652,16 +933,16 @@ class _Args:
 
 
 def test_explicit_flags_win_over_the_config_block(scratch: Path) -> None:
-    configured = scratch / "config-pw.txt"
-    configured.write_text(f"username: configured\npassword: {SECRET}\n")
-    explicit = scratch / "flag-pw.txt"
-    explicit.write_text(f"username: fromflag\npassword: {SECRET}\n")
-    config = {"gateway": {"url": "http://10.0.0.5:9119", "password_file": str(configured)}}
-    built = pl.gateway_from_config(config, _Args(gateway="http://10.0.0.6:9119",
-                                                 gateway_password_file=str(explicit)))
-    assert isinstance(built, pl.Gateway)
-    check("the flag's URL wins", built.host == "10.0.0.6", built.host)
-    check("the flag's credential wins", built.username == "fromflag", built.username)
+    with FakeGate() as gate, FakeGate() as other:
+        configured = gate.credential_file(scratch, name="config-pw.txt")
+        explicit = other.credential_file(scratch, name="flag-pw.txt")
+        config = {"gateway": {"url": gate.origin, "password_file": str(configured)}}
+        built = pl.gateway_from_config(config, _Args(gateway=other.origin,
+                                                    gateway_password_file=str(explicit)))
+        assert isinstance(built, pl.Gateway)
+        check("the flag's URL wins", built.port == int(other.origin.rsplit(":", 1)[1]),
+              str(built.port))
+        check("the flag's credential wins", built.source == str(explicit), built.source)
 
 
 if __name__ == "__main__":
