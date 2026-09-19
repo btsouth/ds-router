@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import socket
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -63,7 +64,8 @@ class FakeGate:
                  require_username: bool = True, login_status: int | None = None,
                  login_detail: str = "", login_cookie: bool = True,
                  redirect_to: str = "", ticket_body: dict | None = None,
-                 stale_once: bool = False, tls: tuple[Path, Path] | None = None) -> None:
+                 stale_once: bool = False, ticket_status: int | None = None,
+                 tls: tuple[Path, Path] | None = None) -> None:
         self.password, self.username = password, username
         self.require_username = require_username
         self.login_status, self.login_detail = login_status, login_detail
@@ -71,6 +73,7 @@ class FakeGate:
         self.redirect_to = redirect_to
         self.ticket_body = ticket_body
         self.stale_once = stale_once
+        self.ticket_status = ticket_status
         self.tls = tls
         self.logins = 0            # sign-in attempts
         self.tickets = 0           # tickets handed out
@@ -192,6 +195,9 @@ class FakeGate:
                     return self._send(200, {"ok": True, "next": "/"}, cookie=cookie)
                 if self.path == "/api/auth/ws-ticket":
                     cookie = self.headers.get("Cookie") or ""
+                    if gate.ticket_status is not None:
+                        return self._send(gate.ticket_status,
+                                          {"detail": "Unauthorized"})
                     if gate.stale_once:
                         gate.stale_once = False
                         return self._send(401, {"detail": "Unauthorized"})
@@ -638,6 +644,24 @@ def test_no_credential_refuses_rather_than_planning_from_the_store(scratch: Path
     check("no plan was printed", "alias" not in proc.stdout, proc.stdout[-300:])
 
 
+def test_a_db_run_does_not_resolve_the_gateway(scratch: Path) -> None:
+    """`--db` means plan from the store, so a broken gateway block must not refuse it."""
+    store = scratch / "state.db"
+    con = sqlite3.connect(str(store))
+    con.executescript(
+        "create table sessions (id text, session_key text, billing_provider text,"
+        " model_config text);")
+    con.execute("insert into sessions values ('s1','k1','commandcode',null)")
+    con.commit()
+    con.close()
+    proc = _run_placement("--plan", "--db", "--db-path", str(store), "--config",
+                          _wrote_config(scratch, MINIMAL_CONFIG.replace(
+                              "models:", "gateway:\n  url: ftp://nonsense\nmodels:")))
+    check("the broken gateway block did not refuse the run",
+          "refusing to start" not in proc.stderr, proc.stderr[-300:])
+    check("it planned from the store instead", proc.returncode == 0, str(proc.returncode))
+
+
 def test_the_config_path_is_honoured(scratch: Path) -> None:
     """A gateway block in a config this run was pointed at is used; the default is not."""
     with FakeGate() as gate:
@@ -795,6 +819,24 @@ def test_a_ticket_response_without_a_ticket_is_refused(scratch: Path) -> None:
                 check(f"a {body!r} body is refused", "ticket" in str(exc), str(exc))
             else:
                 raise AssertionError(f"a ticket response of {body!r} was accepted")
+
+
+def test_a_refused_ticket_hints_at_the_ungated_backend(scratch: Path) -> None:
+    """A loopback backend that is not gated answers the ticket endpoint 401.
+
+    That is the most likely cause of this refusal in practice, so the message says so
+    rather than leaving the reader to conclude their credential is wrong.
+    """
+    with FakeGate(ticket_status=401) as gate:
+        session = pl.GatewaySession(gate.gateway(scratch))
+        try:
+            session.mint_ticket()
+        except pl.GatewayAuthError as exc:
+            check("the refusal names the endpoint", "WS ticket" in str(exc), str(exc))
+            check("it hints at the ungated case", "not gated at all" in str(exc), str(exc))
+            check("it says what to drop", "--gateway" in str(exc), str(exc))
+            return
+    raise AssertionError("a refused ticket was accepted")
 
 
 def test_an_unreachable_gateway_names_the_origin(scratch: Path) -> None:
