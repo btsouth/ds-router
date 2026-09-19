@@ -471,7 +471,11 @@ Claims that are reasoned but **not** verified end to end are flagged inline.
   area worth knowing about: per-provider timeout config is silently ignored for
   named custom providers, so the effective bound is 600 s rather than your
   setting. See `docs/hangs-and-timeouts.md` for the measurement, the cause, and
-  a workaround.
+  a workaround. A second shape is measured there too: when every provider in
+  Hermes' chain is spent, a turn hangs rather than failing fast, which is
+  indistinguishable from work in progress. Keep a last-resort fallback entry that
+  is not metered, so an exhausted fleet degrades to a slower answer instead of a
+  silence.
 - **Stickiness does not survive a restart.** ds-router re-picks after a reboot,
   which is correct but means the first turn of the first session may move.
 

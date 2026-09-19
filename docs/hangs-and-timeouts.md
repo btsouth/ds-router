@@ -99,6 +99,35 @@ the hang stopped at 8.1 s instead of 1800 s+ once the identity was threaded.
 This affects anyone using a named custom provider, so it is worth reporting
 rather than working around forever.
 
+## A second hang shape: when there is nothing left to fall back to
+
+Measured 2026-09-19 on Hermes v0.21.3, while verifying a new fallback entry.
+
+Setup: a throwaway `HERMES_HOME` whose primary was `opencode-go` (sitting on its
+weekly limit) and whose only fallback entry was also `opencode-go`.
+
+```
+hermes -z "Reply with exactly: fallback ok"    -> no output, no error, no usage file
+                                                  killed by `timeout 240` (exit 143)
+```
+
+The same scratch home with a healthy fallback entry added answered in about 20
+seconds and recorded `provider: deepseek` in its `--usage-file`. So the difference
+is not the request shape or the model: it is whether anything in the chain can
+answer at all.
+
+This is not a network stall. The exhausted provider refuses in ~0.15 s (a 429 with
+`Weekly usage limit reached`), so the 240 s went into the retry path, consistent
+with the bounded-but-long timeouts in the table above.
+
+Why it matters here: a hang is indistinguishable from work in progress, to a human
+watching a terminal and to a cron job, so an exhausted fleet can look busy for
+hours. ds-router's premise is to keep a provider in the chain that has measured
+headroom, and this is the shape it exists to prevent. But the last mile is the
+fallback chain, and a chain whose entries are all metered can end up with nothing
+to answer. A last-resort entry that is not metered (an API key with a balance
+behind it) degrades that case to a slower answer instead of a silent hang.
+
 ## What this means for ds-router
 
 The health probe is the mitigation that already exists here: it sends a real
