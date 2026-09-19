@@ -598,6 +598,25 @@ def test_an_unreadable_provider_join_refuses_instead_of_moving_the_fleet():
     assert len(sessions_out) == 2
     assert {s.provider for s in sessions_out} == {"commandcode", "opencode-go"}, sessions_out
 
+    # A store that reads fine but describes OTHER sessions. It is non-empty, so a guard
+    # keyed on "did the store hold anything" let every one of these through as
+    # provider-less and moved them: that is what a backend on another machine looks like
+    # from here, and it is the same whole-fleet rewrite from the other direction.
+    foreign = tmp_path("foreign.db")
+    con = sqlite3.connect(str(foreign))
+    con.executescript(
+        "create table sessions (id text, session_key text, billing_provider text, model_config text);"
+    )
+    con.execute("insert into sessions values ('z','kz','clinepass',null)")
+    con.commit()
+    con.close()
+    try:
+        pl.enumerate_sessions(T(), db_path=foreign)
+        raise AssertionError("a store that cannot answer for these sessions must refuse")
+    except pl.ProviderJoinError as exc:
+        assert "no provider could be read" in str(exc), exc
+        assert "another machine" in str(exc), exc
+
 
 def test_apply_reports_a_reply_that_means_nothing_happened():
     """A returned call is not a completed move. Hermes answers config.set with

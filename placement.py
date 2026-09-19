@@ -29,13 +29,15 @@ Everything RPC-shaped goes through `Transport.call(method, params)`, so the
 whole planner and applier are testable with `FakeTransport` and no backend.
 
 A backend whose dashboard is published refuses Hermes' own session token by design,
-so its sessions can only be reached the way a browser reaches them: a dashboard
-credential, then a single-use WS ticket. `--gateway <origin>`, or a `gateway:` block
-in config.yaml, reaches one that way. The credential comes from a 0600 file or an
-env var, never from argv. Nothing changes without one: the loopback/token path is the
-default. Shapes this transport cannot speak (https, a URL prefix, a wildcard address,
-userinfo in the URL) are refused up front with the alternative named; the README's
-"When it cannot find the backend" has the details.
+so its sessions can only be reached the way a browser does: a dashboard credential,
+then a single-use WS ticket. `--gateway <origin>`, or a `gateway:` block in
+config.yaml, reaches one that way, over https or plain http. The credential comes
+from a 0600 file or an env var, never from argv, and TLS verification is never
+disabled: a private or self-signed certificate is trusted by naming its CA
+(`ca_file`). Nothing changes without a gateway: the loopback/token path is the
+default. Shapes this transport cannot speak (a URL prefix, a wildcard address,
+userinfo in the URL) and trust anchors it cannot load are refused up front with the
+alternative named; the README's "When it cannot find the backend" has the details.
 
 Usage:
 
@@ -43,7 +45,7 @@ Usage:
     python3 placement.py --plan --json
     python3 placement.py --apply           # apply it (explicit flag required)
     python3 placement.py --apply --dry-run # print exactly what would be sent
-    python3 placement.py --plan --gateway http://10.0.0.5:9119 \
+    python3 placement.py --plan --gateway https://10.0.0.5:9119 \
         --gateway-password-file ~/.hermes/dashboard-lan-password.txt
 """
 
@@ -58,6 +60,7 @@ import os
 import re
 import socket
 import sqlite3
+import ssl
 import struct
 import sys
 import time
@@ -695,23 +698,33 @@ class _WSClient:
 
     Deliberately hand-rolled: the repo takes pyyaml and nothing else, and this
     only ever needs to say one JSON line and read one reply.
+
+    A ``wss://`` URL is wrapped in TLS before the handshake, with the caller's
+    context: certificate and hostname verification are the caller's policy and are
+    never disabled here, because the upgrade carries a single-use ticket in its query
+    string.
     """
 
-    def __init__(self, url: str, timeout: float = 10.0) -> None:
+    def __init__(self, url: str, timeout: float = 10.0,
+                 ssl_context: Optional["ssl.SSLContext"] = None) -> None:
         self.url = url
         self.timeout = timeout
+        self.ssl_context = ssl_context
         self._sock: Optional[socket.socket] = None
         self._reader: Any = None
 
     def connect(self) -> None:
         parts = urllib.parse.urlsplit(self.url)
+        secure = parts.scheme == "wss"
         host = parts.hostname or "127.0.0.1"
-        port = parts.port or 80
+        port = parts.port or (443 if secure else 80)
         path = parts.path or "/"
         if parts.query:
             path = f"{path}?{parts.query}"
         sock = socket.create_connection((host, port), timeout=self.timeout)
         sock.settimeout(self.timeout)
+        if secure:
+            sock = self._wrap_tls(sock, host)
         key = base64.b64encode(os.urandom(16)).decode()
         sock.sendall((
             f"GET {path} HTTP/1.1\r\n"
@@ -743,6 +756,28 @@ class _WSClient:
             sock.close()
             raise TransportError("websocket handshake failed: bad Sec-WebSocket-Accept")
         self._sock, self._reader = sock, reader
+
+    def _wrap_tls(self, sock: socket.socket, host: str) -> Any:
+        """*sock* wrapped in TLS for *host*, or a clear refusal.
+
+        The context comes from the caller (``Gateway.ssl_context``), which always
+        verifies: a certificate that does not validate, or one issued for a different
+        name, stops the upgrade here rather than sending a ticket to whatever answered.
+        """
+        context = self.ssl_context or ssl.create_default_context()
+        try:
+            return context.wrap_socket(sock, server_hostname=host)
+        except ssl.SSLCertVerificationError as exc:
+            sock.close()
+            raise TransportError(
+                f"the TLS certificate for {host} could not be verified: "
+                f"{getattr(exc, 'verify_message', '') or exc}. If this dashboard uses a "
+                f"private or self-signed certificate, name its CA with "
+                f"--gateway-ca-file so it can be verified properly",
+                status=None) from exc
+        except (ssl.SSLError, OSError) as exc:
+            sock.close()
+            raise TransportError(f"the TLS handshake with {host} failed: {exc}") from exc
 
     def _read_exactly(self, size: int) -> bytes:
         if size <= 0:
@@ -867,16 +902,18 @@ class Gateway:
     password: str = field(repr=False)
     scheme: str = "http"
     source: str = "config"
+    ca_file: Optional[str] = None
 
     def __post_init__(self) -> None:
-        # This transport speaks plaintext HTTP and WebSocket. A Gateway that claims
-        # otherwise could only be built by hand, and the ticket_url mapping for it
-        # would be a capability the transport does not have, so refuse at construction
-        # rather than carry a dead branch.
-        if self.scheme != "http":
+        if self.scheme not in ("http", "https"):
             raise GatewayAuthError(
-                f"a gated gateway is http only: this transport speaks plaintext HTTP "
-                f"and WebSocket, so {self.scheme!r} cannot be reached")
+                f"a gated gateway is http or https, got {self.scheme!r}")
+        if self.ca_file and self.scheme != "https":
+            # Silently ignoring it would leave a reader believing they pinned a
+            # certificate for a plaintext connection, where there is none.
+            raise GatewayAuthError(
+                "ca_file applies to an https gateway only, and this one is http: "
+                "remove it, or use the https origin the certificate is for")
 
     @property
     def authority(self) -> str:
@@ -894,10 +931,30 @@ class Gateway:
 
     def ticket_url(self, ticket: str) -> str:
         """The upgrade URL for *ticket*, quoted (a ticket is single-use and short-lived)."""
-        return f"ws://{self.authority}/api/ws?ticket={urllib.parse.quote(ticket)}"
+        ws_scheme = "wss" if self.scheme == "https" else "ws"
+        return f"{ws_scheme}://{self.authority}/api/ws?ticket={urllib.parse.quote(ticket)}"
+
+    def ssl_context(self) -> Optional["ssl.SSLContext"]:
+        """The TLS context for this gateway, or None for a plaintext one.
+
+        Verification is never disabled: this connection carries a session cookie and a
+        ticket, and a flag that turns certificate checking off is how a credential ends
+        up on a machine that is not the one named in the config. A private or
+        self-signed certificate is trusted by naming its CA instead (``ca_file``), which
+        keeps verification and hostname checking on.
+        """
+        if self.scheme != "https":
+            return None
+        try:
+            return ssl.create_default_context(cafile=self.ca_file or None)
+        except (OSError, ssl.SSLError) as exc:
+            raise GatewayAuthError(
+                f"cannot read the CA certificate {self.ca_file!r} for {self.authority}: {exc}"
+            ) from exc
 
     def describe(self) -> str:
-        return f"{self.authority} (gated, credential from {self.source})"
+        trusted = ", private CA" if self.ca_file else ""
+        return f"{self.authority} (gated{trusted}, credential from {self.source})"
 
 
 # The labels a credential file may carry. Matching a known set is what stops a prose
@@ -945,10 +1002,17 @@ def read_gateway_credential(path: Path) -> "Credential":
             f"the gateway credential file {path} holds no password line: expected "
             f"'password: <secret>' or 'password <secret>' (a single-line file holding "
             f"only the secret also works)")
-    origins = tuple(value for value in (fields.get("origin"), fields.get("alt")) if value)
+    # A URL, and only the URL: the real file on this machine annotates it on the same
+    # line ("http://10.0.0.5:9119   (raw tailnet IP, no TLS)"), and a trailing note must
+    # not be read as part of the origin.
+    origins: list[str] = []
+    for value in (fields.get("origin"), fields.get("alt")):
+        tokens = str(value or "").split()
+        if tokens and "://" in tokens[0]:
+            origins.append(tokens[0])
     return Credential(
         username=str(fields.get("username") or fields.get("user") or "").strip(),
-        password=password, origins=origins, source=str(path))
+        password=password, origins=tuple(origins), source=str(path))
 
 
 @dataclass
@@ -975,16 +1039,18 @@ def _redact(url: str) -> str:
     return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
 
 
-def _checked_port(parts: object) -> int:
-    """The port to talk to, refusing one that cannot be read.
+def _checked_port(parts: object, scheme: str) -> int:
+    """The port to talk to, refused when it cannot be read, defaulted by scheme.
 
     ``parts.port`` raises for a non-numeric value and returns None when absent, and
-    ``or 80`` silently turned an explicit ``:0`` into 80. Both end up as a traceback
-    or a wrong destination rather than a refusal.
+    ``or 80`` silently turned an explicit ``:0`` into 80. Both end up as a traceback or
+    a wrong destination rather than a refusal. The absent case has to follow the scheme:
+    defaulting an ``https`` origin to 80 dials the wrong port and reports a refusal that
+    looks like the backend being down.
     """
     raw = getattr(parts, "port", None)
     if raw is None:
-        return 80
+        return 443 if scheme == "https" else 80
     if raw == 0:
         raise GatewayAuthError("port 0 is not a destination: give the port the backend serves on")
     return int(raw)
@@ -993,6 +1059,7 @@ def _checked_port(parts: object) -> int:
 def resolve_gateway(url: str, *, username: Optional[str] = None,
                     password_file: Optional[str] = None,
                     password_env: Optional[str] = None,
+                    ca_file: Optional[str] = None,
                     warn: Optional[Callable[[str], None]] = None) -> Gateway:
     """Build a :class:`Gateway` from an origin plus a credential source.
 
@@ -1001,20 +1068,25 @@ def resolve_gateway(url: str, *, username: Optional[str] = None,
     option set, and ``password_file`` and ``password_env`` are mutually exclusive
     rather than one silently winning.
 
+    ``https`` is supported and preferred where the dashboard has a certificate that
+    verifies: the same TLS context is used for the sign-in and for the WebSocket, the
+    certificate and hostname are always checked, and a private or self-signed
+    certificate is trusted by naming its CA (``ca_file``) rather than by turning
+    verification off.
+
     Shapes are refused rather than half-supported, because a URL that looks accepted
     and then fails later is worse than a clear no:
 
     * **userinfo in the URL.** It is ignored by design (a URL lands in shell history
       and in ``ps`` output), and silently ignoring it is how a user believes they
       configured a username they did not.
-    * **https.** This transport speaks plaintext HTTP and WebSocket, so a TLS origin
-      would send the ticket in the clear to a TLS port and fail meaninglessly. A TLS
-      dashboard needs the second-backend recipe in the README.
     * **a URL prefix.** The paths are fixed (``/auth/password-login``,
       ``/api/auth/ws-ticket``, ``/api/ws``), so a dashboard served under a subpath
       would be signed in against the wrong URL.
     * **a wildcard address** (``0.0.0.0``, ``::``), which almost always means the
       user copied ``--host 0.0.0.0`` from their own ``serve`` command.
+    * **a CA file that cannot be read**, or one given for a plaintext gateway where
+      there is no certificate to pin.
 
     A credential file that names other origins than the one configured is a warning
     rather than a refusal: one file legitimately covers a tailnet name and a LAN
@@ -1030,13 +1102,8 @@ def resolve_gateway(url: str, *, username: Optional[str] = None,
             f"config.yaml, instead of a URL like {safe}")
     if parts.scheme not in ("http", "https") or not parts.hostname:
         raise GatewayAuthError(
-            f"a gated gateway needs an http origin such as http://192.168.1.88:9119, "
-            f"got {safe!r}")
-    if parts.scheme == "https":
-        raise GatewayAuthError(
-            f"{safe!r} is https, and this transport speaks plaintext HTTP and WebSocket "
-            f"only: point it at a plain http origin on the tailnet or LAN, or use the "
-            f"second-backend recipe in the README for a TLS dashboard")
+            f"a gated gateway needs an http or https origin such as "
+            f"http://192.168.1.88:9119, got {safe!r}")
     if parts.path.strip("/"):
         raise GatewayAuthError(
             f"{safe!r} carries a URL prefix, and a gated gateway must be an origin: the "
@@ -1051,11 +1118,26 @@ def resolve_gateway(url: str, *, username: Optional[str] = None,
         raise GatewayAuthError(
             "set one of password_file and password_env, not both: which one wins would "
             "otherwise be invisible")
+    if ca_file and parts.scheme != "https":
+        raise GatewayAuthError(
+            f"a CA certificate ({ca_file}) was given for the plaintext origin {safe}: "
+            f"there is no certificate to check there, so remove it or use the https "
+            f"origin the certificate is for")
     try:
-        port = _checked_port(parts)
+        port = _checked_port(parts, str(parts.scheme))
     except ValueError as exc:
         raise GatewayAuthError(
             f"the port in {safe!r} is not a number: {exc}") from exc
+
+    resolved_ca: Optional[str] = None
+    if ca_file:
+        candidate = Path(str(ca_file)).expanduser()
+        if not candidate.is_file():
+            raise GatewayAuthError(
+                f"the CA certificate {candidate} does not exist or is not a file: it is "
+                f"what makes an unverifiable dashboard certificate trusted, so it is "
+                f"required to be readable")
+        resolved_ca = str(candidate)
 
     file_origins: tuple[str, ...] = ()
     if password_file:
@@ -1082,7 +1164,10 @@ def resolve_gateway(url: str, *, username: Optional[str] = None,
             f"no dashboard username for the gated gateway {safe}: pass --gateway-user or "
             f"point at a credential file that carries a 'username [...]' line")
     gateway = Gateway(host=str(parts.hostname), port=port, username=user, password=secret,
-                      scheme=str(parts.scheme), source=source)
+                      scheme=str(parts.scheme), source=source, ca_file=resolved_ca)
+    # Fail here, with the reason, rather than mid-turn: an unloadable CA would
+    # otherwise surface as every connection failing.
+    gateway.ssl_context()
     if warn is not None and file_origins:
         named = " or ".join(file_origins)
         if not any(_same_authority(entry, gateway.authority) for entry in file_origins):
@@ -1092,11 +1177,21 @@ def resolve_gateway(url: str, *, username: Optional[str] = None,
 
 
 def _same_authority(url: str, authority: str) -> bool:
-    """True when *url* names the same host:port as *authority* (port defaulted by scheme)."""
+    """True when *url* names the same host:port as *authority* (port defaulted by scheme).
+
+    Never raises. It only decides whether to print a note, so an entry it cannot parse
+    is "not a claim about this host" rather than a reason for the run to die: a helper
+    on the warning path has no business failing the command that called it.
+    """
     parts = urllib.parse.urlsplit(str(url or ""))
     if not parts.hostname:
         return False
-    port = parts.port if parts.port is not None else (443 if parts.scheme == "https" else 80)
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    if port is None:
+        port = 443 if parts.scheme == "https" else 80
     return f"{parts.hostname}:{port}" == authority
 
 
@@ -1146,16 +1241,23 @@ class GatewaySession:
       the transport incoherent as well as leaky.
     """
 
-    def __init__(self, gateway: Gateway, *, timeout: float = 10.0) -> None:
+    def __init__(self, gateway: Gateway, *, timeout: float = 10.0,
+                 ssl_context: Optional["ssl.SSLContext"] = None) -> None:
         self.gateway = gateway
         self.timeout = float(timeout)
         self.logins = 0  # attempts; observable so a retry loop cannot hide here
         self._cookie_held = False
         self._refusal: Optional[GatewayAuthError] = None
         self._jar = http.cookiejar.CookieJar()
-        self._opener = urllib.request.build_opener(
+        handlers: list[Any] = [
             urllib.request.ProxyHandler({}),        # never route a password via a proxy
-            urllib.request.HTTPCookieProcessor(self._jar), _NoRedirect())
+            urllib.request.HTTPCookieProcessor(self._jar), _NoRedirect(),
+        ]
+        if ssl_context is not None:
+            # The same trust decision as the WebSocket half, so an https gateway with a
+            # private CA does not sign in over one policy and upgrade over another.
+            handlers.insert(2, urllib.request.HTTPSHandler(context=ssl_context))
+        self._opener = urllib.request.build_opener(*handlers)
 
     def forget(self) -> None:
         """Drop the cookie so the next mint signs in again. A latched refusal stays."""
@@ -1277,6 +1379,7 @@ def gateway_from_config(config: dict, args: Any = None,
         username=getattr(args, "gateway_user", None) or block.get("username"),
         password_file=getattr(args, "gateway_password_file", None) or block.get("password_file"),
         password_env=getattr(args, "gateway_password_env", None) or block.get("password_env"),
+        ca_file=getattr(args, "gateway_ca_file", None) or block.get("ca_file"),
         warn=warn)
 
 
@@ -1420,6 +1523,7 @@ class LiveTransport(Transport):
         self._ws: Optional[_WSClient] = None
         self._id = 0
         self._session: Optional[GatewaySession] = None
+        self._context: Optional["ssl.SSLContext"] = None
 
     @staticmethod
     def _resolve(*, port: Optional[int], token: Optional[str],
@@ -1452,12 +1556,26 @@ class LiveTransport(Transport):
 
     # --- connection -------------------------------------------------------- #
 
+    def _ssl_context(self) -> Optional["ssl.SSLContext"]:
+        """The TLS context for this transport, or None when it is plaintext.
+
+        Built once: the context is a trust decision, and rebuilding it per connection
+        would re-read a CA bundle on every mint.
+        """
+        gateway = self.backend.gateway
+        if gateway is None or gateway.scheme != "https":
+            return None
+        if self._context is None:
+            self._context = gateway.ssl_context()
+        return self._context
+
     def _gateway_session(self) -> GatewaySession:
         gateway = self.backend.gateway
         if gateway is None:
             raise TransportError("this transport has no gated gateway configured")
         if self._session is None:
-            self._session = GatewaySession(gateway, timeout=self.timeout)
+            self._session = GatewaySession(gateway, timeout=self.timeout,
+                                           ssl_context=self._ssl_context())
         return self._session
 
     def _ws_url(self) -> str:
@@ -1478,7 +1596,7 @@ class LiveTransport(Transport):
         if self._ws is not None:
             return self._ws
         url = self._ws_url()
-        client = _WSClient(url, timeout=self.timeout)
+        client = _WSClient(url, timeout=self.timeout, ssl_context=self._ssl_context())
         try:
             client.connect()
         except NotSentError:
@@ -1760,11 +1878,19 @@ def enumerate_sessions(transport: Optional[Transport] = None, *, db_path: Option
         provider = str(row.get("provider") or "") or providers.get(key, "") or providers.get(sid, "")
         out.append(Session(id=sid, provider=provider, session_key=key,
                            model=str(row.get("model") or ""), title=str(row.get("title") or "")))
-    if out and not providers and not any(s.provider for s in out):
+    if out and not any(s.provider for s in out):
+        # Keyed on the SESSIONS, not on whether the store held anything at all. A store
+        # that describes other sessions (or another machine) is non-empty and still
+        # cannot answer for these, and every one of them would look provider-less, which
+        # the planner treats as a reason to move it. That is the whole-fleet rewrite the
+        # audit found, reached from the other direction.
         raise ProviderJoinError(
-            f"{len(out)} live session(s) found but no provider could be read for any of them "
-            f"(state store: {state_db_path(db_path)}). Refusing to act, because every session "
-            f"would look provider-less and be moved.")
+            f"{len(out)} live session(s) found but no provider could be read for any of "
+            f"them (state store: {state_db_path(db_path)}). Refusing to act, because every "
+            f"session would look provider-less and be moved. Either that store does not "
+            f"describe this backend (a backend on another machine needs its own copy of "
+            f"the router: point --db-path at a store that describes it, or run this where "
+            f"the backend lives), or nothing has a provider yet.")
     # A PARTIAL join is the same hazard with a narrower trigger. If some sessions
     # resolved and others did not, the unresolved ones look like sessions that
     # never had a provider, which the planner treats as a reason to move them: that
@@ -2000,6 +2126,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--gateway-password-env", default=None, metavar="VAR",
                     help="env var holding the dashboard password "
                          "(default: config gateway.password_env)")
+    ap.add_argument("--gateway-ca-file", default=None, metavar="PATH",
+                    help="CA certificate (PEM) to trust for an https gateway whose own "
+                         "certificate is not in the system store, e.g. a self-signed one; "
+                         "verification and hostname checking stay on "
+                         "(default: config gateway.ca_file)")
     ap.add_argument("--children", action="store_true", help="include subagent/cron sessions")
     ap.add_argument("--limit", type=int, default=0, help="only print this many rows (0 = all)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")

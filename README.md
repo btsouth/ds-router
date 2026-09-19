@@ -190,7 +190,7 @@ dashboard credential, mint a single-use WS ticket, then present that ticket on t
 upgrade. Point the planner at the backend and give it the credential:
 
 ```sh
-./placement.py --plan --gateway http://192.168.1.88:9119 \
+./placement.py --plan --gateway https://192.168.1.88:9119 \
     --gateway-user you \
     --gateway-password-file ~/.hermes/dashboard-lan-password.txt
 ```
@@ -199,16 +199,31 @@ Or put it in `config.yaml`, so the flags are not needed:
 
 ```yaml
 gateway:
-  url: http://192.168.1.88:9119
+  url: https://192.168.1.88:9119
   username: you
   password_file: ~/.hermes/dashboard-lan-password.txt
+  # ca_file: /etc/ssl/my-dashboard-ca.pem   # only for a private or self-signed certificate
 ```
 
 That file is yours to write, one per dashboard, mode 0600. The reader accepts either
 `label: value` or `label value` lines (Hermes' own LAN file uses colons, a
 hand-written one often uses spaces), ignores prose and blank lines, and requires a
 username as well. If the file names an `origin` that is not the host you pointed at,
-the run says so rather than quietly sending the password somewhere else.
+the run says so rather than quietly sending the password somewhere else. A file other
+users can read is refused with the `chmod` to run.
+
+`https` is preferred where the dashboard has a certificate. The same TLS context
+covers the sign-in and the WebSocket, the certificate and the hostname are always
+checked, and there is no flag that turns verification off: a private or self-signed
+certificate is trusted by naming its CA with `--gateway-ca-file` (or `ca_file`),
+which keeps verification on. A `wss://` upgrade to a certificate that does not
+validate stops at the handshake rather than sending the ticket to whatever answered.
+
+Plain `http` still works, for a tailnet or LAN address where TLS is not set up. It is
+a real trade-off rather than a hidden one: the dashboard password, the session cookie
+and the ticket cross that segment unencrypted, so prefer a tailnet name over a shared
+LAN address. The sign-in also ignores any `http_proxy` in the environment, because a
+login is one POST with the password in the body and a proxy would receive it whole.
 
 `--gateway-password-env SOME_VAR` is the other credential source, and setting both a
 file and an env var is refused rather than one silently winning. There is no
@@ -216,23 +231,21 @@ file and an env var is refused rather than one silently winning. There is no
 process on the machine. With no `gateway:` block and no `--gateway`, nothing
 changes and discovery stays on the token path described above.
 
-The origin has to be plain `http` on a host and, optionally, a port, which is what a
-tailnet or LAN address is: this transport speaks plaintext HTTP and WebSocket.
-Several shapes are refused up front with a message saying what to do instead, rather
-than accepted and then failing halfway: an `https` dashboard, one served under a URL
-prefix, a wildcard address such as `0.0.0.0`, and a URL with a username or password
-inside it. All of those need the second-backend recipe below.
+Some shapes are refused up front with a message saying what to do instead, rather
+than accepted and then failing halfway: a dashboard served under a URL prefix, a
+wildcard address such as `0.0.0.0`, a URL with a username or password inside it, and
+a CA file that cannot be loaded or is given for a plaintext origin. Those need the
+second-backend recipe below.
 
-Plain http is a real trade-off, stated rather than hidden: the dashboard password,
-the session cookie and the ticket cross that segment unencrypted, so use a tailnet
-name where you can rather than a shared LAN address. The sign-in also ignores any
-`http_proxy` in the environment: a login is one POST with the password in the body,
-and a proxy would receive it whole.
+Verified against a real gated backend, read-only: the plan listed 13 open sessions
+that the token path cannot see at all, and proposed moving one off an exhausted
+provider. Nothing was written; the write path over a ticket is not exercised here.
 
-Verified against a real gated backend on this machine, read-only: the plan listed 13
-open sessions that the token path cannot see at all, and proposed moving one off an
-exhausted provider. Nothing was written; the write path over a ticket is not
-exercised here.
+The backend has to be on the machine you run this from. Every session is a backend
+session, but its provider is read from the local `state.db`, so a backend somewhere
+else cannot be described by that store: pointed at another host, the run refuses
+rather than treating its sessions as provider-less and moving them. A backend on the
+dev box needs a copy of the router on the dev box, the same rule as the token path.
 
 With no `gateway:` block at all, those sessions are still visible in `state.db`, and
 they cannot be steered. With `--gateway` but no usable credential the run refuses
@@ -409,7 +422,11 @@ reason, plus a 53s median response time. See `docs/token-harbor.md`.
   data rather than putting it in a message for a caller to string-match, and it is
   never read as a stale cookie: Hermes closes a WebSocket before accept for several
   reasons that all look like HTTP 403, and the only reliable "your cookie is stale"
-  signal is the 401 from the ticket request itself.
+  signal is the 401 from the ticket request itself. TLS is never optional: an `https`
+  gateway verifies the certificate and the hostname on both halves through one shared
+  context, a private CA is named by file rather than by a flag that disables checking,
+  and a certificate that does not validate stops the upgrade before the ticket goes
+  anywhere.
 
 ## What is verified
 
@@ -447,16 +464,25 @@ Claims in this README that have been measured, rather than reasoned about:
   reading that could not be trusted scoring as the healthiest provider. Five tests
   that could not fail were rewritten, and the transport and concurrency layers, which
   had no tests at all, now have 18 between them.
-- The gated path, against a real gated backend (read-only) and a loopback fake
-  (`test_gateway.py`, 41 tests). Live: 13 open sessions read from a backend whose
-  token path cannot reach it, and a plan proposing to move one off an exhausted
-  provider; nothing was written. Pinned in the suite: a wrong credential refused
-  once and not retried, a rate-limited login named as such, a redirect not followed,
-  a ticket response carrying no ticket, a 200 login that sets no cookie, a stale
-  cookie re-signed-in exactly once, a file other users can read refused, a
-  credential whose file names another origin reported, a password in a URL refused
-  without being echoed by the refusal, and a password never reaching a message,
-  including through a server's own error detail.
+- The gated path, against real gated backends (read-only, over https and plain http)
+  and a loopback fake (`test_gateway.py`, 49 tests). Live: 13 open sessions read from
+  a backend whose token path cannot reach it, and a plan proposing to move one off an
+  exhausted provider; nothing was written. Live over TLS: a tailnet dashboard with a
+  certificate from the system store, reached through the same sign-in, ticket and
+  upgrade as the plaintext case. Pinned in the suite: a wrong credential refused once
+  and not retried, a rate-limited login named as such, a redirect not followed, a
+  ticket response carrying no ticket, a 200 login that sets no cookie, a stale cookie
+  re-signed-in exactly once, a file other users can read refused, a credential whose
+  file names another origin reported, a password in a URL refused without being echoed
+  by the refusal, and a password never reaching a message, including through a
+  server's own error detail. The TLS checks generate a throwaway self-signed
+  certificate per run and cover the handshake succeeding with its CA named, failing
+  without it, and the refusal naming the fix.
+- **A backend is steered from the machine that owns it.** Pointed at another host's
+  backend, the provider join finds no provider for any of its sessions, which would
+  look like "no provider yet" and move the whole fleet. That is now a refusal that
+  says so, on the same rule as an unreadable store. Verified live: a plan against a
+  backend on another machine refuses with exit 5 instead of proposing four moves.
 - `install.sh` / `uninstall.sh` in an isolated sandbox, including that
   `--dry-run` writes nothing and a re-run is a no-op.
 

@@ -20,7 +20,9 @@ import hashlib
 import http.server
 import json
 import os
+import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -61,7 +63,7 @@ class FakeGate:
                  require_username: bool = True, login_status: int | None = None,
                  login_detail: str = "", login_cookie: bool = True,
                  redirect_to: str = "", ticket_body: dict | None = None,
-                 stale_once: bool = False) -> None:
+                 stale_once: bool = False, tls: tuple[Path, Path] | None = None) -> None:
         self.password, self.username = password, username
         self.require_username = require_username
         self.login_status, self.login_detail = login_status, login_detail
@@ -69,6 +71,7 @@ class FakeGate:
         self.redirect_to = redirect_to
         self.ticket_body = ticket_body
         self.stale_once = stale_once
+        self.tls = tls
         self.logins = 0            # sign-in attempts
         self.tickets = 0           # tickets handed out
         self.paths: list[str] = []  # every path requested, in order
@@ -80,6 +83,11 @@ class FakeGate:
     def __enter__(self) -> "FakeGate":
         self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self._server.daemon_threads = True
+        if self.tls is not None:
+            cert, key = self.tls
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certfile=str(cert), keyfile=str(key))
+            self._server.socket = context.wrap_socket(self._server.socket, server_side=True)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         return self
@@ -91,9 +99,13 @@ class FakeGate:
         self._thread.join(timeout=5)
 
     @property
+    def scheme(self) -> str:
+        return "https" if self.tls is not None else "http"
+
+    @property
     def origin(self) -> str:
         assert self._server is not None
-        return f"http://127.0.0.1:{self._server.server_address[1]}"
+        return f"{self.scheme}://127.0.0.1:{self._server.server_address[1]}"
 
     def credential_file(self, directory: Path, name: str = "dashboard-pw.txt",
                         password: str | None = None, mode: int = 0o600,
@@ -200,12 +212,46 @@ class FakeGate:
 
     # --- the transport, pointed at this gate ------------------------------- #
 
-    def gateway(self, directory: Path, **kwargs: object) -> pl.Gateway:
-        return pl.resolve_gateway(self.origin, password_file=str(self.credential_file(
-            directory, **kwargs)))  # type: ignore[arg-type]
+    def gateway(self, directory: Path, ca_file: str | None = None,
+                **kwargs: object) -> pl.Gateway:
+        """A Gateway for this server, trusting its own certificate when it is a TLS one."""
+        return pl.resolve_gateway(
+            self.origin,
+            password_file=str(self.credential_file(directory, **kwargs)),  # type: ignore[arg-type]
+            ca_file=ca_file or (str(self.tls[0]) if self.tls is not None else None))
 
     def transport(self, directory: Path) -> pl.LiveTransport:
         return pl.LiveTransport(gateway=self.gateway(directory))
+
+
+def _make_cert(scratch: Path) -> tuple[Path, Path]:
+    """A throwaway self-signed certificate for 127.0.0.1, generated for this run.
+
+    Committing a private key to a public repo is worse than generating one here, and the
+    suite takes no dependencies, so this shells out to openssl. That makes openssl a test
+    dependency: the TLS checks fail loudly without it rather than passing silently, since
+    a skipped check here would be a security-relevant hole reported as green.
+    """
+    if not shutil.which("openssl"):
+        raise AssertionError("openssl is required for the TLS checks in this suite")
+    cert, key, conf = scratch / "cert.pem", scratch / "key.pem", scratch / "openssl.cnf"
+    conf.write_text(
+        "[req]\n"
+        "distinguished_name=dn\n"
+        "x509_extensions=v3\n"
+        "prompt=no\n"
+        "[dn]\n"
+        "CN=127.0.0.1\n"
+        "[v3]\n"
+        "subjectAltName=IP:127.0.0.1\n"
+        "basicConstraints=critical,CA:TRUE\n")
+    proc = subprocess.run(
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+         "-keyout", str(key), "-out", str(cert), "-config", str(conf)],
+        capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise AssertionError(f"openssl could not make a test certificate: {proc.stderr[-200:]}")
+    return cert, key
 
 
 class _ProxyRecorder:
@@ -283,6 +329,42 @@ def test_credential_file_reads_the_space_separated_shape(scratch: Path) -> None:
         check("the prose is not the password", "Hermes gateway" not in credential.password)
         check("the origin it names is returned", credential.origins == (gate.origin,),
               str(credential.origins))
+
+
+def test_an_annotated_origin_line_yields_only_the_url(scratch: Path) -> None:
+    """The real devbox file annotates its second origin on the same line.
+
+    Reading the annotation as part of the URL is not cosmetic: it made the comparison
+    raise, and the raise took the whole run down before any credential was sent.
+    """
+    path = scratch / "pw.txt"
+    path.write_text("Hermes gateway on the devbox\n\n"
+                    "  origin   https://devbox.example.ts.net\n"
+                    "  alt      http://100.64.0.5:9119   (raw tailnet IP, no TLS)\n"
+                    "username bts\n"
+                    f"password {SECRET}\n")
+    path.chmod(0o600)
+    credential = pl.read_gateway_credential(path)
+    check("the annotated entry keeps only the URL",
+          credential.origins == ("https://devbox.example.ts.net", "http://100.64.0.5:9119"),
+          str(credential.origins))
+    check("an entry that is not a URL is dropped",
+          all("://" in entry for entry in credential.origins), str(credential.origins))
+
+
+def test_the_origin_comparison_can_never_fail_the_run() -> None:
+    """It decides whether to print a note, so it has no business raising."""
+    cases = [
+        ("https://devbox.example.ts.net", "devbox.example.ts.net:443", True),
+        ("https://devbox.example.ts.net:443", "devbox.example.ts.net:443", True),
+        ("http://100.64.0.5:9119   (raw tailnet IP, no TLS)", "100.64.0.5:9119", False),
+        ("not a url at all", "10.0.0.5:9119", False),
+        ("", "10.0.0.5:9119", False),
+        ("http://10.0.0.5", "10.0.0.5:9119", False),
+    ]
+    for entry, authority, expected in cases:
+        check(f"{entry!r} against {authority}", pl._same_authority(entry, authority) == expected,
+              str(pl._same_authority(entry, authority)))
 
 
 def test_credential_file_accepts_a_bare_secret_line(scratch: Path) -> None:
@@ -380,6 +462,12 @@ def test_resolve_gateway_reads_a_file_and_an_env_var(scratch: Path) -> None:
         defaulted = pl.resolve_gateway("http://10.0.0.5", password_env="DS_TEST_GATEWAY_PW",
                                        username="someone")
         check("an http URL defaults to port 80", defaulted.port == 80, str(defaulted.port))
+        secure = pl.resolve_gateway("https://10.0.0.5", password_env="DS_TEST_GATEWAY_PW",
+                                    username="someone")
+        check("an https URL defaults to port 443", secure.port == 443, str(secure.port))
+        check("and its upgrade url is wss on that port",
+              secure.ticket_url("t") == "wss://10.0.0.5:443/api/ws?ticket=t",
+              secure.ticket_url("t"))
     finally:
         os.environ.pop("DS_TEST_GATEWAY_PW", None)
 
@@ -393,8 +481,8 @@ def test_a_shape_the_transport_cannot_speak_is_refused_not_half_supported(scratc
     with FakeGate() as gate:
         path = gate.credential_file(scratch)
         cases = [
-            ("https://10.0.0.5:9119", "https", "second-backend"),
             ("http://10.0.0.5:9119/dashboard", "prefix", "origin"),
+            ("https://10.0.0.5:9119/dashboard", "prefix", "origin"),
             ("http://user@10.0.0.5:9119", "userinfo", "gateway-user"),
             ("http://user:LEAKME@10.0.0.5:9119", "userinfo", "gateway-user"),
             ("https://user:LEAKME@10.0.0.5:9119", "userinfo", "gateway-user"),
@@ -416,6 +504,25 @@ def test_a_shape_the_transport_cannot_speak_is_refused_not_half_supported(scratc
                 check(f"{url} does not echo a password", "LEAKME" not in message, message)
             else:
                 raise AssertionError(f"{url} was accepted")
+
+
+def test_a_ca_file_that_cannot_be_used_is_refused_not_ignored(scratch: Path) -> None:
+    """A trust anchor that is silently dropped is worse than none: the user believes it is pinned."""
+    with FakeGate() as gate:
+        path = gate.credential_file(scratch)
+        missing = scratch / "no-such-ca.pem"
+        cases = [
+            ("https://10.0.0.5:9119", str(missing), "does not exist"),
+            ("https://10.0.0.5:9119", str(path), "cannot read the CA certificate"),
+            ("http://10.0.0.5:9119", str(missing), "no certificate to check"),
+        ]
+        for url, ca_file, needle in cases:
+            try:
+                pl.resolve_gateway(url, password_file=str(path), ca_file=ca_file)
+            except pl.GatewayAuthError as exc:
+                check(f"ca_file={ca_file} for {url} is refused", needle in str(exc), str(exc))
+            else:
+                raise AssertionError(f"ca_file={ca_file} for {url} was accepted")
 
 
 def test_resolve_gateway_refuses_what_it_cannot_use() -> None:
@@ -702,14 +809,85 @@ def test_an_ipv6_origin_keeps_its_brackets() -> None:
           gateway.describe())
 
 
-def test_a_tls_gateway_cannot_even_be_constructed() -> None:
-    """The transport speaks plaintext only, so no object may claim otherwise."""
+def test_ticket_urls_are_wss_under_https() -> None:
+    secure = pl.Gateway(host="devbox", port=9119, username="u", password="p", scheme="https")
+    check("https becomes wss", secure.ticket_url("a b").startswith("wss://devbox:9119/api/ws?"),
+          secure.ticket_url("a b"))
+    check("the ticket is quoted", "ticket=a%20b" in secure.ticket_url("a b"))
+    plain = pl.Gateway(host="devbox", port=9119, username="u", password="p")
+    check("http stays ws", plain.ticket_url("t").startswith("ws://devbox:9119/api/ws?ticket=t"))
+
+
+def test_a_gateway_refuses_a_ca_file_it_cannot_use() -> None:
+    """A pin the code silently dropped would leave the reader believing it took effect."""
     try:
-        pl.Gateway(host="h", port=443, username="u", password="p", scheme="https")
+        pl.Gateway(host="h", port=9119, username="u", password="p", ca_file="/tmp/x.pem")
     except pl.GatewayAuthError as exc:
-        check("the refusal says http only", "http only" in str(exc), str(exc))
+        check("the refusal says https only", "https gateway only" in str(exc), str(exc))
         return
-    raise AssertionError("a Gateway claiming https was constructed")
+    raise AssertionError("a CA file on a plaintext gateway was accepted")
+
+
+def test_an_https_gateway_signs_in_and_mints_over_tls(scratch: Path) -> None:
+    """What accepting https is for: the password and the ticket never cross in clear."""
+    cert, key = _make_cert(scratch)
+    with FakeGate(tls=(cert, key)) as gate:
+        gateway = gate.gateway(scratch)  # trusts the generated certificate as its CA
+        check("https maps to wss", gateway.ticket_url("t").startswith("wss://127.0.0.1:"),
+              gateway.ticket_url("t"))
+        check("the private CA is named in the description", "private CA" in gateway.describe(),
+              gateway.describe())
+        session = pl.GatewaySession(gateway, ssl_context=gateway.ssl_context())
+        ticket = session.mint_ticket()
+        check("a ticket came back over TLS", ticket == "ticket-1", ticket)
+        check("the sign-in went over TLS too",
+              gate.paths[:2] == ["/auth/password-login", "/api/auth/ws-ticket"], str(gate.paths))
+
+
+def test_an_untrusted_certificate_stops_the_sign_in(scratch: Path) -> None:
+    """No CA file and no system trust: stop, do not hand the password to whoever answered."""
+    cert, key = _make_cert(scratch)
+    with FakeGate(tls=(cert, key)) as gate:
+        untrusted = pl.resolve_gateway(gate.origin,
+                                       password_file=str(gate.credential_file(scratch)))
+        session = pl.GatewaySession(untrusted, ssl_context=untrusted.ssl_context())
+        try:
+            session.mint_ticket()
+        except pl.GatewayAuthError as exc:
+            check("the refusal names the certificate",
+                  "certificate" in str(exc).lower(), str(exc))
+            check("the server never saw a sign-in", gate.logins == 0, str(gate.logins))
+            return
+    raise AssertionError("an untrusted certificate was accepted")
+
+
+def test_the_upgrade_over_tls_verifies_the_certificate(scratch: Path) -> None:
+    """The socket that carries the ticket, checked at the handshake rather than trusted."""
+    cert, key = _make_cert(scratch)
+    with FakeGate(tls=(cert, key)) as gate:
+        trusted = gate.gateway(scratch)
+        url = trusted.ticket_url("t")
+        client = pl._WSClient(url, timeout=5.0, ssl_context=trusted.ssl_context())
+        try:
+            client.connect()
+        except pl.TransportError as exc:
+            # This handler answers HTTP, so an HTTP status coming back IS the proof
+            # that the TLS handshake succeeded.
+            check("the handshake succeeded and an HTTP status came back",
+                  exc.status == 404, f"{exc.status}: {exc}")
+        else:
+            raise AssertionError("a plain HTTP handler upgraded a websocket")
+
+        untrusting = pl._WSClient(url, timeout=5.0, ssl_context=ssl.create_default_context())
+        try:
+            untrusting.connect()
+        except pl.TransportError as exc:
+            check("an untrusted certificate is refused",
+                  "could not be verified" in str(exc), str(exc))
+            check("it is not reported as an HTTP status", exc.status is None, str(exc.status))
+            check("the refusal says how to trust it", "ca-file" in str(exc), str(exc))
+        else:
+            raise AssertionError("an untrusted certificate allowed the upgrade")
 
 
 def test_the_ws_url_mints_a_ticket_per_connection(scratch: Path) -> None:
@@ -752,8 +930,10 @@ class _RefusingClient:
 
     error: Exception = pl.TransportError("websocket upgrade refused", status=403)
 
-    def __init__(self, url: str, timeout: float = 10.0) -> None:
+    def __init__(self, url: str, timeout: float = 10.0,
+                 ssl_context: object = None) -> None:
         self.url = url
+        self.ssl_context = ssl_context
 
     def connect(self) -> None:
         raise type(self).error
@@ -930,6 +1110,26 @@ class _Args:
         self.gateway_user = kwargs.get("gateway_user")
         self.gateway_password_file = kwargs.get("gateway_password_file")
         self.gateway_password_env = kwargs.get("gateway_password_env")
+        self.gateway_ca_file = kwargs.get("gateway_ca_file")
+
+
+def test_the_ca_file_plumbs_through_the_flag_and_the_config(scratch: Path) -> None:
+    cert, _ = _make_cert(scratch)
+    with FakeGate() as gate:
+        path = gate.credential_file(scratch)
+        from_config = pl.gateway_from_config({"gateway": {
+            "url": "https://10.0.0.5:9119", "password_file": str(path),
+            "ca_file": str(cert)}})
+        assert isinstance(from_config, pl.Gateway)
+        check("the config CA is used", from_config.ca_file == str(cert), str(from_config.ca_file))
+        check("the config CA shows in the description", "private CA" in from_config.describe(),
+              from_config.describe())
+        from_flag = pl.gateway_from_config(
+            {"gateway": {"url": "https://10.0.0.5:9119", "password_file": str(path)}},
+            _Args(gateway_ca_file=str(cert)))
+        assert isinstance(from_flag, pl.Gateway)
+        check("the flag's CA is used", from_flag.ca_file == str(cert), str(from_flag.ca_file))
+        check("no secret leaks into the repr", "password" not in repr(from_flag), repr(from_flag))
 
 
 def test_explicit_flags_win_over_the_config_block(scratch: Path) -> None:
