@@ -152,6 +152,36 @@ def test_a_reachable_bus_reports_the_timer_active(tmp: pathlib.Path) -> None:
           "the units were still installed" not in proc.stdout, proc.stdout[-400:])
 
 
+def test_an_uninstall_leaves_no_empty_directories_behind(tmp: pathlib.Path) -> None:
+    """Uninstall has to remove what it installed, and the directories it made for it.
+
+    The units' directory was left behind empty, which is a trace of a tool the user has
+    just asked to remove. `rmdir` cannot take anyone else's unit with it: it only
+    succeeds on an empty directory.
+    """
+    home = tmp / "home"
+    unit_dir = home / ".config" / "systemd" / "user"
+    proc = run_install(tmp, "--skip-preflight", "--yes")
+    check("the install exits 0", proc.returncode == 0, proc.stderr[-300:])
+    check("the units were installed",
+          (unit_dir / "ds-router.timer").is_file(), str(list(unit_dir.iterdir())))
+
+    uninstall = subprocess.run([str(HERE / "uninstall.sh"), "--yes"], capture_output=True,
+                              text=True, env={**os.environ,
+                                              "HOME": str(home),
+                                              "HERMES_HOME": str(home / ".hermes"),
+                                              "XDG_CONFIG_HOME": str(home / ".config"),
+                                              "XDG_STATE_HOME": str(home / ".state"),
+                                              "PATH": f"{tmp}:/usr/local/bin:/usr/bin:/bin"},
+                              cwd=str(HERE), timeout=120)
+    check("the uninstall exits 0", uninstall.returncode == 0, uninstall.stderr[-300:])
+    check("the unit files are gone", not (unit_dir / "ds-router.timer").exists(),
+          str(list(unit_dir.iterdir()) if unit_dir.exists() else []))
+    check("the empty unit directory is gone too", not unit_dir.exists(), str(unit_dir))
+    check("the manifest is gone",
+          not (home / ".state" / "ds-router" / "install-manifest").exists())
+
+
 def test_the_installer_repeats_the_check_summary_rather_than_its_own(
         tmp: pathlib.Path) -> None:
     """`config OK` and `no provider key is set` are different statements.
