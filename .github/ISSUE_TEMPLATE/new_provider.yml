@@ -1,0 +1,48 @@
+name: New provider
+description: Ask for another subscription's usage API to be supported
+labels: [provider support]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A provider needs a usage API the router can read: the point of this project is
+        reading real quota, not guessing at it. See "Adding a provider" in the README for
+        the shape of the code, and please do not paste an API key.
+  - type: input
+    id: provider
+    attributes:
+      label: Provider and plan
+      placeholder: Example Host, $20/mo Pro
+    validations:
+      required: true
+  - type: input
+    id: endpoint
+    attributes:
+      label: The usage endpoint
+      description: The URL the dashboard or CLI calls to learn your remaining quota. A link to the docs is fine if you have one.
+      placeholder: https://api.example.com/v1/usage
+    validations:
+      required: true
+  - type: textarea
+    id: response
+    attributes:
+      label: What that endpoint returns
+      description: A response with the values replaced if you prefer. The window names and their reset times are what the router scores.
+      render: json
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Which windows throttle you
+      description: A 5-hour window, a weekly one, a monthly credit pool, a concurrency cap.
+      placeholder: 5-hour and weekly
+    validations:
+      required: false
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Rate limits on the usage endpoint itself, a token that expires, a caveat about the numbers.
+    validations:
+      required: false

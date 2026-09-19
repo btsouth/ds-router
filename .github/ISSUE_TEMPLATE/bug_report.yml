@@ -1,0 +1,47 @@
+name: Bug report
+description: A decision or an output that looks wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do not paste credentials. `ds-switch --check` and `router.py --dry-run`
+        are the two outputs that make a report actionable, and neither prints a key.
+        If you paste a config, replace any `key_env` value and any gateway URL.
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened, and what you expected instead
+      description: A wrong routing decision, a refusal, a crash, a number that does not match your provider's dashboard.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: The output
+      description: "`./ds-switch --check` and `./router.py --dry-run` (add `--json` if it helps)"
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: The relevant part of config.yaml
+      description: The providers and models blocks, with anything secret replaced by a placeholder.
+      render: yaml
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Commit
+      description: "`git rev-parse --short HEAD` in your clone"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and python
+      placeholder: Linux, python 3.12
+    validations:
+      required: false

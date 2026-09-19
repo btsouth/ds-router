@@ -1,0 +1,24 @@
+name: Feature request
+description: A behaviour to change, or something the docs should say
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve
+      description: The situation you are in, rather than the solution. It is often a different change than the one it suggests.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you have in mind
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: Another router, a wrapper script, declaring the provider by hand.
+    validations:
+      required: false
