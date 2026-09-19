@@ -1029,7 +1029,8 @@ class _RefusingClient:
         raise type(self).error
 
 
-def _fake_upgrade(status_line: bytes, *, accept: bool = False) -> tuple[int, dict]:
+def _fake_upgrade(status_line: bytes, *, accept: bool = False,
+                  family: int = socket.AF_INET) -> tuple[int, dict]:
     """One TCP connection that answers a WS handshake with *status_line*.
 
     A real upgrade refusal, on loopback, so the test exercises the parser rather than
@@ -1037,9 +1038,9 @@ def _fake_upgrade(status_line: bytes, *, accept: bool = False) -> tuple[int, dic
     test can assert what was actually asked for.
     """
     seen: dict = {"request": b"", "port": 0}
-    server = socket.socket()
+    server = socket.socket(family)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", 0))
+    server.bind(("::1" if family == socket.AF_INET6 else "127.0.0.1", 0))
     server.listen(1)
     seen["port"] = int(server.getsockname()[1])
 
@@ -1129,13 +1130,32 @@ def test_a_status_line_that_never_arrived_says_so() -> None:
 
 def test_the_host_header_brackets_an_ipv6_literal() -> None:
     """`Host: ::1:9119` is not a valid header, so a strict server refuses the upgrade
-    that urllib performs happily on the same authority."""
-    check("an IPv6 literal is bracketed", pl._host_header("::1", 9119) == "[::1]:9119",
-          pl._host_header("::1", 9119))
+    that urllib performs happily on the same authority.
+
+    Asserted against the bytes on the wire rather than the helper: a test of
+    `_host_header` alone stays green when the call site stops using it, which is how
+    this slipped through the first time.
+    """
     check("a name is not bracketed", pl._host_header("devbox", 9119) == "devbox:9119",
           pl._host_header("devbox", 9119))
     check("an IPv4 literal is not bracketed",
           pl._host_header("127.0.0.1", 80) == "127.0.0.1:80", pl._host_header("127.0.0.1", 80))
+
+    try:
+        port, seen = _fake_upgrade(b"HTTP/1.1 401 Unauthorized\r\n", family=socket.AF_INET6)
+    except OSError as exc:  # no IPv6 loopback on this host: say so, do not pass quietly
+        print(f"  note: skipping the IPv6 wire check, no IPv6 loopback here ({exc})")
+        return
+    client = pl._WSClient(f"ws://[::1]:{port}/api/ws?ticket=t", timeout=5.0)
+    try:
+        client.connect()
+    except pl.TransportError:
+        pass
+    request = seen["request"].decode("latin-1")
+    check("the request line addresses the literal in brackets",
+          f"GET /api/ws?ticket=t HTTP/1.1" in request, request[:120])
+    check("the Host header brackets it", f"Host: [::1]:{port}" in request, request[:200])
+    check("no bare literal reaches the header", f"Host: ::1:" not in request, request[:200])
 
 
 def test_a_refused_upgrade_carries_its_status() -> None:
