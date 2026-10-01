@@ -89,6 +89,7 @@ class FakeGate:
         if self.tls is not None:
             cert, key = self.tls
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
             context.load_cert_chain(certfile=str(cert), keyfile=str(key))
             self._server.socket = context.wrap_socket(self._server.socket, server_side=True)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
@@ -477,14 +478,16 @@ def test_resolve_gateway_reads_a_file_and_an_env_var(scratch: Path) -> None:
         path = gate.credential_file(scratch)
         from_file = pl.resolve_gateway(gate.origin, password_file=str(path))
         check("the file's username is used", from_file.username == "bts")
-        check("the file is named as the source", from_file.source == str(path), from_file.source)
+        check("the file is named as the source",
+              from_file.source == "the configured credential file", from_file.source)
         check("the port the gate listens on is read", from_file.port > 1024, str(from_file.port))
 
     os.environ["DS_TEST_GATEWAY_PW"] = SECRET
     try:
         from_env = pl.resolve_gateway("http://10.0.0.5:9119", password_env="DS_TEST_GATEWAY_PW",
                                       username="someone")
-        check("the env var is named as the source", from_env.source == "$DS_TEST_GATEWAY_PW",
+        check("the environment is named as the source",
+              from_env.source == "the configured credential environment variable",
               from_env.source)
         check("the port is read", from_env.port == 9119, str(from_env.port))
         defaulted = pl.resolve_gateway("http://10.0.0.5", password_env="DS_TEST_GATEWAY_PW",
@@ -739,7 +742,7 @@ def test_a_wrong_credential_is_refused_and_never_retried(scratch: Path) -> None:
             except pl.GatewayAuthError as exc:
                 message = str(exc)
                 check("the refusal says the credential was refused", "refused" in message, message)
-                check("it names the credential's source", "dashboard-pw.txt" in message, message)
+                check("it names the credential's source", "credential file" in message, message)
                 check("it never carries the password", "not-the-password" not in message, message)
             else:
                 raise AssertionError(f"attempt {attempt}: a wrong dashboard password was accepted")
@@ -1023,8 +1026,10 @@ def test_a_tls_handshake_against_a_plaintext_server_is_named() -> None:
             conn.close()
 
     threading.Thread(target=serve_plaintext, daemon=True).start()
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
     client = pl._WSClient(f"wss://127.0.0.1:{port}/api/ws?ticket=t", timeout=5.0,
-                          ssl_context=ssl.create_default_context())
+                          ssl_context=context)
     try:
         client.connect()
     except pl.TransportError as exc:
@@ -1055,6 +1060,9 @@ def test_an_https_gateway_signs_in_and_mints_over_tls(scratch: Path) -> None:
         check("the private CA is named in the description", "private CA" in gateway.describe(),
               gateway.describe())
         session = pl.GatewaySession(gateway, ssl_context=gateway.ssl_context())
+        check("the client requires TLS 1.2 or newer",
+              gateway.ssl_context().minimum_version >= ssl.TLSVersion.TLSv1_2,
+              str(gateway.ssl_context().minimum_version))
         ticket = session.mint_ticket()
         check("a ticket came back over TLS", ticket == "ticket-1", ticket)
         check("the sign-in went over TLS too",
@@ -1099,7 +1107,9 @@ def test_the_upgrade_over_tls_verifies_the_certificate(scratch: Path) -> None:
         else:
             raise AssertionError("a plain HTTP handler upgraded a websocket")
 
-        untrusting = pl._WSClient(url, timeout=5.0, ssl_context=ssl.create_default_context())
+        untrusting_context = ssl.create_default_context()
+        untrusting_context.minimum_version = ssl.TLSVersion.TLSv1_2
+        untrusting = pl._WSClient(url, timeout=5.0, ssl_context=untrusting_context)
         try:
             untrusting.connect()
         except pl.TransportError as exc:
@@ -1396,7 +1406,8 @@ def test_the_gateway_block_is_dormant_when_absent(scratch: Path) -> None:
                 "password_env": "DS_TEST_GATEWAY_PW"}})
             assert isinstance(from_env, pl.Gateway)
             check("password_env reaches the gateway",
-                  from_env.source == "$DS_TEST_GATEWAY_PW", from_env.source)
+                  from_env.source == "the configured credential environment variable",
+                  from_env.source)
         finally:
             os.environ.pop("DS_TEST_GATEWAY_PW", None)
 
@@ -1448,7 +1459,8 @@ def test_explicit_flags_win_over_the_config_block(scratch: Path) -> None:
         assert isinstance(built, pl.Gateway)
         check("the flag's URL wins", built.port == int(other.origin.rsplit(":", 1)[1]),
               str(built.port))
-        check("the flag's credential wins", built.source == str(explicit), built.source)
+        check("the flag's credential wins",
+              built.source == "the configured credential file", built.source)
 
 
 if __name__ == "__main__":

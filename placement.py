@@ -1002,7 +1002,9 @@ class Gateway:
         if self.scheme != "https":
             return None
         try:
-            return ssl.create_default_context(cafile=self.ca_file or None)
+            context = ssl.create_default_context(cafile=self.ca_file or None)
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            return context
         except (OSError, ssl.SSLError) as exc:
             raise GatewayAuthError(
                 f"cannot read the CA certificate {self.ca_file!r} for {self.authority}: {exc}"
@@ -1226,11 +1228,11 @@ def resolve_gateway(url: str, *, username: Optional[str] = None,
         path = Path(str(password_file)).expanduser()
         credential = read_gateway_credential(path)
         secret, file_user, file_origins = credential.password, credential.username, credential.origins
-        source = str(path)
+        source = "the configured credential file"
         _check_file_mode(path)
     elif password_env:
         secret = os.environ.get(str(password_env), "")
-        source = f"${password_env}"
+        source = "the configured credential environment variable"
         file_user = ""
         if not secret:
             raise GatewayAuthError(f"{password_env} is unset or empty")
@@ -1253,7 +1255,7 @@ def resolve_gateway(url: str, *, username: Optional[str] = None,
     if warn is not None and file_origins:
         named = " or ".join(file_origins)
         if not any(_same_authority(entry, gateway.authority) for entry in file_origins):
-            warn(f"the credential file {source} names {named}, and you pointed at "
+            warn(f"the credential file names {named}, and you pointed at "
                  f"{gateway.authority}: the password will be sent to {gateway.authority}")
     return gateway
 
